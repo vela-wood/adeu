@@ -53,8 +53,19 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+try:
+    from fastmcp.exceptions import ToolError
+    from fastmcp.tools.tool import ToolResult
+except ImportError:
+    # fastmcp is an optional dependency (install extra: adeu[mcp]). The CLI
+    # path only needs these two symbols, so provide minimal stand-ins.
+    class ToolError(Exception):  # type: ignore[no-redef]
+        pass
+
+    class ToolResult:  # type: ignore[no-redef]
+        def __init__(self, content: Any = None, structured_content: Any = None) -> None:
+            self.content = content
+            self.structured_content = structured_content
 
 from adeu.outline import extract_outline
 from adeu.pagination import (
