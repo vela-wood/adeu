@@ -11,13 +11,13 @@
 
 **LLMs speak Markdown; reviewers speak "Track Changes."**
 
-Adeu is a **docx ↔ LLM translator**: a Model Context Protocol (MCP) server (Python and Node.js implementations) and accompanying SDKs that act as a **Virtual DOM for Microsoft Word**. It provides a two-way abstraction layer that lets AI agents freely edit document text without destroying the underlying formatting or complex DOCX XML.
+Adeu is a **docx ↔ LLM translator**: a Python CLI/SDK and a Node.js Model Context Protocol (MCP) server that act as a **Virtual DOM for Microsoft Word**. It provides a two-way abstraction layer that lets AI agents freely edit document text without destroying the underlying formatting or complex DOCX XML.
 
 While standard libraries like `python-docx` excel at generating documents from scratch, they fail at non-destructive redlining. Adeu solves this by translating `.docx` files into a token-efficient Markdown representation. This frees AI agents to focus entirely on document semantics instead of wasting tokens wrestling with OpenXML.
 
 Adeu acts as an **intelligent proxy**, processing AI edits as safe, atomic transactions:
 
-1. **Read:** Translates the document (from disk or live Word) into LLM-friendly **[CriticMarkup](https://fletcher.github.io/MultiMarkdown-6/syntax/critic.html)** with a **Semantic Appendix** of defined terms, cross-references, and likely typos. The agent starts with semantic structure, not raw data.
+1. **Read:** Translates the document from disk into LLM-friendly **[CriticMarkup](https://fletcher.github.io/MultiMarkdown-6/syntax/critic.html)** with a **Semantic Appendix** of defined terms, cross-references, and likely typos. The agent starts with semantic structure, not raw data.
 2. **Validate:** Acts as a strict safety gate. It protects the document's integrity by automatically blocking ambiguous text matches or invalid structural changes before they touch the file.
 3. **Apply:** Translates the AI's text edits into native Word Track Changes. Adeu handles the complex XML under the hood, ensuring existing layouts, fonts, and margin comments are perfectly preserved.
 
@@ -37,7 +37,7 @@ Adeu ships as a [Claude Code plugin](https://docs.claude.com/en/docs/claude-code
 /plugin install adeu-redlining@adeu-skills
 ```
 
-For best results, also connect either the Node MCP server (`npx -y @adeu/mcp-server`) or the Python MCP server (`uvx --from adeu adeu-server`). The plugin works without an MCP server too — it falls back to driving the `uvx adeu` CLI via Bash.
+For best results, also connect the Node MCP server (`npx -y @adeu/mcp-server`). The plugin works without an MCP server too — it falls back to driving the `uvx adeu` CLI via Bash.
 
 ### Other Skills-Compatible Agents (Cursor, Windsurf, VS Code Copilot, etc.)
 Adeu's redlining skill follows the open [Agent Skills specification](https://agentskills.io) and works with any compatible agent:
@@ -62,27 +62,14 @@ gemini extensions install https://github.com/dealfluence/adeu
 ```
 
 ### Other MCP Clients (Cursor, Windsurf, etc.)
-For IDEs or clients that configure MCP servers via JSON, you can use either the Node.js or Python backend:
+For IDEs or clients that configure MCP servers via JSON, use the Node.js backend:
 
-**Node.js**
 ```json
 {
   "mcpServers": {
     "adeu": {
       "command": "npx",
       "args": ["-y", "@adeu/mcp-server"]
-    }
-  }
-}
-```
-
-**Python (Required for Live MS Word integration on Windows)**
-```json
-{
-  "mcpServers": {
-    "adeu": {
-      "command": "uvx",
-      "args": ["--from", "adeu", "adeu-server"]
     }
   }
 }
@@ -111,9 +98,6 @@ You can guarantee the best behavioral results by adding this context to your age
 > - `read_docx(clean_view=True)`: Read the final "clean" version of the text to understand context. Use `search_query` and `page` filters to locate specific clauses without reading the whole document.
 > - `process_document_batch`: **Commit & Negotiate Mode.** Apply a unified list of changes. Use `type: "modify"` for specific search-and-replace text edits (supports `match_mode="all"` and `regex=True` for bulk updates), and `type: "accept"`, `"reject"`, or `"reply"` to manage existing Track Changes and Comments by ID.
 > - `finalize_document`: **Pre-Send Scrub.** Strip dangerous metadata, author names, and internal tracking IDs, lock the document (`protection_mode="read_only"`), and prepare it for distribution.
-
-### Live MS Word Integration
-If you are running on Windows with Microsoft Word installed, Adeu can act as a real-time copilot, editing the active document right in front of you. This requires running the Python MCP server backend (see Developer Tools below).
 
 ---
 
@@ -201,26 +185,6 @@ See the [n8n-nodes-adeu README](https://github.com/dealfluence/adeu/blob/main/no
 
 ---
 
-## LangChain Integration
-
-`langchain-adeu` is an official integration package that exposes Adeu's local, offline-capable document manipulation tools directly to the LangChain ecosystem.
-
-```bash
-pip install langchain-adeu
-```
-
-Bundle its capabilities as tools in your agent workflow:
-```python
-from langchain_adeu import AdeuToolkit
-
-# Instantiate and retrieve all document tools
-tools = AdeuToolkit().get_tools()
-```
-
-Refer to the [LangChain Workspace Guide](langchain/README.md) for full development instructions and detailed parameters.
-
----
-
 ## Ecosystem & Integrations
 
 Adeu is designed as a Virtual DOM for DOCX. Because we keep the core strictly focused on OpenXML safety, we maintain a dedicated [`ecosystem/`](ecosystem/) directory for third-party integrations.
@@ -252,4 +216,3 @@ We welcome contributions from the community! Whether it's fixing bugs, adding ca
 ## License
 
 MIT License. Open source and free to use in commercial applications.
-

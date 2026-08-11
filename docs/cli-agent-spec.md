@@ -33,9 +33,9 @@ mechanism through which sandboxed agents learn the CLI surface.
 and defaults its output to `<stem>_clean.docx`, byte-for-byte mirroring the
 `accept_all_changes` MCP tool's behavior.
 
-Commands that only make sense outside a sandbox (`adeu init` for Claude
-Desktop config, `--live` Windows COM interop) remain available but are not
-part of the agentic contract.
+The slim Python CLI is file-based. Configure the separate Node MCP server for
+MCP clients; Python desktop initialization and live Word commands are not part
+of this fork.
 
 ## 3. Machine-readable outputs (`--json`)
 

@@ -9,8 +9,7 @@
 # formatter + linter, auto-fixing and re-staging the result so the formatted
 # code lands in the same commit, then runs the type checker as a gate:
 #
-#   python/      ruff check --fix, ruff format, mypy src           (via uv)
-#   langchain/   ruff check --fix, ruff format, mypy langchain_adeu (via uv)
+#   python/      ruff check --fix, ruff format, mypy src (via uv)
 #   node/n8n     eslint --fix on n8n-nodes-adeu *.ts files
 #
 # Untouched areas are skipped. Tests are intentionally left to CI / pre-push
@@ -48,7 +47,7 @@ restage() {
 }
 
 # ---------------------------------------------------------------------------
-# Python area: $1 = directory (python|langchain), $2 = mypy target, rest regex
+# Python area: $1 = directory, $2 = mypy target, rest regex
 # ---------------------------------------------------------------------------
 check_python_area() {
 	_dir=$1
@@ -104,7 +103,6 @@ check_n8n_eslint() {
 }
 
 check_python_area "python" "src" '^python/.*\.pyi?$'
-check_python_area "langchain" "langchain_adeu" '^langchain/.*\.pyi?$'
 check_n8n_eslint
 
 if [ "$FAIL" -ne 0 ]; then

@@ -5,7 +5,7 @@
  * for the findings that live on the server surface:
  *
  *   F-06  `--help` / `--version` used to start the stdio server instead of
- *         printing and exiting — both the Python `adeu-server` and this
+ *         printing and exiting — this
  *         Node bin share the defect
  *   F-10  search snippet highlighting collides with the document's own
  *         style markers (`**The **Supplier** _shall provide**_`)

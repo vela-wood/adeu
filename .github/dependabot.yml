@@ -6,12 +6,6 @@ updates:
     schedule:
       interval: "weekly"
 
-  # Maintain Python dependencies in /langchain
-  - package-ecosystem: "pip"
-    directory: "/langchain"
-    schedule:
-      interval: "weekly"
-
   # Maintain Node.js dependencies in /node
   - package-ecosystem: "npm"
     directory: "/node"

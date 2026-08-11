@@ -1,8 +1,8 @@
-# Adeu: Python Toolchain & MCP Server
+# Adeu: Python Toolchain
 
-This directory contains the core Python implementation of Adeu. It provides the core Redline Engine, the developer SDK, the command-line interface (CLI), and the FastMCP server backend. 
+This directory contains the slim Python implementation of Adeu. It provides the core Redline Engine, developer SDK, and command-line interface (CLI).
 
-Adeu acts as a "Virtual DOM" for Microsoft Word. It translates complex DOCX XML into token-efficient CriticMarkup for LLMs, validates structural edits, and patches the XML safely to preserve document formatting, metadata, and styles. On Windows, it also interfaces directly with live Microsoft Word instances via COM.
+Adeu acts as a "Virtual DOM" for Microsoft Word. It translates complex DOCX XML into token-efficient CriticMarkup for LLMs, validates structural edits, and patches the XML safely to preserve document formatting, metadata, and styles.
 
 ## Local Development Setup
 
@@ -32,8 +32,6 @@ uvx adeu extract contract.docx -o output.md
 # Extract only the structural heading outline
 uvx adeu extract contract.docx --mode outline
 
-# Windows Only: Extract text from the actively open Word document
-uvx adeu extract --live
 ```
 
 ### Diffing
@@ -55,8 +53,6 @@ uvx adeu apply original.docx edits.json --author "AI Reviewer" -o redlined.docx
 # Emit the batch result as machine-readable JSON on stdout (for agents/scripts)
 uvx adeu apply original.docx edits.json --json
 
-# Windows Only: Apply edits directly to the live, open Word canvas
-uvx adeu apply edits.json --live
 ```
 
 ### Accepting All Changes
@@ -165,36 +161,9 @@ result = sanitize_docx(
 print(result.report_text)
 ```
 
-## The MCP Server
-
-The Python backend exposes Adeu's capabilities to AI agents via the Model Context Protocol (MCP), powered by FastMCP.
-
-### Running the Server
-You can boot the server over stdio for agent consumption:
-```bash
-uvx --from adeu adeu-server
-```
-
-### Claude Desktop Integration
-Adeu provides an initialization command to automatically inject the MCP server into your local Claude Desktop configuration.
-
-```bash
-# Installs to Claude Desktop using the global uvx path
-uvx adeu init
-
-# Local Developer Mode: Configures Claude to run the server from your current source tree
-uv run adeu init --local
-```
-
-### Live Word Interop (Windows COM)
-When the MCP server runs on Windows (`sys.platform == 'win32'`), it automatically enables the `live_word.py` tools. These tools utilize `pywin32` to hijack the active Microsoft Word COM object. 
-
-If an agent leaves the `file_path` argument empty when calling `read_docx` or `process_document_batch`, the server will automatically target the document that the user currently has open on their screen.
-
 ## Testing & Architectural Constraints
 
 When developing inside the `python/` directory, please note the following invariants:
 
 * **Surgical Mode**: The `RedlineEngine` never performs global document normalization on load or save. This strict behavior prevents the silent destruction of unrelated metadata (like `<w:proofErr>`) and minimizes XML diff noise.
-* **COM Teardown**: In `live_word.py` and its associated tests, we intentionally omit `pythoncom.CoUninitialize()` and `app.Quit()` during teardown. FastMCP and `pytest` hold proxies unpredictably: forcing teardown causes fatal RPC Access Violations (`0x800706be`). We let the OS handle the apartment lifecycle.
 * **Testing Asserts**: Native `python-docx` `Paragraph.text` properties silently ignore text inside `<w:ins>` tags. When writing tests to verify redlines, strictly use `extract_text_from_stream(clean_view=True)` to accurately evaluate the accepted text state.

@@ -139,6 +139,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Enforce slim dependency boundary
+        run: python scripts/check_slim_dependencies.py
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
@@ -200,39 +203,3 @@ jobs:
       - name: Publish to NPM
         working-directory: ./node
         run: npm publish --workspaces --access public --provenance
-
-  langchain-pypi-publish:
-    if: github.repository == 'dealfluence/adeu' && github.event_name == 'release'
-    name: Upload langchain-adeu to PyPI
-    runs-on: ubuntu-latest
-    # Same as the `pypi` job: name-only environment pinned by langchain-adeu's
-    # OIDC Trusted Publisher. Keep the `environment:` block (required for auth);
-    # it is not an approval gate. Re-add a gate via Settings -> Environments ->
-    # langchain-pypi if ever needed, not in this file.
-    environment:
-      name: langchain-pypi
-      url: https://pypi.org/project/langchain-adeu
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-          cache-dependency-glob: "langchain/uv.lock"
-
-      - name: Set up Python
-        run: uv python install 3.12
-
-      - name: Build package
-        working-directory: ./langchain
-        run: uv build
-
-      - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: langchain/dist/

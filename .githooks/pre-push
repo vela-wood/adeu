@@ -6,7 +6,6 @@
 # stay fast. Bypass in a pinch with `git push --no-verify`.
 #
 #   python/      uv run pytest
-#   langchain/   uv run pytest
 #   node/        npm run build && npm test
 #
 # Cross-platform: runs under Git Bash on Windows and /bin/sh on macOS/Linux.
@@ -52,15 +51,6 @@ if touched '^python/'; then
 		uv run --directory python pytest || FAIL=1
 	else
 		echo "  ! uv not found — skipping python tests (CI still enforces them)"
-	fi
-fi
-
-if touched '^langchain/'; then
-	if have uv; then
-		echo "→ langchain: pytest"
-		uv run --directory langchain pytest || FAIL=1
-	else
-		echo "  ! uv not found — skipping langchain tests (CI still enforces them)"
 	fi
 fi
 

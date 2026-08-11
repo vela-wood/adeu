@@ -1,3 +1,4 @@
+import inspect
 import io
 import logging
 import sys
@@ -7,6 +8,42 @@ import structlog
 from docx import Document
 
 from adeu.utils.console import dynamic_stderr
+
+# This fork deliberately excludes the Python MCP server and live-Word adapter
+# from its distribution. Keep upstream's server tests in the tree for easier
+# future merges, but do not collect them in the framework-free test environment.
+collect_ignore = [
+    "test_atomic_batch_pipeline.py",
+    "test_changes_ledger.py",
+    "test_cli_init.py",
+    "test_doc_cache.py",
+    "test_failure_envelope.py",
+    "test_failure_recovery_protocol.py",
+    "test_fastmcp4_compat.py",
+    "test_flat_opc_to_docx.py",
+    "test_live_word.py",
+    "test_live_word_dispatch.py",
+    "test_live_word_structured_insertion.py",
+    "test_mcp_reasoning_optional.py",
+    "test_page_ranges.py",
+    "test_regressions.py",
+    "test_report_minimal.py",
+    "test_repro_accept_all_changes_leak.py",
+    "test_repro_benchmark_schema_failures.py",
+    "test_repro_customxml_missing_part.py",
+    "test_repro_feedback_observations.py",
+    "test_repro_qa_customer_assessment_2026_07_23.py",
+    "test_repro_qa_mcp_2026_07_23_mcp.py",
+    "test_repro_qa_mcp_2026_07_23_reports.py",
+    "test_repro_qa_report_v2.py",
+    "test_repro_qa_round3_2026_07_24.py",
+    "test_repro_round16_bugs.py",
+    "test_response_budget_guard.py",
+    "test_search_paging.py",
+    "test_search_write_engine.py",
+    "test_server.py",
+    "test_stringified_json_search_page.py",
+]
 
 # Unconfigured structlog prints DEBUG lines to STDOUT, so any test that calls
 # engine/ingest helpers in its setup pollutes captured stdout (a `--json` CLI
@@ -55,6 +92,25 @@ def pytest_collection_modifyitems(config, items):
     sequentially; every other test still distributes freely.
     """
     for item in items:
+        try:
+            source = inspect.getsource(item.obj)
+        except (OSError, TypeError):
+            source = ""
+        unsupported_python_server_surface = any(
+            marker in source
+            for marker in (
+                "fastmcp",
+                "adeu.server",
+                "mcp_components.tools",
+                "handle_init",
+                "_get_claude_config_path",
+                'run_cli(["init"',
+                "--live",
+            )
+        )
+        if unsupported_python_server_surface and item.name != "test_extract_never_imports_fastmcp":
+            item.add_marker(pytest.mark.skip(reason="Python MCP/live-Word surface is excluded from the slim fork"))
+
         is_live_word = "active_word_app" in getattr(item, "fixturenames", ())
         if not is_live_word:
             basename = item.path.name if getattr(item, "path", None) else ""

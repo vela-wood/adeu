@@ -10,7 +10,7 @@ Because we keep the core engine strictly decoupled from business logic, this `ec
 
 *   **Legal Validation & Research:** Routing proposed edits through case-law APIs or statutory databases before applying them to the DOCX.
 *   **CLM Integrations:** Syncing Adeu's CriticMarkup extraction with external Contract Lifecycle Management platforms.
-*   **Custom Agent Workflows:** Specialized LangChain, LlamaIndex, or AutoGen orchestrations utilizing Adeu as a tool.
+*   **Custom Agent Workflows:** Specialized orchestrations utilizing Adeu as a tool.
 
 ## Active Integrations
 

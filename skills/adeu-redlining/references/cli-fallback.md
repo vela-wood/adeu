@@ -105,5 +105,5 @@ For ID-based operations (`accept`, `reject`, `reply`), step 1 and step 2 must be
 ## CLI vs MCP differences worth knowing
 
 - **The CLI is Python-only.** Node users don't have a CLI equivalent — they should run the Node MCP server (`@adeu/mcp-server`) instead.
-- The CLI does not expose Live MS Word (Windows COM) integration for reading; `adeu extract --live` / `adeu apply --live` exist on Windows only and require a running Word instance — do not rely on them in sandboxes.
+- The CLI operates on files. Live Word integration is not part of this slim fork.
 - `mode="outline"` / `mode="appendix"` / search map to `adeu extract --mode outline`, `--mode appendix`, and `--search-query`.

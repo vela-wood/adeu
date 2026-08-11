@@ -4,7 +4,7 @@ Thank you for your interest in contributing to Adeu! We welcome bug reports, fea
 
 ## Development Environment
 
-Adeu is a monorepo with a Python backend, a Node.js workspace, and a LangChain integration package. The Python toolchain is managed by [uv](https://docs.astral.sh/uv/); the Node.js workspace uses npm. You need Python >=3.12 and Node.js >=22.0.0.
+Adeu is a monorepo with a Python backend and a Node.js workspace. The Python toolchain is managed by [uv](https://docs.astral.sh/uv/); the Node.js workspace uses npm. You need Python >=3.12 and Node.js >=22.0.0.
 
 ### 1. Python Setup
 
@@ -13,7 +13,7 @@ Clone the repository and install the Python dependencies:
 ```bash
 git clone https://github.com/dealfluence/adeu.git
 cd adeu/python
-uv sync --all-extras --dev
+uv sync --dev
 ```
 
 ### 2. Code Quality & Linting
@@ -46,12 +46,12 @@ git config core.hooksPath .githooks
 
 The hook only touches the directories your commit changes:
 
-- **`python/` / `langchain/`** — runs `ruff check --fix` and `ruff format`
+- **`python/`** — runs `ruff check --fix` and `ruff format`
   (fixes are applied in place and re-staged into the commit), then `mypy`.
 - **`node/` (n8n-nodes-adeu)** — runs `eslint --fix` on touched `.ts` files.
 
 A companion `pre-push` hook runs each changed area's test suite before a push
-(`pytest` for `python/` and `langchain/`, `npm run build && npm test` for
+(`pytest` for `python/`, `npm run build && npm test` for
 `node/`) — kept off the commit path so commits stay fast. Bypass in a pinch
 with `git push --no-verify`.
 
@@ -88,18 +88,6 @@ npm run test      # run all vitest suites
 ```
 
 The Node workspace contains three packages: `@adeu/core` (TypeScript SDK), `@adeu/mcp-server` (MCP server), and `n8n-nodes-adeu` (n8n community node).
-
-### 5. LangChain Setup
-
-```bash
-cd langchain
-uv sync --all-extras --dev
-uv run pytest                           # unit tests
-uv run ruff format . && uv run ruff check . --fix
-uv run mypy .
-```
-
-The LangChain package uses `uv.sources` to editable-link the sibling `python/` package during local development.
 
 ## Pull Request Guidelines
 

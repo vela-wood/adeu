@@ -1,12 +1,9 @@
 import argparse
 import codecs
-import datetime
 import getpass
 import json
 import os
-import platform
 import re
-import shutil
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -23,145 +20,6 @@ from adeu.redline.engine import BatchValidationError, RedlineEngine, validate_ed
 from adeu.sanitize.core import SanitizeError, SanitizeResult, sanitize_docx
 from adeu.utils.console import configure_cli_streams, dynamic_stderr
 from adeu.utils.text import batch_details_header
-
-
-def _get_claude_config_path() -> Path:
-    """Determine the location of claude_desktop_config.json based on OS."""
-    system = platform.system()
-    if system == "Windows":
-        base = os.environ.get("APPDATA")
-        if not base:
-            raise OSError("APPDATA environment variable not found.")
-        return Path(base) / "Claude" / "claude_desktop_config.json"
-    elif system == "Darwin":  # macOS
-        return Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
-    else:
-        return Path.home() / ".config" / "Claude" / "claude_desktop_config.json"
-
-
-def handle_init(args: argparse.Namespace):
-    """
-    Configures Adeu in the Claude Desktop environment.
-    1. Checks for 'uvx'.
-    2. Locates config file.
-    3. Backs up existing config.
-    4. Injects MCP server entry.
-    """
-    print("🤖 Adeu Agentic Setup")
-
-    try:
-        config_path = _get_claude_config_path()
-    except Exception as e:
-        print(f"❌ Error locating Claude config: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    if config_path.exists():
-        print(f"📍 Config found: {config_path}")
-    else:
-        print(f"📍 Config will be created: {config_path}")
-
-    data: Dict[str, Any] = {"mcpServers": {}}
-    existing_valid_json = True
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    data = json.loads(content)
-        except json.JSONDecodeError:
-            existing_valid_json = False
-            print("⚠️  Existing config was invalid JSON. Starting fresh.")
-
-    mcp_servers = data.setdefault("mcpServers", {})
-
-    if args.local:
-        cwd = Path.cwd().resolve()
-        python_exe = sys.executable
-        # --local means "run the MCP server from this source checkout". From
-        # an arbitrary directory that claim is false and the resulting config
-        # is misleading (QA 2026-07-18 L6) — verify before writing.
-        looks_like_checkout = (cwd / "src" / "adeu" / "__init__.py").is_file() or (
-            (cwd / "pyproject.toml").is_file()
-            and 'name = "adeu"' in (cwd / "pyproject.toml").read_text(encoding="utf-8", errors="ignore")
-        )
-        if not looks_like_checkout:
-            print(
-                f"❌ --local expects to run from an Adeu source checkout, but '{cwd}' contains "
-                "no src/adeu package or adeu pyproject.toml.\n"
-                "   cd into your adeu repository's python/ directory and re-run, or use plain "
-                "'adeu init' to configure the installed package.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        print("🔧 Configuring in LOCAL DEV mode.")
-        print(f"   - CWD: {cwd}")
-        print(f"   - Python: {python_exe}")
-
-        mcp_servers["adeu"] = {
-            "command": python_exe,
-            "args": ["-m", "adeu.server"],
-            "cwd": str(cwd),
-        }
-    else:
-        # Resolve the absolute path to uvx so Claude Desktop (which runs
-        # with a stripped PATH) can find it even on macOS/Linux where it
-        # typically lives in ~/.local/bin — outside the GUI app's PATH.
-        uvx_path = shutil.which("uvx")
-        if not uvx_path:
-            print(
-                "❌ Could not find 'uvx' in your PATH.\n"
-                "   Install uv first:\n"
-                "     macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh\n"
-                "     Windows:     powershell -ExecutionPolicy ByPass -c "
-                '"irm https://astral.sh/uv/install.ps1 | iex"',
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        print(f"🔍 Found uvx at: {uvx_path}")
-
-        # Pin the package to the version doing the configuring: an unpinned
-        # "--from adeu" makes every Claude Desktop launch resolve the latest
-        # PyPI release, so the MCP server silently drifts away from the CLI
-        # the user tested (QA 2026-07-19 F-16).
-        version, _sha, _ = get_build_info()
-        package_ref = f"adeu=={version}" if version and version not in ("unknown", "0.0.0") else "adeu"
-
-        mcp_servers["adeu"] = {
-            "command": uvx_path,  # absolute path, not bare "uvx"
-            "args": ["--from", package_ref, "adeu-server", "--scope", args.scope],
-        }
-
-    new_content = json.dumps(data, indent=2)
-
-    # No-op detection: re-running init with an unchanged result must neither
-    # rewrite the config nor pile up .bak files (QA 2026-07-18 L5).
-    if config_path.exists():
-        try:
-            current_content = config_path.read_text(encoding="utf-8")
-        except OSError:
-            current_content = None
-        if current_content is not None and existing_valid_json:
-            try:
-                unchanged = json.loads(current_content or "{}") == data
-            except json.JSONDecodeError:
-                unchanged = False
-            if unchanged:
-                print("✅ Adeu is already configured — config unchanged, no backup needed.")
-                return
-
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = config_path.with_name(f"{config_path.name}.{timestamp}.bak")
-        shutil.copy2(config_path, backup_path)
-        print(f"📦 Backup created: {backup_path.name}")
-
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-
-    print("✅ Adeu successfully configured in Claude Desktop.")
-    print("   Please restart Claude to load the new toolset.")
-
 
 # When True (set per-invocation from a subcommand's --json flag), every fatal
 # CLI error emits one machine-readable JSON object on stdout in addition to
@@ -738,35 +596,25 @@ def handle_extract(args):
         # that aliases the input DOCX.
         protected = [(args.input, "input DOCX")] if args.input else []
         _guard_text_output_path(args.output, protected)
-    if args.live:
-        if sys.platform != "win32":
-            _cli_error("unsupported", "--live is only supported on Windows.")
-        from adeu.mcp_components.tools.live_word import _read_active_word_document_core
+    doc = _load_docx_or_exit(args.input)
 
-        text, doc, paragraph_offsets = _read_active_word_document_core(clean_view=args.clean_view)
+    # Perform extraction
+    needs_appendix = args.mode == "appendix"
+    needs_offsets = args.mode == "outline"
+
+    from adeu.ingest import _extract_text_from_doc
+
+    extract_result = _extract_text_from_doc(
+        doc,
+        clean_view=args.clean_view,
+        include_appendix=needs_appendix,
+        return_paragraph_offsets=needs_offsets,
+    )
+    if needs_offsets:
+        text, paragraph_offsets = extract_result
     else:
-        if not args.input:
-            _cli_error("invalid_input", "Must provide input file or use --live", exit_code=2)
-
-        doc = _load_docx_or_exit(args.input)
-
-        # Perform extraction
-        needs_appendix = args.mode == "appendix"
-        needs_offsets = args.mode == "outline"
-
-        from adeu.ingest import _extract_text_from_doc
-
-        extract_result = _extract_text_from_doc(
-            doc,
-            clean_view=args.clean_view,
-            include_appendix=needs_appendix,
-            return_paragraph_offsets=needs_offsets,
-        )
-        if needs_offsets:
-            text, paragraph_offsets = extract_result
-        else:
-            text = extract_result
-            paragraph_offsets = None
+        text = extract_result
+        paragraph_offsets = None
 
     from adeu.mcp_components._response_builders import (
         build_appendix_response,
@@ -844,7 +692,7 @@ def handle_extract(args):
                 getattr(args, "search_regex", False),
                 not getattr(args, "search_case_insensitive", False),
                 args.page,
-                "Active Document" if args.live else str(args.input),
+                str(args.input),
                 is_cli=True,
                 max_matches=getattr(args, "max_matches", 20),
                 match_offset=getattr(args, "match_offset", 0),
@@ -854,7 +702,7 @@ def handle_extract(args):
             res = build_outline_response(
                 doc,
                 text,
-                "Active Document" if args.live else str(args.input),
+                str(args.input),
                 outline_max_level=args.outline_max_level,
                 outline_verbose=args.outline_verbose,
                 paragraph_offsets=paragraph_offsets,
@@ -886,7 +734,7 @@ def handle_extract(args):
 
             res = build_changes_response(
                 text,
-                "Active Document" if args.live else str(args.input),
+                str(args.input),
                 comments_data=comments_data,
                 author_filter=getattr(args, "changes_author", None),
                 page=args.page,
@@ -901,14 +749,14 @@ def handle_extract(args):
                 text,
                 range_start,
                 range_end,
-                "Active Document" if args.live else str(args.input),
+                str(args.input),
                 is_cli=True,
             )
         elif args.mode == "appendix":
             res = build_appendix_response(
                 text,
                 page_num,
-                "Active Document" if args.live else str(args.input),
+                str(args.input),
                 is_cli=True,
             )
         elif want_all_pages:
@@ -928,7 +776,7 @@ def handle_extract(args):
                     "response_budget_exceeded",
                     build_budget_guard_message(
                         text,
-                        "Active Document" if args.live else str(args.input),
+                        str(args.input),
                         doc=doc,
                         paragraph_offsets=paragraph_offsets,
                         is_cli=True,
@@ -940,13 +788,13 @@ def handle_extract(args):
 
             res = build_full_document_response(
                 text,
-                "Active Document" if args.live else str(args.input),
+                str(args.input),
             )
         else:
             res = build_paginated_response(
                 text,
                 page_num,
-                "Active Document" if args.live else str(args.input),
+                str(args.input),
                 is_cli=True,
             )
 
@@ -1173,15 +1021,6 @@ def handle_apply(args):
             "stored in a DOCX. Remove them and re-run.",
         )
 
-    if args.live:
-        if args.changes is None and args.original is not None:
-            # Shift positional arguments if only one is provided
-            args.changes = args.original
-            args.original = None
-
-    if not args.changes:
-        _cli_error("invalid_input", "Must provide changes file.", exit_code=2)
-
     _require_docx_output(args.output)
 
     changes: List[DocumentChange] = []
@@ -1202,72 +1041,40 @@ def handle_apply(args):
     else:
         if not args.json:
             print(f"Calculating diff from text file {args.changes}...", file=sys.stderr)
-        if args.live:
-            if sys.platform != "win32":
-                _cli_error("unsupported", "--live is only supported on Windows.")
-            from adeu.mcp_components.tools.live_word import (
-                _read_active_word_document_core,
-            )
+        doc = _load_docx_or_exit(args.original)
 
-            text_orig, _, _ = _read_active_word_document_core(clean_view=False)
-        else:
-            if not args.original:
-                _cli_error("invalid_input", "Must provide original file if not using --live", exit_code=2)
-            doc = _load_docx_or_exit(args.original)
+        from adeu.ingest import _extract_text_from_doc
 
-            from adeu.ingest import _extract_text_from_doc
+        # Canonical baseline for text-file input: the CLEAN (accepted)
+        # view. Extract with --clean-view (and --page all on multi-page
+        # documents) to produce a file this path can round-trip.
+        text_orig = _extract_text_from_doc(doc, clean_view=True, include_appendix=False)
 
-            # Canonical baseline for text-file input: the CLEAN (accepted)
-            # view. Extract with --clean-view (and --page all on multi-page
-            # documents) to produce a file this path can round-trip.
-            text_orig = _extract_text_from_doc(doc, clean_view=True, include_appendix=False)
+        text_mod = _load_roundtrip_text(args.changes, args.original, "apply")
 
-            text_mod = _load_roundtrip_text(args.changes, args.original, "apply")
-
-            guard_ratio = (
-                _MAJOR_DELETION_RATIO
-                if len(text_orig) >= _MAJOR_DELETION_MIN_ORIGINAL_CHARS
-                else _MAJOR_DELETION_RATIO_SMALL_DOC
-            )
-            if not args.allow_major_deletions and len(text_orig) > 0 and len(text_mod) < guard_ratio * len(text_orig):
-                pct = 100 - int(100 * len(text_mod) / len(text_orig))
-                print(
-                    f"❌ '{args.changes.name}' is ~{pct}% shorter than the document's clean text "
-                    f"({len(text_mod):,} vs {len(text_orig):,} characters). Applying it would "
-                    "delete the majority of the document as tracked deletions.\n"
-                    "   If the file is a partial extract, re-extract the ENTIRE document with "
-                    "`--page all --clean-view` and edit that.\n"
-                    "   If the mass deletion is intentional, re-run with --allow-major-deletions.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
-            from adeu.diff import generate_edits_via_paragraph_alignment
-
-            changes.extend(generate_edits_via_paragraph_alignment(text_orig, text_mod))
-            verify_against = text_mod
-
-    if args.live:
-        if sys.platform != "win32":
-            _cli_error("unsupported", "--live is only supported on Windows.")
-        from adeu.mcp_components.tools.live_word import _process_active_word_batch_core
-
-        if not args.json:
-            print(f"Applying {len(changes)} changes to live Word document...", file=sys.stderr)
-        stats = _process_active_word_batch_core(changes, args.author)
-        if args.json:
-            print(json.dumps(stats))
-        else:
+        guard_ratio = (
+            _MAJOR_DELETION_RATIO
+            if len(text_orig) >= _MAJOR_DELETION_MIN_ORIGINAL_CHARS
+            else _MAJOR_DELETION_RATIO_SMALL_DOC
+        )
+        if not args.allow_major_deletions and len(text_orig) > 0 and len(text_mod) < guard_ratio * len(text_orig):
+            pct = 100 - int(100 * len(text_mod) / len(text_orig))
             print(
-                f"✅ Live Word Batch complete. Applied: {stats['applied']}, Failed: {stats['failed']}",
+                f"❌ '{args.changes.name}' is ~{pct}% shorter than the document's clean text "
+                f"({len(text_mod):,} vs {len(text_orig):,} characters). Applying it would "
+                "delete the majority of the document as tracked deletions.\n"
+                "   If the file is a partial extract, re-extract the ENTIRE document with "
+                "`--page all --clean-view` and edit that.\n"
+                "   If the mass deletion is intentional, re-run with --allow-major-deletions.",
                 file=sys.stderr,
             )
-        if stats["failed"] > 0:
             sys.exit(1)
-        return
 
-    if not args.original:
-        _cli_error("invalid_input", "Must provide original file if not using --live", exit_code=2)
+        from adeu.diff import generate_edits_via_paragraph_alignment
+
+        changes.extend(generate_edits_via_paragraph_alignment(text_orig, text_mod))
+        verify_against = text_mod
+
     _require_input_file(args.original)
 
     if not args.json:
@@ -1924,15 +1731,8 @@ def _main_impl():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     subparsers = parser.add_subparsers(dest="command", required=True, help="Subcommands")
 
-    live_help_prefix = "Windows-only: " if sys.platform != "win32" else ""
-
     p_extract = subparsers.add_parser("extract", help="Extract raw text from a DOCX file")
-    p_extract.add_argument("input", type=Path, nargs="?", help="Input DOCX file (omit if --live)")
-    p_extract.add_argument(
-        "--live",
-        action="store_true",
-        help=f"{live_help_prefix}Extract text from live active Word document",
-    )
+    p_extract.add_argument("input", type=Path, help="Input DOCX file")
     p_extract.add_argument("-o", "--output", type=Path, help="Output file ('-' or omitted: stdout)")
     p_extract.add_argument(
         "--force",
@@ -2032,20 +1832,6 @@ def _main_impl():
     )
     p_extract.set_defaults(func=handle_extract)
 
-    p_init = subparsers.add_parser("init", help="Auto-configure Adeu for Claude Desktop")
-    p_init.add_argument(
-        "--local",
-        action="store_true",
-        help="Configure to run from current source (for dev/testing)",
-    )
-    p_init.add_argument(
-        "--scope",
-        choices=["all", "docx"],
-        default="all",
-        help="Limit exposed tools to local manipulation ('docx') or everything ('all').",
-    )
-    p_init.set_defaults(func=handle_init)
-
     p_diff = subparsers.add_parser("diff", help="Compare two files (DOCX vs DOCX/Text)")
     p_diff.add_argument("original", type=Path, help="Original DOCX")
     p_diff.add_argument("modified", type=Path, help="Modified DOCX or Text file")
@@ -2080,13 +1866,8 @@ def _main_impl():
             "    comment    — attach a Word comment to the change\n"
         ),
     )
-    p_apply.add_argument("original", type=Path, nargs="?", help="Original DOCX (omit if --live)")
-    p_apply.add_argument("changes", type=Path, nargs="?", help="JSON edits file OR Modified Text file")
-    p_apply.add_argument(
-        "--live",
-        action="store_true",
-        help=f"{live_help_prefix}Apply edits to live active Word document",
-    )
+    p_apply.add_argument("original", type=Path, help="Original DOCX")
+    p_apply.add_argument("changes", type=Path, help="JSON edits file OR Modified Text file")
     p_apply.add_argument("-o", "--output", type=Path, help="Output DOCX path")
     p_apply.add_argument(
         "--author",

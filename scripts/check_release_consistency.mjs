@@ -43,7 +43,6 @@ const VALID_CATEGORIES = new Set([
 // FILES_TO_BUMP there — this check is what catches it if they drift.
 const VERSIONED_MANIFESTS = [
   "python/pyproject.toml",
-  "langchain/pyproject.toml",
   "node/packages/core/package.json",
   "node/packages/mcp-server/package.json",
   "desktop-extension/manifest.json",
