@@ -21,6 +21,7 @@ from adeu.mcp_components._response_builders import (
     BuilderResult,
     build_appendix_response,
     build_changes_response,
+    build_fields_response,
     build_full_document_response,
     build_outline_response,
     build_page_range_response,
@@ -213,12 +214,18 @@ def _summarize_validation_error(exc: Exception) -> str:
     """
     from pydantic import ValidationError
 
+    from adeu.payloads import FUSED_JSON_HINT, has_fused_json_marker
+
     if not isinstance(exc, ValidationError):
         return str(exc)
     parts: List[str] = []
     for err in exc.errors():
         loc = ".".join(str(p) for p in err.get("loc", ()))
         msg = err.get("msg", "invalid")
+        if err.get("type") == "union_tag_invalid":
+            tag = err.get("ctx", {}).get("tag", "")
+            if has_fused_json_marker(str(tag)):
+                msg = f"{msg}. {FUSED_JSON_HINT}" if not msg.endswith(".") else f"{msg} {FUSED_JSON_HINT}"
         parts.append(f"{loc}: {msg}" if loc else msg)
     return "; ".join(parts) if parts else str(exc)
 
@@ -332,6 +339,17 @@ def _schedule_background_fill(entry, clean_view: bool) -> None:
             entry.clean_fill_scheduled = False
 
 
+def _mcp_fields_banner(file_path: str) -> "str | None":
+    """The A1.9 banner for an MCP full-view read, or None.
+
+    Surface-aware hint (QA F11): an MCP client cannot run a shell command, so
+    it is pointed at the read mode instead of the CLI flag.
+    """
+    from adeu.fields import banner_for_path
+
+    return banner_for_path(file_path, hint=' \u00b7 read mode="fields" for the field ledger')
+
+
 async def _read_docx_disk(
     file_path: str,
     ctx: Context,
@@ -346,6 +364,7 @@ async def _read_docx_disk(
     search_case_sensitive: bool = True,
     changes_author: Optional[str] = None,
     changes_offset: int = 0,
+    fields_offset: int = 0,
     max_matches: int = 20,
     match_offset: int = 0,
     full_paragraph: bool = False,
@@ -458,6 +477,28 @@ async def _read_docx_disk(
                     )
                 )
 
+            if mode == "fields":
+                # RAW projection: the ledger previews values from the text
+                # between a control's anchors, and the clean view drops the
+                # placeholder bubbles that distinguish an empty control.
+                text, pagination = await asyncio.to_thread(
+                    doc_cache.get_pagination, entry, clean_view=False, cb=relay.callback
+                )
+                await ctx.info("Successfully extracted text from DOCX", extra={"text_length": len(text)})
+                from adeu.cli import _load_docx_or_exit
+
+                doc = await asyncio.to_thread(_load_docx_or_exit, Path(file_path))
+                return _as_tool_result(
+                    build_fields_response(
+                        doc,
+                        text,
+                        file_path,
+                        offset=fields_offset,
+                        is_cli=False,
+                        pagination_result=pagination,
+                    )
+                )
+
             if mode == "appendix":
                 text = await asyncio.to_thread(doc_cache.get_text_with_appendix, entry, clean_view, relay.callback)
                 await ctx.info("Successfully extracted text from DOCX", extra={"text_length": len(text)})
@@ -520,7 +561,9 @@ async def _read_docx_disk(
                                 pagination_result=pagination,
                             )
                         )
-                    return _as_tool_result(build_full_document_response(text, file_path))
+                    return _as_tool_result(
+                        build_full_document_response(text, file_path, fields_banner=_mcp_fields_banner(file_path))
+                    )
                 if kind == "range":
                     assert isinstance(page_val, tuple)
                     start_p, end_p = page_val
@@ -535,7 +578,15 @@ async def _read_docx_disk(
                     )
                 assert isinstance(page_val, int)
                 page_num = page_val
-            return _as_tool_result(build_paginated_response(text, page_num, file_path, pagination_result=pagination))
+            return _as_tool_result(
+                build_paginated_response(
+                    text,
+                    page_num,
+                    file_path,
+                    pagination_result=pagination,
+                    fields_banner=_mcp_fields_banner(file_path),
+                )
+            )
         finally:
             await relay.finish()
             # Warm the clean view in the background after a cold RAW ingest —
@@ -567,6 +618,10 @@ async def _process_document_batch_disk(
     changes: List[DocumentChange],
     output_path: Optional[str],
     rejected_notes: Optional[RejectedNotes] = None,
+    partial: bool = True,
+    ignore_control_locks: bool = False,
+    ignore_document_protection: bool = False,
+    allow_untracked_writes: bool = False,
 ) -> str:
     """Core logic for modifying a DOCX on disk."""
     # Batches are heavy CPU: let the projection cache's background fills see
@@ -623,13 +678,42 @@ async def _process_document_batch_disk(
 
     def _run_batch_sync() -> tuple[bool, Any, str, str]:
         stream = read_file_bytes(original_docx_path)
-        engine = RedlineEngine(stream, author=author_name, id_discovery_hint=MCP_ID_DISCOVERY_HINT)
+        engine = RedlineEngine(
+            stream,
+            author=author_name,
+            id_discovery_hint=MCP_ID_DISCOVERY_HINT,
+            ignore_control_locks=ignore_control_locks,
+            ignore_document_protection=ignore_document_protection,
+            allow_untracked_writes=allow_untracked_writes,
+        )
 
         valid_indices = getattr(rejected_notes, "valid_indices", None)
         try:
-            stats = engine.process_batch(changes, original_indices=valid_indices)
+            stats = engine.process_batch(changes, original_indices=valid_indices, partial=partial)
         except BatchValidationError as e:
             return False, e, "", ""
+
+        applied_count = stats.get("edits_applied", 0) + stats.get("actions_applied", 0)
+        engine_failed = list(stats.get("failed", []))
+        schema_failed = getattr(rejected_notes, "pairs", []) if rejected_notes else []
+
+        if applied_count == 0 and (engine_failed or schema_failed):
+            err_list: list[str] = []
+            failed_pairs: list[tuple[int, str]] = []
+            for idx, note in schema_failed:
+                err_list.append(f"changes[{idx}]: {note}")
+                failed_pairs.append((idx, str(note)))
+            for item in engine_failed:
+                err_list.append(item["reason"])
+                failed_pairs.append((item["index"], str(item["reason"])))
+
+            env = failure_envelope(
+                "batch_validation_failed",
+                failed_pairs,
+                "Batch rejected. Some edits failed validation.",
+                errors=err_list,
+            )
+            return False, env, "", ""
 
         final_output = output_path
         if not final_output:
@@ -657,6 +741,10 @@ async def _process_document_batch_disk(
             if isinstance(exc, BatchValidationError):
                 err_list = list(exc.errors)
                 failed_pairs = list(exc.failed)
+            elif isinstance(exc, dict):
+                json_block = f"\n\n```json\n{json.dumps(exc, ensure_ascii=False)}\n```"
+                err_list = exc.get("errors", [exc.get("message", "Batch rejected")])
+                return "Batch rejected. Some edits failed validation:\n\n" + "\n\n".join(err_list) + json_block
             else:
                 err_list = exc if isinstance(exc, list) else [str(exc)]
                 failed_pairs = []
@@ -699,7 +787,51 @@ async def _process_document_batch_disk(
                 pass
 
         stats = result_data
-        res = rejection_prefix + f"Batch complete. Saved to: {final_output_path}{overwrite_note}\n"
+        applied_count = stats.get("edits_applied", 0) + stats.get("actions_applied", 0)
+        engine_failed = list(stats.get("failed", []))
+        schema_failed = getattr(rejected_notes, "pairs", []) if rejected_notes else []
+
+        is_partial_success = (
+            partial
+            and (bool(schema_failed) or bool(engine_failed) or stats.get("status") == "partial")
+            and applied_count > 0
+        )
+
+        # Partial success is a SUCCESS response with the failures hoisted to
+        # the top — never a failure envelope. A batch envelope carries
+        # BATCH_RECOVERY_PROTOCOL ("Nothing was written"), which contradicts
+        # the saved output path printed in the same response.
+        partial_header = ""
+        if is_partial_success:
+            combined_fails: list[tuple[int, str]] = []
+            for idx, note in schema_failed:
+                combined_fails.append((idx, f"changes[{idx}]: {note}"))
+            for item in engine_failed:
+                combined_fails.append((item["index"], item["reason"]))
+            combined_fails.sort(key=lambda x: x[0])
+
+            max_idx = max([idx for idx, _ in combined_fails] + [0])
+            total_n = max(max_idx + 1, len(changes) + len(schema_failed))
+
+            partial_header = (
+                f"PARTIAL: applied {applied_count} of {total_n} changes. {len(combined_fails)} failed validation:\n\n"
+            )
+            for idx, reason in combined_fails:
+                partial_header += f"- Change #{idx + 1} Failed: {reason}\n"
+            partial_header += "\n"
+
+        # The partial header already lists the schema rejections, so it
+        # replaces (never stacks with) the rejection preamble.
+        res = (partial_header or rejection_prefix) + f"Batch complete. Saved to: {final_output_path}{overwrite_note}\n"
+
+        # spec-gates §5: an exercised override is disclosed in the report
+        # header, beside the impersonation warning, because both are "this
+        # batch did something the default would not have".
+        if stats.get("overrides_note"):
+            res += f"\n*{stats['overrides_note']}*\n"
+        if stats.get("author_impersonation_warning"):
+            await ctx.warning(stats["author_impersonation_warning"])
+            res += f"\n*Warning:* {stats['author_impersonation_warning']}\n"
 
         total_occurrences = sum(
             e.get("occurrences_modified", 1) for e in stats.get("edits", []) if e.get("status") == "applied"
@@ -721,6 +853,11 @@ async def _process_document_batch_disk(
                 res += f"### Edit {i + 1} {status_indicator}{page_suffix}\n"
                 if report.get("heading_path"):
                     res += f"**Path:** `{report['heading_path']}`\n"
+                if report.get("field"):
+                    # Audit-trail symmetry with Path: an edit inside a content
+                    # control is subject to that control's locks and binding,
+                    # which decides whether a human can keep it.
+                    res += f"field: {report['field']}\n"
 
                 occ = report.get("occurrences_modified", 0)
                 occ_text = f"{occ} occurrence{'s' if occ != 1 else ''} modified"
@@ -958,10 +1095,17 @@ def _create_diff_output(original_path: str, modified_path: str, text_orig: str, 
 
 @tool(
     description=(
-        "Accepts all tracked changes and removes all comments in a single operation, "
-        "producing a finalized clean document. "
-        "Use this when a document review is entirely complete and you want to clear all redlines. "
-        "For selective acceptance/rejection of specific changes, use `process_document_batch` instead."
+        "Accepts every tracked change in the document, producing a finalized clean document. "
+        "Use this when a document review is entirely complete. "
+        "For selective acceptance/rejection of specific changes, use `process_document_batch` instead. "
+        "\n\n"
+        "remove_comments (boolean, DEFAULT TRUE): also delete every comment. The default is TRUE "
+        "because this tool's purpose is a distributable clean document, and comments are internal "
+        "review notes that must not travel to a counterparty. Pass remove_comments=false to accept "
+        "the tracked changes while KEEPING the comments — use that when the review conversation is "
+        "still live. Either way the response reports how many comments were deleted and names each "
+        "one with its author, and comments whose anchored text an accepted deletion consumes are "
+        "removed regardless, exactly as Word does."
     ),
     tags={"docx"},
     annotations={"destructiveHint": True},
@@ -970,6 +1114,11 @@ async def accept_all_changes(
     docx_path: Annotated[str, "Absolute path to the DOCX file."],
     ctx: Context,
     output_path: Annotated[Optional[str], "Optional output path."] = None,
+    remove_comments: Annotated[
+        bool,
+        "Also delete every comment in the document. Defaults to True (finalized clean document); "
+        "pass false to keep comments while accepting the tracked changes.",
+    ] = True,
     reasoning: Annotated[
         Optional[str],
         "Why do I need to accept all changes in this document? State this reason before any other parameter.",
@@ -982,8 +1131,18 @@ async def accept_all_changes(
         stream = read_file_bytes(docx_path)
         engine = RedlineEngine(stream, id_discovery_hint=MCP_ID_DISCOVERY_HINT)
 
-        await ctx.debug("Engine loaded, executing accept_all_revisions()")
-        counts = engine.accept_all_revisions(remove_comments=True)
+        # This surface DELIBERATELY defaults to True while the library API
+        # defaults to False: `accept_all_changes` exists to produce a
+        # distributable clean document, and shipping a counterparty a file that
+        # still carries internal review notes is the more expensive failure
+        # (QA_ISSUES_DISCOVERED #10, "Confidentiality risk"). What
+        # BUG_comment_threading_anchoring_and_typography.md B2 correctly
+        # objected to was that the inversion was SILENT and unavoidable — the
+        # caller now has an explicit parameter, the published description states
+        # the default, and every deleted comment is named with its author.
+        await ctx.debug(f"Engine loaded, executing accept_all_revisions(remove_comments={remove_comments})")
+        counts = engine.accept_all_revisions(remove_comments=remove_comments)
+        removed_comment_notes = list(engine.removed_comment_notes)
 
         if not output_path:
             p = Path(docx_path)
@@ -1000,7 +1159,9 @@ async def accept_all_changes(
 
         # A no-op must be reported as one (QA 2026-07-23 F18), and comment
         # removal is destructive review-content cleanup that the response
-        # must disclose, never perform silently (F12).
+        # must disclose, never perform silently (F12) — naming each comment AND
+        # its author, because a comment the caller did not write is somebody
+        # else's work product (B2).
         if accepted_ins + accepted_del + accepted_fmt + removed_comments == 0:
             res = (
                 "No tracked changes or comments to accept — the document is "
@@ -1013,8 +1174,17 @@ async def accept_all_changes(
                 f"Deletions accepted: {accepted_del}\n"
                 f"Formatting changes accepted: {accepted_fmt}\n"
                 f"Comments removed: {removed_comments}"
-                f"{overwrite_note}"
             )
+            if removed_comment_notes:
+                res += "\nComments deleted: " + ", ".join(removed_comment_notes)
+                if not remove_comments:
+                    res += (
+                        "\nNote: these comments were anchored to text an accepted deletion "
+                        "consumed, so Word removes them too. Nothing else was deleted."
+                    )
+            elif not remove_comments:
+                res += "\nComments kept (remove_comments=false)."
+            res += overwrite_note
         return add_timing_if_debug(start_time, res)
     except Exception as e:
         await ctx.error(
@@ -1022,6 +1192,73 @@ async def accept_all_changes(
             extra={"error": str(e), "docx_path": docx_path},
         )
         return add_timing_if_debug(start_time, f"Error accepting changes: {str(e)}")
+
+
+@tool(
+    description=(
+        "Applies whole-text revised text to a DOCX document by computing a diff and generating tracked changes. "
+        "Includes a clean-text verification gate to ensure the applied document matches the supplied text."
+    ),
+    tags={"docx"},
+    annotations={"destructiveHint": True},
+)
+async def apply_text_revision(
+    file_path: Annotated[str, "Absolute path to the source DOCX file."],
+    revised_text: Annotated[str, "The complete revised clean text of the document."],
+    ctx: Context,
+    output_path: Annotated[Optional[str], "Optional output path for the modified DOCX."] = None,
+    author: Annotated[Optional[str], "Author name for Track Changes."] = None,
+    allow_major_deletions: Annotated[
+        bool,
+        "Allow deleting >50% of characters (>75% for documents under 2000 characters).",
+    ] = False,
+    reasoning: Annotated[
+        Optional[str],
+        "Why do I need to apply this text revision? State this reason before any other parameter.",
+    ] = "",
+) -> str:
+    start_time = time.perf_counter()
+    del reasoning  # reason-first UX; not used by the tool.
+    await ctx.info(f"Applying text revision to document: {Path(file_path).name}")
+
+    from adeu.text_revision import (
+        TextRevisionVerificationError,
+        apply_text_revision_core,
+    )
+
+    try:
+        stats, out_path = await asyncio.to_thread(
+            apply_text_revision_core,
+            file_path,
+            revised_text,
+            output_path,
+            author,
+            allow_major_deletions,
+        )
+        applied_count = stats.get("edits_applied", 0)
+        res = f"Text revision complete. Saved to: {out_path}\nEdits: {applied_count} applied."
+        return add_timing_if_debug(start_time, res)
+    except TextRevisionVerificationError as e:
+        await ctx.error(
+            "Text revision verification failed",
+            extra={
+                "unverified_path": str(e.unverified_path),
+                "output_path": str(e.output_path),
+            },
+        )
+        raise ToolError(str(e)) from e
+    except (ValueError, FileNotFoundError) as e:
+        await ctx.error(
+            "Failed to apply text revision",
+            extra={"error": str(e), "file_path": file_path},
+        )
+        raise ToolError(str(e)) from e
+    except Exception as e:
+        await ctx.error(
+            "Failed to apply text revision",
+            extra={"error": str(e), "file_path": file_path},
+        )
+        raise ToolError(f"Error applying text revision: {str(e)}") from e
 
 
 @tool(
@@ -1091,6 +1328,32 @@ PROCESS_BATCH_COMMON_DESC = (
     "Validation failures reject the whole batch transactionally: nothing is "
     "applied until every change resolves.\n\n"
 )
+# CC-4 override parameters (spec-gates.md §1). Defined once and reused by both
+# tool registrations so the win32 and non-win32 surfaces cannot drift in either
+# their defaults or their prose — the two have drifted before.
+#
+# All three default False. spec-gates §1 requires it: a truthy default survives
+# client stripping, and a gate that defaults to off is a gate that does not
+# exist. The defaults are restated in the description text per the §7a rule,
+# because some clients show the caller only the prose.
+IgnoreControlLocksParam = Annotated[
+    bool,
+    "Apply edits even inside content-locked or grouped content controls. Defaults to False. "
+    "Word refuses such edits, so overriding means the document owner has accepted the lock is wrong.",
+]
+IgnoreDocumentProtectionParam = Annotated[
+    bool,
+    "Apply changes even when the document carries enforced editing protection "
+    "(read-only, fill-in-forms, comments-only, tracked-changes-only). Defaults to False.",
+]
+AllowUntrackedWritesParam = Annotated[
+    bool,
+    "Permit writes that Word records WITHOUT tracked changes. Defaults to False. Applies only to "
+    "fill-in-forms-protected documents, where Word does not record revisions at all; every such "
+    "write is flagged in the report. This is separate from ignore_document_protection because it "
+    "concedes Adeu's own always-tracked guarantee rather than bypassing the author's restriction.",
+]
+
 PROCESS_BATCH_WIN32_EXTRA = (
     "If the file is open in Word, edits run live on the canvas. "
     "Leave original_docx_path empty to edit whatever document is currently active.\n\n"
@@ -1102,9 +1365,17 @@ PROCESS_BATCH_OPERATIONS_DESC = (
     "'# Heading 1' through '###### Heading 6', '**bold**', '_italic_', and '\\n\\n' "
     "to split into multiple paragraphs. Empty `new_text` deletes. Do NOT write "
     "CriticMarkup tags ({++, {--, {>>) manually — use the `comment` parameter for comments.\n"
-    "2. 'accept' / 'reject': Finalize or revert a tracked change by `target_id` (e.g. 'Chg:12').\n"
+    "2. 'accept' / 'reject': Finalize or revert a tracked change by `target_id` (e.g. 'Chg:12'). "
+    "Revision ids are numbered per package part; if the same id exists in several parts "
+    "(e.g. body and a header) the bare id is refused, and the optional `part` field "
+    "(e.g. 'word/header1.xml') picks the one you mean.\n"
     "3. 'reply': Reply to a comment by `target_id` (e.g. 'Com:5') with `text`.\n"
-    "4. 'insert_row' / 'delete_row': Table edits. Disk mode only — not supported on Live Word canvas.\n\n"
+    "4. 'set_field': Fill a content control (form field) — `field` is its 'CC:<N>' id, "
+    "tag or alias, `value` the text; list them with `read_docx` mode='fields'. Checkboxes "
+    "take true/false, dates YYYY-MM-DD, dropdowns a listed option. Data-bound controls "
+    "update their store too. A locked or protected control refuses and names the override "
+    "that permits it.\n"
+    "5. 'insert_row' / 'delete_row': Table edits. Disk mode only — not supported on Live Word canvas.\n\n"
     "ID VOLATILITY: 'Chg:N' and 'Com:N' shift between document states. "
     "Always call `read_docx` immediately before any accept/reject/reply — "
     "do not reuse IDs from earlier in the conversation.\n\n"
@@ -1145,10 +1416,11 @@ if sys.platform == "win32":
             "If False (default), returns the 'Raw' text with inline CriticMarkup. If True, returns 'Accepted' text.",
         ] = False,
         mode: Annotated[
-            Literal["full", "outline", "appendix", "changes"],
+            Literal["full", "outline", "appendix", "changes", "fields"],
             "'full' returns body content (paginated). 'outline' returns a structural "
             "heading map. 'appendix' returns defined terms, anchors, and diagnostics. "
-            "'changes' returns a tracked changes & comments ledger.",
+            "'changes' returns a tracked changes & comments ledger. 'fields' returns "
+            "the content-control ledger.",
         ] = "full",
         page: Annotated[
             Optional[Union[int, str]],
@@ -1202,6 +1474,10 @@ if sys.platform == "win32":
             int,
             "For mode='changes' only: entry offset for paginating tracked changes ledger.",
         ] = 0,
+        fields_offset: Annotated[
+            int,
+            "For mode='fields' only: entry offset for paginating the content-control ledger.",
+        ] = 0,
         reasoning: Annotated[
             Optional[str],
             "Why do I need to read this docx document? State this reason before any other parameter.",
@@ -1215,26 +1491,27 @@ if sys.platform == "win32":
         # response builder distinguish "omitted" from "explicit 1".
         if search_query is None and mode != "changes" and page is None:
             page = 1
+
+        opts: dict[str, Any] = {
+            "mode": mode,
+            "page": page,
+            "force": force,
+            "outline_max_level": outline_max_level,
+            "outline_verbose": outline_verbose,
+            "search_query": search_query,
+            "search_regex": search_regex,
+            "search_case_sensitive": search_case_sensitive,
+            "changes_author": changes_author,
+            "changes_offset": changes_offset,
+            "fields_offset": fields_offset,
+            "max_matches": max_matches,
+            "match_offset": match_offset,
+            "full_paragraph": full_paragraph,
+        }
+
         if not file_path:
             # Read active document directly. No disk fallback available if this fails.
-            res = await read_active_word_document(
-                ctx,
-                clean_view,
-                None,
-                mode=mode,
-                page=page,
-                force=force,
-                outline_max_level=outline_max_level,
-                outline_verbose=outline_verbose,
-                search_query=search_query,
-                search_regex=search_regex,
-                search_case_sensitive=search_case_sensitive,
-                changes_author=changes_author,
-                changes_offset=changes_offset,
-                max_matches=max_matches,
-                match_offset=match_offset,
-                full_paragraph=full_paragraph,
-            )
+            res = await read_active_word_document(ctx, clean_view, None, **opts)
         else:
             # An explicit file_path means the file on disk is authoritative:
             # read from disk UNLESS Word already has that exact file open (in
@@ -1246,24 +1523,7 @@ if sys.platform == "win32":
             if is_document_open_in_word(file_path):
                 await ctx.debug("Document is open in live Word; reading from the canvas.")
                 try:
-                    res = await read_active_word_document(
-                        ctx,
-                        clean_view,
-                        file_path,
-                        mode=mode,
-                        page=page,
-                        force=force,
-                        outline_max_level=outline_max_level,
-                        outline_verbose=outline_verbose,
-                        search_query=search_query,
-                        search_regex=search_regex,
-                        search_case_sensitive=search_case_sensitive,
-                        changes_author=changes_author,
-                        changes_offset=changes_offset,
-                        max_matches=max_matches,
-                        match_offset=match_offset,
-                        full_paragraph=full_paragraph,
-                    )
+                    res = await read_active_word_document(ctx, clean_view, file_path, **opts)
                 except LiveWordUnavailableError:
                     # The probe reported the file open, but Word/COM turned out to
                     # be unusable (dead or zombie instance). Since we hold an
@@ -1274,43 +1534,9 @@ if sys.platform == "win32":
                     # propagate. Only reachable when a file_path exists; the
                     # active-document mode above has no disk fallback by design.
                     await ctx.debug("Live Word probe matched but COM was unavailable; falling back to disk read.")
-                    res = await _read_docx_disk(
-                        file_path,
-                        ctx,
-                        clean_view,
-                        mode,
-                        page,
-                        force=force,
-                        outline_max_level=outline_max_level,
-                        outline_verbose=outline_verbose,
-                        search_query=search_query,
-                        search_regex=search_regex,
-                        search_case_sensitive=search_case_sensitive,
-                        changes_author=changes_author,
-                        changes_offset=changes_offset,
-                        max_matches=max_matches,
-                        match_offset=match_offset,
-                        full_paragraph=full_paragraph,
-                    )
+                    res = await _read_docx_disk(file_path, ctx, clean_view, **opts)
             else:
-                res = await _read_docx_disk(
-                    file_path,
-                    ctx,
-                    clean_view,
-                    mode,
-                    page,
-                    force=force,
-                    outline_max_level=outline_max_level,
-                    outline_verbose=outline_verbose,
-                    search_query=search_query,
-                    search_regex=search_regex,
-                    search_case_sensitive=search_case_sensitive,
-                    changes_author=changes_author,
-                    changes_offset=changes_offset,
-                    max_matches=max_matches,
-                    match_offset=match_offset,
-                    full_paragraph=full_paragraph,
-                )
+                res = await _read_docx_disk(file_path, ctx, clean_view, **opts)
         return add_timing_if_debug(start_time, res)
 
     @tool(
@@ -1336,6 +1562,13 @@ if sys.platform == "win32":
             Optional[str],
             "Optional output path (only used if original_docx_path is provided).",
         ] = None,
+        partial: Annotated[
+            bool,
+            "Whether to apply valid edits when some fail (salvage mode). Defaults to True.",
+        ] = True,
+        ignore_control_locks: IgnoreControlLocksParam = False,
+        ignore_document_protection: IgnoreDocumentProtectionParam = False,
+        allow_untracked_writes: AllowUntrackedWritesParam = False,
         reasoning: Annotated[
             Optional[str],
             "Why do I need to apply these changes to the document? State this reason before any other parameter.",
@@ -1365,7 +1598,17 @@ if sys.platform == "win32":
             )
         if not original_docx_path:
             # Edit active document directly. No disk fallback available.
-            res = await process_active_word_batch(ctx, changes, author_name, None)
+            res = await process_active_word_batch(
+                ctx,
+                changes,
+                author_name,
+                None,
+                {
+                    "ignore_control_locks": ignore_control_locks,
+                    "ignore_document_protection": ignore_document_protection,
+                    "allow_untracked_writes": allow_untracked_writes,
+                },
+            )
         elif is_document_open_in_word(original_docx_path):
             # The file is open in Word: apply edits to the live canvas so the
             # agent's changes land where the user is looking. If the probe matched
@@ -1373,7 +1616,17 @@ if sys.platform == "win32":
             # (which the explicit path makes authoritative) instead of erroring.
             await ctx.debug("Document is open in live Word; editing the canvas.")
             try:
-                res = await process_active_word_batch(ctx, changes, author_name, original_docx_path)
+                res = await process_active_word_batch(
+                    ctx,
+                    changes,
+                    author_name,
+                    original_docx_path,
+                    {
+                        "ignore_control_locks": ignore_control_locks,
+                        "ignore_document_protection": ignore_document_protection,
+                        "allow_untracked_writes": allow_untracked_writes,
+                    },
+                )
             except LiveWordUnavailableError:
                 await ctx.debug("Live Word probe matched but COM was unavailable; falling back to disk edit.")
                 res = await _process_document_batch_disk(
@@ -1383,6 +1636,10 @@ if sys.platform == "win32":
                     changes,
                     output_path,
                     rejected_notes=rejected_notes,
+                    partial=partial,
+                    ignore_control_locks=ignore_control_locks,
+                    ignore_document_protection=ignore_document_protection,
+                    allow_untracked_writes=allow_untracked_writes,
                 )
         else:
             # Not open in Word (or Word not running): the file on disk is
@@ -1394,6 +1651,10 @@ if sys.platform == "win32":
                 changes,
                 output_path,
                 rejected_notes=rejected_notes,
+                partial=partial,
+                ignore_control_locks=ignore_control_locks,
+                ignore_document_protection=ignore_document_protection,
+                allow_untracked_writes=allow_untracked_writes,
             )
         return add_timing_if_debug(start_time, res)
 
@@ -1532,11 +1793,12 @@ else:
             "If False (default), returns the 'Raw' text with inline CriticMarkup. If True, returns 'Accepted' text.",
         ] = False,
         mode: Annotated[
-            Literal["full", "outline", "appendix", "changes"],
+            Literal["full", "outline", "appendix", "changes", "fields"],
             "'full' returns body content (paginated for large docs). 'outline' returns "
             "a structural heading map with page numbers; body content is omitted. "
             "'appendix' returns defined terms, anchors, and diagnostics — consult before "
-            "editing. 'changes' returns a tracked changes & comments ledger.",
+            "editing. 'changes' returns a tracked changes & comments ledger. 'fields' "
+            "returns the content-control ledger.",
         ] = "full",
         page: Annotated[
             Optional[Union[int, str]],
@@ -1590,6 +1852,10 @@ else:
             int,
             "For mode='changes' only: entry offset for paginating tracked changes ledger.",
         ] = 0,
+        fields_offset: Annotated[
+            int,
+            "For mode='fields' only: entry offset for paginating the content-control ledger.",
+        ] = 0,
         reasoning: Annotated[
             Optional[str],
             "Why do I need to read this docx document? State this reason before any other parameter.",
@@ -1613,6 +1879,7 @@ else:
             search_case_sensitive=search_case_sensitive,
             changes_author=changes_author,
             changes_offset=changes_offset,
+            fields_offset=fields_offset,
             max_matches=max_matches,
             match_offset=match_offset,
             full_paragraph=full_paragraph,
@@ -1636,6 +1903,13 @@ else:
             "Name to appear in Track Changes (e.g., 'Reviewer AI'). Defaults to 'Adeu AI' when omitted.",
         ] = "Adeu AI",
         output_path: Annotated[Optional[str], "Optional output path."] = None,
+        partial: Annotated[
+            bool,
+            "Whether to apply valid edits when some fail (salvage mode). Defaults to True.",
+        ] = True,
+        ignore_control_locks: IgnoreControlLocksParam = False,
+        ignore_document_protection: IgnoreDocumentProtectionParam = False,
+        allow_untracked_writes: AllowUntrackedWritesParam = False,
         reasoning: Annotated[
             Optional[str],
             "Why do I need to apply these changes to the document? State this reason before any other parameter.",
@@ -1666,5 +1940,9 @@ else:
             changes,
             output_path,
             rejected_notes=rejected_notes,
+            partial=partial,
+            ignore_control_locks=ignore_control_locks,
+            ignore_document_protection=ignore_document_protection,
+            allow_untracked_writes=allow_untracked_writes,
         )
         return add_timing_if_debug(start_time, res)

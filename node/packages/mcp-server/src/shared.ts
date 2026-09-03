@@ -1,15 +1,15 @@
-// FILE: node/packages/mcp-server/src/shared.ts
+import { split_structural_appendix } from "@adeu/core";
+
 export const MARKDOWN_UI_URI = "ui://adeu/markdown-ui";
 
-/**
- * Minimal CLI handling BEFORE the stdio server starts: `--help` and
- * `--version` must print and exit like every other executable instead of
- * silently starting the transport (QA 2026-07-19 v8 F-06). Returns the text
- * to print (caller exits without serving), or null to proceed with server
- * startup. Unknown arguments are tolerated — MCP hosts append their own
- * flags. Lives here (not index.ts) so tests can import it without booting
- * the server.
- */
+export const MCP_ID_DISCOVERY_HINT =
+  "Call `read_docx` with `mode='changes'` on the document again to list the current change (Chg:) and comment (Com:) ids — ids shift between document states.";
+
+export function split_projection(text: string): [string, string] {
+  const [body, appendix] = split_structural_appendix(text);
+  return [appendix ? body.replace(/\n\n---$/, "") : body, appendix];
+}
+
 export function handleServerCliArgs(
   argv: string[],
   packageVersion: string,

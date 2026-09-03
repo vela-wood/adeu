@@ -1,5 +1,10 @@
 import { DocxPackage, Part, DocumentObject } from './docx/bridge.js';
 import { findAllDescendants, findChild, parseXml } from './docx/dom.js';
+import {
+  generateLongHexNumber,
+  isWordReadableLongHexNumber,
+  toLongHexNumber,
+} from './docx/long-hex-number.js';
 
 const NS = {
   w: 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
@@ -23,6 +28,74 @@ const RT = {
   IDS: 'http://schemas.microsoft.com/office/2016/09/relationships/commentsIds',
   EXTENSIBLE: 'http://schemas.microsoft.com/office/2018/08/relationships/commentsExtensible'
 };
+
+// ---------------------------------------------------------------------------
+// Repairing ST_LongHexNumbers Adeu did not mint
+// ---------------------------------------------------------------------------
+//
+// The generators guarantee that every id Adeu MINTS is one Word will keep. They
+// can say nothing about the ids Adeu READS. A document arriving with
+// `w14:paraId="D2AEAE20"` - legal against the schema, discarded by Word on load
+// - takes the reply threaded onto it down with it, and no amount of correct
+// minting prevents that (2026-08-12 B6, western-district demo).
+//
+// Repairing means rewriting a value that other parts point AT, so the attribute
+// groups below exist to keep a repair from breaking the references it was
+// supposed to preserve. Mirrors comments.py.
+
+/** One logical paragraph identity, spelled four ways across three parts. Word
+ *  consults all of them; repair them together or the comment drops out of the
+ *  modern-comments path exactly as if it had not been repaired at all. */
+export const PARA_ID_ATTRIBUTES = [
+  'w14:paraId',
+  'w15:paraId',
+  'w15:paraIdParent',
+  'w16cid:paraId',
+];
+
+/** The comment's durable identity: commentsIds mints it, commentsExtensible
+ *  points back at it. Out of range, the anchor collapses to a point (B3). */
+export const DURABLE_ID_ATTRIBUTES = ['w16cid:durableId', 'w16cex:durableId'];
+
+/** ST_LongHexNumbers nothing else references, so they can be folded in place.
+ *  Folding (rather than re-minting) keeps equal rsids equal, which is the only
+ *  thing an rsid means, and keeps `w14:textId` on the element whose
+ *  `w14:paraId` it versions - [MS-DOCX] 2.6.2.6 requires the two to travel
+ *  together. */
+export const STANDALONE_ID_ATTRIBUTES = [
+  'w14:textId',
+  'w:rsidR',
+  'w:rsidRPr',
+  'w:rsidRDefault',
+  'w:rsidP',
+  'w:rsidDel',
+  'w:rsidTr',
+];
+
+/**
+ * Raised when a reply cannot be threaded onto its parent comment.
+ *
+ * A `reply` that quietly becomes a new top-level thread is worse than a failed
+ * call: apply_review_actions reports success, the agent believes it answered
+ * the reviewer, and it keeps acting on a success it never got
+ * (BUG_comment_threading_anchoring_and_typography.md B1). So threading is
+ * resolved BEFORE any XML is written, and an unresolvable parent is loud.
+ */
+export class CommentThreadingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CommentThreadingError';
+  }
+}
+
+/** Depth-first walk over an element and every element descendant. */
+function* walkElements(element: Element): Generator<Element> {
+  yield element;
+  for (let i = 0; i < element.childNodes.length; i++) {
+    const child = element.childNodes[i] as Element;
+    if (child.nodeType === 1) yield* walkElements(child);
+  }
+}
 
 export class CommentsManager {
   private _commentsPart: Part | null = null;
@@ -161,8 +234,25 @@ export class CommentsManager {
     return Math.max(...ids) + 1;
   }
 
+  // Every id below is an ST_LongHexNumber and comes from ONE generator.
+  //
+  // These stay as named aliases only so the call sites read as what they mint;
+  // they must never diverge. Word parses ST_LongHexNumber as a SIGNED 32-bit
+  // integer for ALL of them, silently discarding and regenerating anything
+  // outside (0x00000000, 0x80000000) — an out-of-range paraId drops replies
+  // out of their thread (B5), an out-of-range durableId collapses the comment's
+  // anchor (B3), and a zero paraId makes Word reject the file outright. The
+  // earlier belief that only durableId was constrained is what produced B5;
+  // see docx/long-hex-number.ts and BUG_paraId_signed_int32_thread_collapse.md.
+
+  /** `w14:paraId` (threading identity) and `w:rsid*` (revision grouping). */
   private _generateHexId(): string {
-    return Math.floor(Math.random() * 0xFFFFFFFF).toString(16).toUpperCase().padStart(8, '0');
+    return generateLongHexNumber();
+  }
+
+  /** `w16cid:durableId` — the identity the comment anchor binds to. */
+  private _generateDurableId(): string {
+    return generateLongHexNumber();
   }
 
   private _getInitials(author: string): string {
@@ -170,9 +260,26 @@ export class CommentsManager {
     return author.split(' ').filter(Boolean).map(p => p[0]).join('').toUpperCase();
   }
 
+  /**
+   * True when the package already carries a comments part (loaded or not).
+   *
+   * Read paths must use this guard instead of testing the raw backing field
+   * `_commentsPart`: on a fresh manager that field is null until the lazy
+   * `commentsPart` getter populates it, so guarding on it silently no-ops even
+   * though the document HAS comments (Python's _has_comments_part, QA
+   * 2026-07-17 F3 — the Node twin kept the stale field check). Checking the
+   * package keeps the other guarantee: a document with no comments part never
+   * has one created as a side effect of a read.
+   */
+  private _hasCommentsPart(): boolean {
+    return (
+      this._commentsPart !== null || this._getExistingPartByType(CT.COMMENTS) !== null
+    );
+  }
+
   private _findParaIdForComment(commentId: string): string | null {
-    if (!this._commentsPart) return null;
-    for (const c of findAllDescendants(this._commentsPart._element, 'w:comment')) {
+    if (!this._hasCommentsPart()) return null;
+    for (const c of findAllDescendants(this.commentsPart._element, 'w:comment')) {
       if (c.getAttribute('w:id') === commentId) {
         for (const p of findAllDescendants(c, 'w:p')) {
           const pid = p.getAttribute('w14:paraId');
@@ -199,7 +306,246 @@ export class CommentsManager {
     return directParaId;
   }
 
+  /**
+   * Gives an existing comment a modern paragraph identity so a reply can thread
+   * onto it, returning that paraId (null if the comment does not exist, or has
+   * no paragraph to identify).
+   *
+   * A comment written by pre-2013 Word — or by any generator that skips the
+   * modern-comments extensions — has no `w14:paraId`, so `_findThreadRootParaId`
+   * resolves nothing and `w15:paraIdParent` never gets written: the "reply"
+   * silently becomes a second top-level thread (B1). Minting the missing
+   * identity is the repair; it is idempotent and leaves the comment's body,
+   * author and date untouched.
+   *
+   * The paraId is registered in commentsExtended AND commentsIds together: Word
+   * consults both, and a paraId present in one but not the other drops the
+   * comment out of the modern-comments path entirely.
+   */
+  /**
+   * Every comment part that ALREADY exists, as a mutable element.
+   *
+   * Deliberately not the `commentsPart` / `extendedPart` getters: those CREATE
+   * the part they cannot find, and a repair pass that invents a
+   * commentsExtended part for a document that has no comments would be a side
+   * effect nobody asked for.
+   */
+  private _existingCommentPartElements(): Element[] {
+    const elements: Element[] = [];
+    for (const contentType of [CT.COMMENTS, CT.EXTENDED, CT.IDS, CT.EXTENSIBLE]) {
+      const part = this._getExistingPartByType(contentType);
+      if (part) elements.push(part._element);
+    }
+    return elements;
+  }
+
+  /**
+   * A legal id for `value` that the comment parts are not already using.
+   *
+   * Folding first (clearing the top bit, which is what Word does to the value
+   * anyway) keeps the repair DETERMINISTIC: the same document repaired twice
+   * produces the same ids, so a re-run is a no-op rather than a fresh set of
+   * anchors. `D2AEAE20 -> 52AEAE20`, Word-verified against the western-district
+   * document.
+   *
+   * The collision check is not belt-and-braces. [MS-DOCX] 2.6.2.4 requires
+   * `w14:paraId` to be unique within the part, and folding is exactly the
+   * operation that can violate it: `D2AEAE20` and `52AEAE20` fold to the same
+   * value, so a document containing both would end up with one id naming two
+   * paragraphs and a `w15:paraIdParent` that no longer says which thread it
+   * means.
+   */
+  private _freeLongHexNumber(value: string, taken: Set<string>): string {
+    const parsed = parseInt(value, 16);
+    let candidate = Number.isNaN(parsed)
+      ? generateLongHexNumber()
+      : toLongHexNumber(parsed);
+    while (taken.has(candidate)) candidate = generateLongHexNumber();
+    return candidate;
+  }
+
+  /**
+   * Bring every ST_LongHexNumber in the comment parts into range.
+   *
+   * B5 masked the generators, which fixed every id Adeu mints and none of the
+   * ids it inherits. B6 is the second kind: the western-district demo was
+   * handed a comment carrying `w14:paraId="D2AEAE20"`,
+   * `_adoptIntoModernComments` reused it verbatim because it was present, and
+   * the reply's `w15:paraIdParent` was written to point at a value Word
+   * discards on load. Every check passed on the way out - the reply IS
+   * parented, `CommentThreadingError` correctly did not fire - and the thread
+   * still collapsed the moment the document was opened.
+   *
+   * Whole-part, not just the comment being replied to: Word renumbers a PART
+   * when it finds a bad id in it, so leaving one bad rsid behind in
+   * comments.xml re-arms the renumbering pass that de-threads the reply.
+   *
+   * A no-op on a healthy document. It must stay that way: a pass that re-mints
+   * unconditionally would churn every paraId on every save and invalidate every
+   * `{#cell:<paraId>}` anchor the caller is holding, which is the damage it
+   * exists to prevent.
+   */
+  private _repairInheritedLongHexNumbers(): void {
+    const elements = this._existingCommentPartElements();
+    if (elements.length === 0) return;
+
+    const remapFor = (attributes: string[]): Map<string, string> => {
+      const taken = new Set<string>();
+      const broken: string[] = [];
+      for (const root of elements) {
+        for (const el of walkElements(root)) {
+          for (const attribute of attributes) {
+            const value = el.getAttribute(attribute);
+            if (!value) continue;
+            if (isWordReadableLongHexNumber(value)) taken.add(value.toUpperCase());
+            else if (!broken.includes(value)) broken.push(value);
+          }
+        }
+      }
+      const remap = new Map<string, string>();
+      for (const value of broken) {
+        const repaired = this._freeLongHexNumber(value, taken);
+        taken.add(repaired);
+        remap.set(value, repaired);
+      }
+      return remap;
+    };
+
+    const paraRemap = remapFor(PARA_ID_ATTRIBUTES);
+    const durableRemap = remapFor(DURABLE_ID_ATTRIBUTES);
+
+    for (const root of elements) {
+      for (const el of walkElements(root)) {
+        for (const attribute of PARA_ID_ATTRIBUTES) {
+          const repaired = paraRemap.get(el.getAttribute(attribute) ?? '');
+          if (repaired) el.setAttribute(attribute, repaired);
+        }
+        for (const attribute of DURABLE_ID_ATTRIBUTES) {
+          const repaired = durableRemap.get(el.getAttribute(attribute) ?? '');
+          if (repaired) el.setAttribute(attribute, repaired);
+        }
+        for (const attribute of STANDALONE_ID_ATTRIBUTES) {
+          const value = el.getAttribute(attribute);
+          if (value && !isWordReadableLongHexNumber(value)) {
+            el.setAttribute(attribute, this._freeLongHexNumber(value, new Set()));
+          }
+        }
+      }
+    }
+  }
+
+  private _adoptIntoModernComments(commentId: string): string | null {
+    if (!this._hasCommentsPart()) return null;
+
+    let commentEl: Element | null = null;
+    for (const c of findAllDescendants(this.commentsPart._element, 'w:comment')) {
+      if (c.getAttribute('w:id') === commentId) {
+        commentEl = c;
+        break;
+      }
+    }
+    if (!commentEl) return null;
+
+    const paragraphs = findAllDescendants(commentEl, 'w:p');
+    if (paragraphs.length === 0) return null;
+
+    let paraId: string | null = null;
+    for (const p of paragraphs) {
+      const pid = p.getAttribute('w14:paraId');
+      if (pid) {
+        paraId = pid;
+        break;
+      }
+    }
+    if (!paraId) {
+      paraId = this._generateHexId();
+      paragraphs[0].setAttribute('w14:paraId', paraId);
+    }
+
+    const hasChild = (part: Part, attr: string): boolean => {
+      for (let i = 0; i < part._element.childNodes.length; i++) {
+        const child = part._element.childNodes[i] as Element;
+        if (child.nodeType === 1 && child.getAttribute(attr) === paraId) return true;
+      }
+      return false;
+    };
+
+    if (!hasChild(this.extendedPart, 'w15:paraId')) {
+      // Thread ROOT: no w15:paraIdParent.
+      const exDoc = this.extendedPart._element.ownerDocument!;
+      const commentEx = exDoc.createElement('w15:commentEx');
+      commentEx.setAttribute('w15:paraId', paraId);
+      commentEx.setAttribute('w15:done', '0');
+      this.extendedPart._element.appendChild(commentEx);
+    }
+
+    if (!hasChild(this.idsPart, 'w16cid:paraId')) {
+      const idsDoc = this.idsPart._element.ownerDocument!;
+      const commentIdEl = idsDoc.createElement('w16cid:commentId');
+      commentIdEl.setAttribute('w16cid:paraId', paraId);
+      commentIdEl.setAttribute('w16cid:durableId', this._generateDurableId());
+      this.idsPart._element.appendChild(commentIdEl);
+    }
+
+    return paraId;
+  }
+
+  /**
+   * The paraId a reply to `parentId` must point at, repairing a parent that
+   * predates modern comments. Null means threading is impossible and the caller
+   * must fail loudly rather than mint a top-level comment.
+   *
+   * The repair pass runs FIRST, because every lookup below reads paraIds and a
+   * lookup that returns an id Word discards is worse than one that returns
+   * nothing: `null` raises CommentThreadingError and leaves the document alone,
+   * while a doomed id is reported as a successful reply and collapses the
+   * thread on load (B6).
+   *
+   * The root lookup runs next so a reply-to-a-reply still flattens onto the
+   * thread root (modern Word's model). The adoption pass then runs
+   * unconditionally — it is idempotent, and it also backfills a parent that HAS
+   * a w14:paraId but is missing from commentsExtended / commentsIds: Word
+   * consults both, so a paraIdParent pointing at an unregistered paragraph
+   * drops the reply out of its thread just as surely as a missing attribute
+   * would.
+   */
+  public resolveThreadParentParaId(parentId: string): string | null {
+    this._repairInheritedLongHexNumbers();
+    const rootParaId = this._findThreadRootParaId(parentId);
+    const adoptedParaId = this._adoptIntoModernComments(parentId);
+    return rootParaId ?? adoptedParaId;
+  }
+
   public addComment(author: string, text: string, parentId: string | null = null): string {
+    // Before anything else, and for top-level comments too: the paraIds this
+    // document arrived with are about to share a part with the ones we are
+    // about to mint, and Word renumbers the whole part if any of them is out of
+    // range (B6).
+    this._repairInheritedLongHexNumbers();
+
+    // Snapshot the modern-comments state BEFORE resolving threading: the legacy
+    // `w15:p` fallback below keys on whether the document was already on the
+    // modern path, and repairing a legacy parent may create the
+    // commentsExtended part as a side effect.
+    const extPartExisted = this._getExistingPartByType(CT.EXTENDED) !== null;
+
+    // Resolve threading BEFORE writing anything. A reply whose parent cannot be
+    // resolved used to be written anyway, minus its w15:paraIdParent — i.e. as
+    // a brand-new top-level thread, reported as applied (B1). Throwing here
+    // leaves the document untouched.
+    let parentParaId: string | null = null;
+    if (parentId !== null && parentId !== undefined) {
+      parentParaId = this.resolveThreadParentParaId(parentId);
+      if (!parentParaId) {
+        throw new CommentThreadingError(
+          `Cannot thread a reply onto comment Com:${parentId}: the comment has no resolvable ` +
+            `paragraph identity (w14:paraId) in word/comments.xml, so Word would render the ` +
+            `reply as a separate top-level comment instead of a reply. Refusing to create an ` +
+            `unthreaded comment.`,
+        );
+      }
+    }
+
     const commentId = this.nextId.toString();
     this.nextId++;
     const now = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -213,8 +559,7 @@ export class CommentsManager {
     const initials = this._getInitials(author);
     if (initials) comment.setAttribute('w:initials', initials);
 
-    const extPart = this._getExistingPartByType(CT.EXTENDED);
-    if (parentId && !extPart) {
+    if (parentId && !extPartExisted) {
       comment.setAttribute('w15:p', parentId);
     }
 
@@ -253,7 +598,10 @@ export class CommentsManager {
     this.commentsPart._element.appendChild(comment);
 
     if (this.extendedPart) {
-      const parentParaId = parentId ? this._findThreadRootParaId(parentId) : null;
+      // parentParaId was resolved (and any legacy parent repaired) at the top of
+      // this method, so it is either a real thread root or the call already
+      // threw. Never re-resolve here: silently falling back to null is exactly
+      // how a reply became a thread root (B1).
       const exDoc = this.extendedPart._element.ownerDocument!;
       const commentEx = exDoc.createElement('w15:commentEx');
       commentEx.setAttribute('w15:paraId', paraId);
@@ -266,7 +614,7 @@ export class CommentsManager {
       const idsDoc = this.idsPart._element.ownerDocument!;
       const commentIdEl = idsDoc.createElement('w16cid:commentId');
       commentIdEl.setAttribute('w16cid:paraId', paraId);
-      commentIdEl.setAttribute('w16cid:durableId', this._generateHexId());
+      commentIdEl.setAttribute('w16cid:durableId', this._generateDurableId());
       this.idsPart._element.appendChild(commentIdEl);
     }
 
@@ -394,12 +742,16 @@ export function extract_comments_data(pkg: DocxPackage): Record<string, any> {
   } as unknown as DocumentObject;
   
   const mgr = new CommentsManager(docObj);
-  const data: Record<string, any> = {};
+  // Null-prototype: keyed on w:id / w14:paraId values read out of the package.
+  // On a `{}` literal, an id of "__proto__" hits the prototype setter (the
+  // comment is silently dropped) and an id of "constructor" makes the
+  // `data[c_id]` guard below true, writing parent_id onto the global Object.
+  const data: Record<string, any> = Object.create(null);
   
   const part = pkg.parts.find(p => p.contentType === CT.COMMENTS);
   if (!part) return data;
 
-  const para_id_to_cid: Record<string, string> = {};
+  const para_id_to_cid: Record<string, string> = Object.create(null);
   const comments = findAllDescendants(part._element, 'w:comment');
 
   for (const c of comments) {

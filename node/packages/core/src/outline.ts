@@ -25,6 +25,28 @@ export interface OutlineNode {
   style: string;
   has_table: boolean;
   footnote_ids: string[];
+  /** Last page of the range this heading owns; filled by _assign_end_pages. */
+  end_page: number;
+}
+
+/**
+ * Fills `end_page`: a heading owns pages up to the page BEFORE the next
+ * heading at the same or a higher level, or the last page when it reaches the
+ * end (port of outline.py:184-194 / :343-353). Renderers show a range only
+ * when end_page > page.
+ */
+function _assign_end_pages(nodes: OutlineNode[], total_pages: number): void {
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    let end_page = total_pages;
+    for (let j = i + 1; j < nodes.length; j++) {
+      if (nodes[j].level <= node.level) {
+        end_page = nodes[j].page > node.page ? nodes[j].page - 1 : node.page;
+        break;
+      }
+    }
+    node.end_page = end_page;
+  }
 }
 
 interface _BlockRecord {
@@ -84,11 +106,20 @@ export function extract_outline(
     const has_table = _direct_has_table(block_records, rec_idx + 1, owned_end);
     const footnote_ids = _collect_footnote_ids(owned_blocks);
 
-    const page_num = _offset_to_page(rec.start_offset, body_page_offsets);
+    const page_num = offset_to_page(rec.start_offset, body_page_offsets);
 
-    nodes.push({ level, text, page: page_num, style, has_table, footnote_ids });
+    nodes.push({
+      level,
+      text,
+      page: page_num,
+      style,
+      has_table,
+      footnote_ids,
+      end_page: page_num,
+    });
   }
 
+  _assign_end_pages(nodes, body_pages.length);
   return nodes;
 }
 
@@ -408,7 +439,19 @@ function _heading_text(paragraph: Paragraph, comments_map: any): string {
 
 function _truncate_outline_text(text: string): string {
   if (text.length <= _OUTLINE_TEXT_MAX_CHARS) return text;
-  return text.substring(0, _OUTLINE_TEXT_MAX_CHARS) + "…";
+  let cut = text.substring(0, _OUTLINE_TEXT_MAX_CHARS);
+  // Never ship a SPLIT anchor token. The cut can land inside `{#cc:3}` or
+  // `{#_Ref444615940}` and emit `{#cc:`, which is not obviously broken to an
+  // agent reading the outline — it is a plausible target that resolves to
+  // nothing. A1.6 allows dropping the token entirely but never splitting it,
+  // so a dangling opener is trimmed back to its `{#`. Only an UNCLOSED
+  // fragment matches: a whole token keeps its `}`.
+  const dangling = /\{#[^}\n]*$/.exec(cut);
+  if (dangling !== null) cut = cut.substring(0, dangling.index);
+  // trimEnd() matches Python's .rstrip(). That was a live parity divergence
+  // before this change and trimming a dangling anchor makes trailing
+  // whitespace the common case rather than the rare one.
+  return cut.trimEnd() + "…";
 }
 
 function _strip_critic_markup(text: string): string {
@@ -507,22 +550,6 @@ function _determine_heading_style(paragraph: Paragraph): string {
   return "(heuristic)";
 }
 
-function _safe_style_name(
-  paragraph: Paragraph,
-  style_cache: any,
-  default_pstyle: any,
-): string | null {
-  const pPr = findChild(paragraph._element, "w:pPr");
-  let style_id = default_pstyle;
-  if (pPr) {
-    const pStyle = findChild(pPr, "w:pStyle");
-    if (pStyle) style_id = pStyle.getAttribute("w:val") || default_pstyle;
-  }
-  return style_id && style_cache && style_cache[style_id]
-    ? style_cache[style_id].name
-    : style_id;
-}
-
 function _find_owned_end(
   block_records: _BlockRecord[],
   heading_indices: number[],
@@ -562,7 +589,63 @@ function _collect_footnote_ids(owned_blocks: _BlockRecord[]): string[] {
   return ordered;
 }
 
-function _offset_to_page(offset: number, body_page_offsets: number[]): number {
+/**
+ * Render one projection fragment as plain prose for a breadcrumb.
+ *
+ * Breadcrumbs show CLEAN-view heading text: a heading carrying a pending
+ * tracked change must not leak raw CriticMarkup into the Path line (QA
+ * 2026-07-23 F22b). Deletions vanish, insertions/highlights unwrap, meta
+ * bubbles drop. Because callers operate on ONE line of the projection, a
+ * multi-line `{>>…<<}` bubble can be clipped by the line break — drop the
+ * unterminated tail too, then sweep leftover fragments.
+ *
+ * Hoisted from `build_search_response` for CC-2: the fields ledger renders the
+ * same breadcrumbs from the same projection, and two copies of these
+ * substitutions would be two dialects of "clean".
+ */
+export function clean_breadcrumb(raw: string): string {
+  return raw
+    .replace(/\{--.*?--\}/g, "")
+    .replace(/\{\+\+(.*?)\+\+\}/g, "$1")
+    .replace(/\{==(.*?)==\}/g, "$1")
+    .replace(/\{>>.*?<<\}/g, "")
+    .replace(/\{(?:>>|--).*$/g, "")
+    .replace(/\{\+\+|\{==|--\}|\+\+\}|<<\}|==\}/g, "")
+    .replace(/\*\*|__|[*_]/g, "")
+    .replace(/\{#[^}]+\}/g, "")
+    .trim();
+}
+
+/**
+ * The heading breadcrumb for position `idx` in projection `txt`.
+ *
+ * Scans through the END of the line containing `idx`: slicing at the offset
+ * itself cuts the line in half, so a hit INSIDE a heading reported a truncated
+ * path ("Master" for a match on "Services" in "# Master Services Agreement",
+ * QA 2026-07-19 F-17).
+ */
+export function heading_path_at(idx: number, txt: string): string {
+  const path: string[] = [];
+  let current_level = 999;
+  const nl = txt.indexOf("\n", idx);
+  const line_end = nl === -1 ? txt.length : nl;
+  const lines = txt.slice(0, line_end).split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^(#{1,6})\s+(.*)/);
+    if (!m) continue;
+    const level = m[1].length;
+    if (level >= current_level) continue;
+    let clean_heading = clean_breadcrumb(m[2]);
+    if (clean_heading.length > 80)
+      clean_heading = clean_heading.slice(0, 80) + "...";
+    path.unshift(clean_heading);
+    current_level = level;
+    if (level === 1) break;
+  }
+  return path.join(" > ");
+}
+
+export function offset_to_page(offset: number, body_page_offsets: number[]): number {
   if (!body_page_offsets || body_page_offsets.length === 0) return 1;
   let page = 1;
   for (let i = 0; i < body_page_offsets.length; i++) {
@@ -678,7 +761,7 @@ function _extract_outline_fast(
     let page_num = 1;
     if (para_offset !== undefined) {
       const [start_offset] = para_offset;
-      page_num = _offset_to_page(start_offset, body_page_offsets);
+      page_num = offset_to_page(start_offset, body_page_offsets);
     }
 
     nodes.push({
@@ -688,9 +771,11 @@ function _extract_outline_fast(
       style,
       has_table,
       footnote_ids,
+      end_page: page_num,
     });
   }
 
+  _assign_end_pages(nodes, body_page_offsets.length);
   return nodes;
 }
 

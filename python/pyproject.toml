@@ -1,6 +1,6 @@
 [project]
 name = "adeu"
-version = "2.1.0"
+version = "3.0.2"
 description = "Automated DOCX Redlining Engine"
 authors = [
     { name = "Mikko Korpela" },
@@ -56,7 +56,6 @@ dev = [
 packages = ["src/adeu"]
 exclude = [
     "src/adeu/server.py",
-    "src/adeu/mcp_components/doc_cache.py",
     "src/adeu/mcp_components/resources/**",
     "src/adeu/mcp_components/tools/**",
 ]

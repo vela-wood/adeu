@@ -23,9 +23,10 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn, ChildProcess } from "node:child_process";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DocumentObject } from "@adeu/core";
+import { createTestDocument, addParagraph } from "../../core/src/test-utils.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -50,6 +51,7 @@ describe("MCP tools — advertised schema/docs match real capability", () => {
   let diffOrig: string;
   let diffMod: string;
   let finalizeInput: string;
+  let multiPageFixture: string;
 
   const getTool = (name: string) => allTools.find((t) => t.name === name);
 
@@ -85,25 +87,8 @@ describe("MCP tools — advertised schema/docs match real capability", () => {
   // clearing its body — `@adeu/core` does not export its test-utils). Tracks the
   // path for cleanup.
   async function buildDoc(paragraphs: string[]): Promise<string> {
-    const initialPath = resolve(
-      __dirname,
-      "../../../../shared/fixtures/initial.docx",
-    );
-    const doc = await DocumentObject.load(readFileSync(initialPath));
-    const body = doc.element;
-    while (body.firstChild) body.removeChild(body.firstChild);
-
-    for (const text of paragraphs) {
-      const xmlDoc = body.ownerDocument!;
-      const p = xmlDoc.createElement("w:p");
-      const r = xmlDoc.createElement("w:r");
-      const t = xmlDoc.createElement("w:t");
-      t.textContent = text;
-      if (/\s/.test(text)) t.setAttribute("xml:space", "preserve");
-      r.appendChild(t);
-      p.appendChild(r);
-      body.appendChild(p);
-    }
+    const doc = await createTestDocument();
+    for (const text of paragraphs) addParagraph(doc, text);
 
     const outPath = join(
       tmpdir(),
@@ -175,6 +160,14 @@ describe("MCP tools — advertised schema/docs match real capability", () => {
       "Second clause stays.",
     ]);
     finalizeInput = await buildDoc(["Some content to finalize."]);
+
+    const filler =
+      "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.";
+    const multiParas: string[] = [];
+    for (let i = 0; i < 200; i++) {
+      multiParas.push(`Paragraph ${i + 1}: ${filler}`);
+    }
+    multiPageFixture = await buildDoc(multiParas);
   });
 
   afterAll(() => {
@@ -247,6 +240,22 @@ describe("MCP tools — advertised schema/docs match real capability", () => {
       expect(description).toContain("regex");
     });
 
+    // B5: the description used to promise "nothing is applied" on any
+    // failure, which the salvage default makes a lie. The replacement prose
+    // has to fit the SAME ~2048-char client truncation budget, or the
+    // guidance it replaces is invisible anyway.
+    it("documents the salvage default and still fits the 2048-char client budget", () => {
+      const description: string = getTool("process_document_batch").description;
+      expect(description).toContain("PARTIAL: applied K of N");
+      expect(description).toContain("partial=false");
+      expect(description).not.toContain("rejects the whole batch transactionally");
+      expect(
+        description.length,
+        `process_document_batch description is ${description.length} chars — ` +
+          "clients truncate at ~2048 and the tail never reaches the model",
+      ).toBeLessThan(2048);
+    });
+
     it("honors match_mode:'all' at the live MCP boundary — edits every occurrence (2)", async () => {
       const outPath = join(tmpdir(), `adeu_schema_gap_all_${Date.now()}.docx`);
       tempPaths.push(outPath);
@@ -299,14 +308,14 @@ describe("MCP tools — advertised schema/docs match real capability", () => {
 
       const text: string = res.result.content[0].text;
       expect(res.result.isError).toBeFalsy();
-      expect(text).toContain("USD 500"); // capture group $1 substituted
+      expect(text).toContain("{++USD ++}500"); // capture group $1 substituted
     });
   });
 
   // ======================================================================
-  // read_docx — build stamp appears exactly once
+  // read_docx — build stamp & discoverable page ranges
   // ======================================================================
-  describe("read_docx: build stamp appears exactly once", () => {
+  describe("read_docx: build stamp & discoverable page ranges", () => {
     it("stamps the build tag once — UI tools are no longer double-wrapped", () => {
       const readDocx = getTool("read_docx");
       expect(readDocx, "read_docx must be advertised").toBeDefined();
@@ -319,6 +328,30 @@ describe("MCP tools — advertised schema/docs match real capability", () => {
         getTool("process_document_batch").description.match(BUILD_STAMP_RE) ??
         [];
       expect(pdbStamps.length).toBe(1);
+    });
+
+    it("advertises page range support ('2-6') in tool description and stays under 2048 chars", () => {
+      const readDocx = getTool("read_docx");
+      expect(readDocx, "read_docx must be advertised").toBeDefined();
+      expect(readDocx.description).toContain("'2-6'");
+      expect(readDocx.description.length).toBeLessThan(2048);
+    });
+
+    it("returns two page banners when called with page: '2-3' at live MCP boundary", async () => {
+      const res = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          reasoning: "test",
+          file_path: multiPageFixture,
+          page: "2-3",
+        },
+      });
+
+      const text: string = res.result.content[0].text;
+      expect(res.result.isError).toBeFalsy();
+      expect(text).toContain("Page 2 of");
+      expect(text).toContain("Page 3 of");
+      expect(text).not.toContain("Page 1 of");
     });
   });
 
@@ -387,6 +420,331 @@ describe("MCP tools — advertised schema/docs match real capability", () => {
       expect(text).toContain("Encryption mode");
       expect(text.toLowerCase()).toContain("unsupported");
       expect(text).toMatch(/read-only/i);
+    });
+  });
+
+  // ======================================================================
+  // read_docx — mode='changes', changes_author, changes_offset
+  // ======================================================================
+  describe("read_docx: mode='changes', changes_author, changes_offset", () => {
+    it("advertises 'changes' in mode enum, and advertises changes_author and changes_offset (defaulting to 0)", () => {
+      const readDocx = getTool("read_docx");
+      expect(readDocx).toBeDefined();
+
+      const modeProp = readDocx.inputSchema.properties.mode;
+      expect(modeProp.enum).toContain("changes");
+
+      const props = readDocx.inputSchema.properties;
+      expect(props.changes_author).toBeDefined();
+      expect(props.changes_offset).toBeDefined();
+      expect(props.changes_offset.default).toBe(0);
+    });
+
+    it("advertises 'fields' in the mode enum with a numeric fields_offset (A2.7)", () => {
+      const readDocx = getTool("read_docx");
+      const modeProp = readDocx.inputSchema.properties.mode;
+
+      // A plain string enum, NOT a union: real clients strip property-level
+      // anyOf/oneOf to {}, which would lose the type and the docs entirely.
+      expect(modeProp.enum).toContain("fields");
+      expect(modeProp.type).toBe("string");
+      expect(modeProp.anyOf).toBeUndefined();
+      expect(modeProp.oneOf).toBeUndefined();
+
+      const offsetProp = readDocx.inputSchema.properties.fields_offset;
+      const changesOffsetProp = readDocx.inputSchema.properties.changes_offset;
+      expect(offsetProp).toBeDefined();
+      expect(offsetProp.default).toBe(0);
+      expect(offsetProp.anyOf).toBeUndefined();
+      expect(offsetProp.oneOf).toBeUndefined();
+
+      // spec-fields-ledger §1 contradicts itself on this one: it says
+      // fields_offset "mirrors changes_offset" (integer) AND that it
+      // "publishes type: number". The implemented convention wins, and the
+      // assertion is written as PARITY rather than a literal so it keeps
+      // tracking changes_offset if that ever moves. Both z.coerce.number()
+      // .int() schemas emit "integer"; what A2.7 actually guards against is a
+      // union, asserted above.
+      expect(offsetProp.type).toBe(changesOffsetProp.type);
+      expect(typeof offsetProp.type).toBe("string");
+    });
+
+    it("mentions mode='fields' in read_docx description for discoverability", () => {
+      // The description is the only channel guaranteed to reach the model, so
+      // an undocumented mode is an unreachable one.
+      expect(getTool("read_docx").description).toContain("mode='fields'");
+    });
+
+    it("mentions mode='changes' in read_docx description for discoverability", () => {
+      const readDocx = getTool("read_docx");
+      expect(readDocx.description).toContain("mode='changes'");
+    });
+
+    it("returns tracked changes ledger for mode='changes' on fixture with tracked changes", async () => {
+      const trackedFixture = resolve(
+        __dirname,
+        "../../../../shared/conformance/fixtures/multi_author.docx",
+      );
+      const res = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          reasoning: "test",
+          file_path: trackedFixture,
+          mode: "changes",
+        },
+      });
+
+      expect(res.result.isError).toBeFalsy();
+      const text: string = res.result.content[0].text;
+      expect(text).toMatch(/^> \*\*File Path:\*\*/);
+      expect(text).toContain("> **Changes ledger** —");
+      expect(text).toContain("Chg:");
+    });
+
+    it("refuses mode='changes' with clean_view:true", async () => {
+      const res = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          reasoning: "test",
+          file_path: pdbFixture,
+          mode: "changes",
+          clean_view: true,
+        },
+      });
+
+      expect(res.result.isError).toBe(true);
+      const text: string = res.result.content[0].text;
+      expect(text).toContain("--clean-view cannot be used with mode='changes'.");
+    });
+
+    it("supports page ranges with mode='changes' without error", async () => {
+      const denseFixture = resolve(
+        __dirname,
+        "../../../../shared/conformance/fixtures/dense_175.docx",
+      );
+      const res = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          reasoning: "test",
+          file_path: denseFixture,
+          mode: "changes",
+          page: "2-3",
+        },
+      });
+
+      expect(res.result.isError).toBeFalsy();
+      const text: string = res.result.content[0].text;
+      expect(text).toContain("> **Changes ledger** —");
+    });
+
+    it("rejects non-integer changes_offset", async () => {
+      const trackedFixture = resolve(
+        __dirname,
+        "../../../../shared/conformance/fixtures/multi_author.docx",
+      );
+      const res = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          reasoning: "test",
+          file_path: trackedFixture,
+          mode: "changes",
+          changes_offset: 1.5,
+        },
+      });
+
+      const isValidationError =
+        res.error?.code === -32602 || res.result?.isError === true;
+      expect(isValidationError).toBe(true);
+    });
+  });
+
+  // ======================================================================
+  // read_docx — search paging knobs are INTEGER counts, like Python's
+  // ======================================================================
+  describe("read_docx: max_matches / match_offset are integers", () => {
+    it("publishes type 'integer' for max_matches and match_offset, matching the Python authority", () => {
+      const props = getTool("read_docx").inputSchema.properties;
+
+      expect(props.max_matches).toBeDefined();
+      expect(props.max_matches.type).toBe("integer");
+      expect(props.max_matches.default).toBe(20);
+
+      expect(props.match_offset).toBeDefined();
+      expect(props.match_offset.type).toBe("integer");
+      expect(props.match_offset.default).toBe(0);
+    });
+
+    it("rejects a non-integer match_offset instead of paginating from 2.5", async () => {
+      const res = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          reasoning: "test",
+          file_path: pdbFixture,
+          search_query: "Confidential",
+          match_offset: 2.5,
+        },
+      });
+
+      const isValidationError =
+        res.error?.code === -32602 || res.result?.isError === true;
+      expect(isValidationError).toBe(true);
+    });
+
+    it("rejects a non-integer max_matches", async () => {
+      const res = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          reasoning: "test",
+          file_path: pdbFixture,
+          search_query: "Confidential",
+          max_matches: 2.5,
+        },
+      });
+
+      const isValidationError =
+        res.error?.code === -32602 || res.result?.isError === true;
+      expect(isValidationError).toBe(true);
+    });
+  });
+
+  // ======================================================================
+  // optional reasoning parameter on every tool
+  // ======================================================================
+  describe("optional reasoning parameter on all tools", () => {
+    const FIVE_TOOLS = [
+      "read_docx",
+      "process_document_batch",
+      "accept_all_changes",
+      "diff_docx_files",
+      "finalize_document",
+    ];
+
+    it("tools/list shows reasoning is NOT included in inputSchema.required for all five tools", () => {
+      for (const toolName of FIVE_TOOLS) {
+        const tool = getTool(toolName);
+        expect(tool, `${toolName} must be advertised`).toBeDefined();
+        const requiredList = tool.inputSchema?.required ?? [];
+        expect(
+          requiredList,
+          `reasoning should not be required in ${toolName}`,
+        ).not.toContain("reasoning");
+      }
+    });
+
+    it("tools/call read_docx without reasoning succeeds and returns document text", async () => {
+      const res = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          file_path: pdbFixture,
+        },
+      });
+
+      expect(res.result?.isError).toBeFalsy();
+      const text: string = res.result?.content?.[0]?.text ?? "";
+      expect(text).toContain("Confidential Information");
+    });
+
+    it("tools/call process_document_batch without reasoning applies the batch successfully", async () => {
+      const outPath = tempOut("no_reasoning_batch");
+      const res = await rpc("tools/call", {
+        name: "process_document_batch",
+        arguments: {
+          original_docx_path: pdbFixture,
+          author_name: "No Reasoning Test",
+          changes: [
+            {
+              type: "modify",
+              target_text: "Setup fee is $500",
+              new_text: "Setup fee is $600",
+            },
+          ],
+          output_path: outPath,
+        },
+      });
+
+      expect(res.result?.isError).toBeFalsy();
+      const text: string = res.result?.content?.[0]?.text ?? "";
+      expect(text).toContain("Batch complete");
+      expect(text).toContain("{++600++}");
+    });
+
+    it("reasoning is still accepted when sent and produces identical content", async () => {
+      const resWithout = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          file_path: pdbFixture,
+        },
+      });
+
+      const resWith = await rpc("tools/call", {
+        name: "read_docx",
+        arguments: {
+          reasoning: "Because I want to inspect paragraph 1",
+          file_path: pdbFixture,
+        },
+      });
+
+      expect(resWithout.result?.isError).toBeFalsy();
+      expect(resWith.result?.isError).toBeFalsy();
+      expect(resWith.result?.content?.[0]?.text).toBe(
+        resWithout.result?.content?.[0]?.text,
+      );
+    });
+  });
+
+  // ======================================================================
+  // E3 / E4 — id-discovery hint and missing-file hints
+  // ======================================================================
+  describe("E3/E4: file hints and id discovery hint", () => {
+    it("E3: process_document_batch call on stale ID contains Call `read_docx` with `mode='changes'`", async () => {
+      const res = await rpc("tools/call", {
+        name: "process_document_batch",
+        arguments: {
+          original_docx_path: pdbFixture,
+          author_name: "QA Agent",
+          changes: [{ type: "accept", target_id: "Chg:999" }],
+        },
+      });
+
+      expect(res.result?.isError).toBe(true);
+      const text: string = res.result?.content?.[0]?.text ?? "";
+      expect(text).toContain("Call `read_docx` with `mode='changes'`");
+    });
+
+    it("E4: missing-file error for relative path contains available files: [ and (+N more in ...) if directory holds >10 .docx files", async () => {
+      const crowdedDirName = "temp_crowded_docs_test";
+      const crowdedDirPath = resolve(process.cwd(), crowdedDirName);
+      if (!existsSync(crowdedDirPath)) {
+        mkdirSync(crowdedDirPath, { recursive: true });
+      }
+      for (let i = 1; i <= 12; i++) {
+        const docName = `doc_${String(i).padStart(2, "0")}.docx`;
+        writeFileSync(join(crowdedDirPath, docName), "dummy");
+      }
+
+      try {
+        const relativeMissingPath = join(crowdedDirName, "missing_doc.docx");
+        const res = await rpc("tools/call", {
+          name: "read_docx",
+          arguments: {
+            file_path: relativeMissingPath,
+          },
+        });
+
+        expect(res.result?.isError).toBe(true);
+        const text: string = res.result?.content?.[0]?.text ?? "";
+        expect(text).toContain("file not found:");
+        expect(text).toContain("available files: [");
+        expect(text).toContain("(+2 more in");
+        expect(text).toContain("Provide an absolute path");
+      } finally {
+        for (let i = 1; i <= 12; i++) {
+          const docName = `doc_${String(i).padStart(2, "0")}.docx`;
+          const p = join(crowdedDirPath, docName);
+          if (existsSync(p)) unlinkSync(p);
+        }
+        if (existsSync(crowdedDirPath)) rmSync(crowdedDirPath, { recursive: true, force: true });
+      }
     });
   });
 });

@@ -39,8 +39,7 @@
 // and passes once the published schemas/runtime comply.
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { spawn, ChildProcess } from "node:child_process";
-import { resolve, join } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   readFileSync,
@@ -49,67 +48,25 @@ import {
   rmSync,
   mkdtempSync,
 } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { DocumentObject } from "@adeu/core";
+import { createTestDocument, addParagraph } from "../../core/src/test-utils.js";
+import { startTestServer, type TestServer } from "./test-rpc.js";
 
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-
-// Measured client budget (rule 1). The client showed a 2046-char prefix plus
-// an ellipsis for a 2128-char description; 2048 is the safe ceiling.
 const CLIENT_DESCRIPTION_BUDGET = 2048;
 
 describe("QA 2026-07-23 — client-compat constraints (real server over stdio)", () => {
-  let serverProc: ChildProcess;
+  let server: TestServer;
   let workDir: string;
   let allTools: any[] = [];
   let plainDocPath: string;
 
-  const pending = new Map<number, (msg: any) => void>();
-  let rpcId = 900;
-  let stdoutBuffer = "";
-
   function rpc(method: string, params: any): Promise<any> {
-    const id = ++rpcId;
-    return new Promise((resolveRpc, rejectRpc) => {
-      const timeout = setTimeout(
-        () => rejectRpc(new Error(`RPC timeout for ${method}`)),
-        15000,
-      );
-      pending.set(id, (msg) => {
-        clearTimeout(timeout);
-        resolveRpc(msg);
-      });
-      serverProc.stdin?.write(
-        JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
-      );
-    });
-  }
-
-  function notify(method: string, params: any): void {
-    serverProc.stdin?.write(
-      JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n",
-    );
+    return server.rpc(method, params);
   }
 
   async function buildDoc(paragraphs: string[]): Promise<Buffer> {
-    const initialPath = resolve(
-      __dirname,
-      "../../../../shared/fixtures/initial.docx",
-    );
-    const doc = await DocumentObject.load(readFileSync(initialPath));
-    const body = doc.element;
-    while (body.firstChild) body.removeChild(body.firstChild);
-    const xmlDoc = body.ownerDocument!;
-    for (const text of paragraphs) {
-      const p = xmlDoc.createElement("w:p");
-      const r = xmlDoc.createElement("w:r");
-      const t = xmlDoc.createElement("w:t");
-      t.textContent = text;
-      t.setAttribute("xml:space", "preserve");
-      r.appendChild(t);
-      p.appendChild(r);
-      body.appendChild(p);
-    }
+    const doc = await createTestDocument();
+    for (const text of paragraphs) addParagraph(doc, text);
     return doc.save();
   }
 
@@ -121,43 +78,14 @@ describe("QA 2026-07-23 — client-compat constraints (real server over stdio)",
       await buildDoc(["The quick brown fox jumps over the lazy dog."]),
     );
 
-    const serverPath = resolve(__dirname, "../dist/index.js");
-    if (!existsSync(serverPath)) {
-      throw new Error("MCP server not built. Run 'npm run build' first.");
-    }
-    serverProc = spawn("node", [serverPath]);
-    serverProc.stdout?.on("data", (data: Buffer) => {
-      stdoutBuffer += data.toString();
-      let idx;
-      while ((idx = stdoutBuffer.indexOf("\n")) >= 0) {
-        const line = stdoutBuffer.slice(0, idx).trim();
-        stdoutBuffer = stdoutBuffer.slice(idx + 1);
-        if (!line.startsWith("{")) continue;
-        try {
-          const msg = JSON.parse(line);
-          if (msg.id !== undefined && pending.has(msg.id)) {
-            pending.get(msg.id)!(msg);
-            pending.delete(msg.id);
-          }
-        } catch {
-          /* partial chunk */
-        }
-      }
-    });
-
-    await rpc("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "client-compat-tests", version: "0.0.0" },
-    });
-    notify("notifications/initialized", {});
-    const listed = await rpc("tools/list", {});
+    server = await startTestServer("client-compat-tests");
+    const listed = await server.rpc("tools/list", {});
     allTools = listed.result.tools;
     expect(allTools.length).toBeGreaterThan(0);
   });
 
   afterAll(() => {
-    if (serverProc && !serverProc.killed) serverProc.kill();
+    server?.stop();
     if (workDir && existsSync(workDir))
       rmSync(workDir, { recursive: true, force: true });
   });
@@ -175,6 +103,27 @@ describe("QA 2026-07-23 — client-compat constraints (real server over stdio)",
         `${CLIENT_DESCRIPTION_BUDGET} chars, so their tail guidance is ` +
         `invisible to the model: ${over.join(", ")}`,
     ).toEqual([]);
+  });
+
+  it("the fields ledger surface survives client stripping (A2.7)", () => {
+    // The generic walkers below already cover every property, but CC-2 added a
+    // mode and an offset to the most heavily used tool in the server, so the
+    // acceptance criterion is pinned by name rather than left implicit.
+    const readDocx = allTools.find((t) => t.name === "read_docx")!;
+    const props: any = readDocx.inputSchema.properties;
+
+    expect(props.mode.enum).toContain("fields");
+    expect(props.mode.type).toBe("string");
+    expect(props.mode.anyOf ?? props.mode.oneOf).toBeUndefined();
+    expect(props.fields_offset).toBeDefined();
+    expect(props.fields_offset.anyOf ?? props.fields_offset.oneOf).toBeUndefined();
+
+    // Documented, or the model cannot reach it: the description is the only
+    // channel guaranteed to survive to the client.
+    expect(readDocx.description).toContain("mode='fields'");
+    expect(readDocx.description.length).toBeLessThanOrEqual(
+      CLIENT_DESCRIPTION_BUDGET,
+    );
   });
 
   it("no property schema publishes a type union — clients strip anyOf/oneOf to {}", () => {

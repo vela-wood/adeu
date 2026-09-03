@@ -1,7 +1,11 @@
 import { DocumentObject } from "./docx/bridge.js";
 import { Paragraph, Table, Run, DocxEvent } from "./docx/primitives.js";
 import { DocumentMapper, TextSpan } from "./mapper.js";
-import { CommentsManager, extract_comments_data } from "./comments.js";
+import {
+  CommentsManager,
+  CommentThreadingError,
+  extract_comments_data,
+} from "./comments.js";
 import {
   ModifyText,
   InsertTableRow,
@@ -18,6 +22,7 @@ import { split_structural_appendix, paginate } from "./pagination.js";
 import {
   is_heading_paragraph,
   is_native_heading,
+  _get_style_cache,
   get_run_style_markers,
   get_run_text,
   apply_formatting_to_segments,
@@ -26,9 +31,61 @@ import { format_ambiguity_error } from "./markup.js";
 import {
   PREVIEW_TEXT_CAP,
   REPORT_ECHO_CAP,
+  clamp_text,
+  restore_matched_typography,
   truncate_middle,
 } from "./utils/text.js";
 import { RegexTimeoutError } from "./utils/safe-regex.js";
+import { CORE_VERSION } from "./version.js";
+import type { SdtInfo } from "./utils/content-controls.js";
+import type { DocumentProtection } from "./utils/protection.js";
+import {
+  UNPROTECTED,
+  isProtectionActive,
+  readDocumentProtection,
+} from "./utils/protection.js";
+import {
+  type GateOverrides,
+  CHECKBOX_STATES,
+  NO_OVERRIDES,
+  checkBlockMergeAcrossControl,
+  checkBoundControl,
+  checkCheckboxEdit,
+  checkContentLock,
+  checkDeleteLock,
+  checkGroupRegion,
+  checkPlaceholderTarget,
+  checkProtectionBlocksEdit,
+  checkProtectionBlocksReview,
+  checkUntrackedWrite,
+  crossedControlWalls,
+  describeControl,
+  overridesNote,
+  segmentationNote,
+} from "./gates.js";
+import { collectFields, resolveField, type FieldEntry } from "./fields.js";
+import {
+  checkboxGlyph,
+  clearPlaceholder,
+  findBoundStore,
+  glyphRun,
+  optionIsListed,
+  parseCheckboxValue,
+  parseIsoDate,
+  refuseClass,
+  refuseValue,
+  renderDate,
+  resolveOption,
+  sdtContent,
+  setCheckboxChecked,
+  setDropdownLastValue,
+  setFullDate,
+  unwrapSdt,
+  writeBoundValue,
+} from "./utils/field-write.js";
+
+// Ceiling for refusal advisory message characters (~70 approx tokens).
+const GUARD_MESSAGE_CAP = 70 * 4;
 
 // Width of the surrounding-document window shown in redline previews.
 const PREVIEW_CONTEXT_CHARS = 30;
@@ -170,6 +227,17 @@ function stripMatchingHeadingHashes(
   newText: string,
 ): [string, string] {
   if (!target || !newText) return [target, newText];
+  // Only a rewrite of the heading ITSELF may cancel the markers. When the
+  // replacement spans several paragraphs the leading "#" belongs to the FIRST
+  // of them and the heading being targeted usually reappears at the end
+  // ("# SCOPE" -> "# NEW\n\nbody\n\n# SCOPE", i.e. insert a section in front of
+  // it). Cancelling the markers there desynchronises the two sides: the shared
+  // suffix shrinks from the whole heading to its bare text, so the replacement
+  // no longer ends on a paragraph break, the paragraph-preceding insertion path
+  // is missed, and the leftover "# " is welded onto the heading's own text
+  // ("# NEW SECTIONSCOPE" + an empty "# "). The Python twin has no such
+  // pre-processing step at all; this keeps Node's behaviour equal to it here.
+  if (newText.includes("\n")) return [target, newText];
   const targetMatch = target.match(/^(#+)\s+/);
   const newMatch = newText.match(/^(#+)\s+/);
   if (targetMatch && newMatch && targetMatch[1] === newMatch[1]) {
@@ -182,12 +250,44 @@ function stripMatchingHeadingHashes(
 }
 
 // --- Validation ---
+/**
+ * Parses "- Edit N Failed: reason" / "- Action N Failed: reason" /
+ * "- Note: Action N …" prose back into (0-based index, reason) pairs so a
+ * failure envelope can blame the caller's own `changes` positions. Prose that
+ * names no number is blamed on index 0 rather than dropped — an unattributed
+ * failure must still travel. Mirrors
+ * python/src/adeu/redline/engine.py _extract_failed_indices (:70-83).
+ */
+export function extract_failed_indices(errors: string[]): [number, string][] {
+  const pattern = /^-\s*(?:Action|Edit|Note: Action)\s+(\d+)\b/i;
+  const failed: [number, string][] = [];
+  for (const err of errors) {
+    const first_line = err ? err.split("\n")[0] : "";
+    const m = pattern.exec(first_line);
+    if (m) {
+      const idx = parseInt(m[1], 10) - 1;
+      // Python's split("Failed: ", 1) keeps the remainder intact; JS's limit
+      // argument DISCARDS it, so the tail is rejoined explicitly.
+      const parts = err.split("Failed: ");
+      const reason =
+        parts.length > 1 ? parts.slice(1).join("Failed: ").trim() : err.trim();
+      failed.push([idx, reason]);
+    } else {
+      failed.push([0, err.trim()]);
+    }
+  }
+  return failed;
+}
+
 export class BatchValidationError extends Error {
   public errors: string[];
-  constructor(errors: string[]) {
+  /** (0-based index into the caller's `changes`, reason) for every failure. */
+  public failed: [number, string][];
+  constructor(errors: string[], failed?: [number, string][]) {
     super("Batch validation failed:\n" + errors.join("\n"));
     this.name = "BatchValidationError";
     this.errors = errors;
+    this.failed = failed ?? extract_failed_indices(errors);
   }
 }
 
@@ -210,6 +310,41 @@ function sequential_context_hint(applied_so_far: number): string {
 // silently, so they must be rejected before they reach the DOM
 // (QA 2026-07-17 F11; mirrors Python's clean per-edit error).
 const XML_ILLEGAL_CHARS_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
+
+// CC-1e: content-control anchors, open or close, with or without flag words.
+/**
+ * Drop paragraph marks that BOTH sides of a replacement end with (CC-14).
+ *
+ * A "\n\n" the target and the replacement share is structural context, not
+ * text to rewrite, and must never reach the apply layer: that layer
+ * track-deletes a trailing mark inside a target -- a genuine paragraph merge,
+ * "A.\n\n" -> "Z.", depends on it -- but does not re-create the one the
+ * replacement asks for. The break silently disappears while the batch still
+ * reports the edit applied.
+ *
+ * Trims from the END only, so a caller-pinned start index stays valid. The
+ * real merge shape (target ends with a mark, replacement does not) is left
+ * alone, as is a shared LEADING mark, which the apply layer handles correctly
+ * today.
+ */
+function trimSharedTrailingParagraphMark(
+  target: string,
+  next: string,
+): [string, string] {
+  while (target.endsWith("\n\n") && next.endsWith("\n\n")) {
+    target = target.slice(0, -2);
+    next = next.slice(0, -2);
+  }
+  return [target, next];
+}
+
+const CC_ANCHOR_RE = /\{#\/?cc:\d+[^}]*\}/g;
+
+// The sanctioned empty-pair fill target (spec-projection.md §3): an open and
+// close anchor for the SAME ordinal with nothing between them but an optional
+// placeholder bubble.
+const CC_EMPTY_PAIR_RE =
+  /^\{#cc:(\d+)[^}]*\}(?:\{>>placeholder:[^<]*<<\})?\{#\/cc:\1\}$/;
 
 /**
  * Children of a properties container that the corresponding tracked-change
@@ -246,28 +381,52 @@ const ALL_REVISION_TAGS: readonly string[] = [
 interface IndexedRevision {
   el: Element;
   id: string | null;
+  /** OPC part path holding the element ("word/document.xml",
+   *  "word/header1.xml", ...). Revision ids are numbered PER PART, so an id
+   *  is only meaningful together with this (issue #114). */
+  part: string;
   /** Proper ins/del descendants, matching getElementsByTagName's
    *  self-exclusion. */
   nested: IndexedRevision[];
 }
 
 /**
- * Every revision element in the main story, bucketed by tag in document order.
+ * Every revision element in every story part (body, headers, footers,
+ * footnotes, endnotes), bucketed by tag in document order per part.
  *
  * apply_review_actions used to re-scan the whole document for each of these
  * buckets, ~12 full walks per action (18 getElementsByTagName calls), so a
  * batch cost O(actions x document). One walk now answers all of them.
  *
- * Validity is keyed on the owning document's mutation counter AND its
+ * Validity is keyed on every root's owning-document mutation counter AND its
  * identity: the counter catches ordinary edits, and the identity catches a
  * transactional rollback swapping in a freshly parsed document whose counter
- * restarts low enough to collide.
+ * restarts low enough to collide. Roots are re-derived on every check so an
+ * added or removed part invalidates too.
  */
 interface RevisionIndex {
-  doc: any;
-  inc: number | null;
+  roots: { el: Element; doc: any; inc: number | null }[];
   byTag: Map<string, IndexedRevision[]>;
 }
+
+/** Part paths compare and print without the leading "/" some in-memory
+ *  parts carry ("/word/header1.xml" from addPart vs "word/header1.xml"
+ *  from the zip loader). */
+function normalize_part_name(name: string): string {
+  return name.startsWith("/") ? name.substring(1) : name;
+}
+
+/** Content types of the parts revisions can be authored in and targeted
+ *  from — the story parts the mapper projects. Deliberately narrower than
+ *  the accept_all/reject_all traversal: a w:ins inside e.g. a comment's
+ *  body is resolved by the bulk paths but is not an addressable document
+ *  revision (issue #114). */
+const STORY_PART_CONTENT_TYPES: readonly string[] = [
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+];
 
 export function describe_illegal_control_chars(text: string): string | null {
   if (!text) return null;
@@ -285,8 +444,14 @@ export function validate_edit_strings(
 
   for (let i = 0; i < edits.length; i++) {
     const edit = edits[i];
+    // `set_field` has no target_text - it addresses a control by id rather
+    // than by content - but its `value` is written into the document and must
+    // clear exactly the same bar as any other inserted string. A value
+    // containing `{#cc:3}` or raw CriticMarkup would fabricate anchors and
+    // reviewer names as prose (CC-1e), and routing it here is what stops
+    // `set_field` becoming a hole in that check.
     const t_text = edit.target_text || "";
-    const n_text = edit.new_text || "";
+    const n_text = edit.new_text ?? edit.value ?? "";
 
     // VAL-CRIT-8: XML-illegal control characters (QA 2026-07-17 F11).
     const checked_fields: Array<[string, string]> = [
@@ -418,6 +583,40 @@ export function validate_edit_strings(
       }
     }
 
+    // CC-1e / A1.7: content-control anchors are structural in BOTH
+    // directions. The VAL-OBS-9 loop above only counts anchors that GAINED
+    // copies, so it catches fabrication and rewriting but not deletion: a
+    // target covering `{#/cc:3}` whose new_text omits it passed cleanly and
+    // silently unbalanced the pair in the projection.
+    //
+    // Scoped to `cc` anchors rather than made symmetric for every `{#...}`
+    // token, because two anchor classes are deliberate TARGETING surfaces that
+    // a symmetric rule would break: `{#cell:paraId}` empty-cell writes and the
+    // empty pair below.
+    if ((t_text.includes("{#") && t_text.includes("cc:")) || n_text.includes("cc:")) {
+      // ORDERED, unlike the footnote/image checks above, which compare
+      // multisets. A multiset lets `{#cc:3}A{#/cc:3}` become
+      // `{#/cc:3}A{#cc:3}` — same tokens, inverted pair. Text replacement
+      // cannot move an sdt wrapper anyway, so reordering controls is never a
+      // legitimate edit and order is the honest invariant.
+      const t_cc = t_text.match(CC_ANCHOR_RE) || [];
+      const n_cc = n_text.match(CC_ANCHOR_RE) || [];
+      // Sanctioned edit surface #1 (spec-projection.md §3): the empty pair is
+      // deliberately matchable and is the text-first fill. The anchors are not
+      // being deleted there — the wrapper survives and only the control's
+      // CONTENT changes — so the fill must stay legal for CC-4/CC-5 to route
+      // through set_field semantics.
+      const fills_empty_pair = CC_EMPTY_PAIR_RE.test(t_text.trim());
+      if (
+        !fills_empty_pair &&
+        (t_cc.length !== n_cc.length || t_cc.some((v: string, k: number) => v !== n_cc[k]))
+      ) {
+        errors.push(
+          `- Edit ${i + 1 + index_offset} Failed: Cannot insert, alter, or remove content-control anchor markers (\`{#cc:N}\` / \`{#/cc:N}\`). They are read-only projections of the control's structure, not text. Edit the content BETWEEN the anchors, keeping both tokens in \`new_text\` exactly as they appear.`,
+        );
+      }
+    }
+
     if (edit.type === "modify" && n_text) {
       const lines = n_text.split(/[\r\n]+/);
       for (const line of lines) {
@@ -461,17 +660,66 @@ export class RedlineEngine {
   public timestamp: string;
   public current_id: number;
   public mapper: DocumentMapper;
+  /** Anchor pairs as offsets into mapper.full_text; invalidated with it. */
+  private _cc_anchor_pairs: Array<[number, number, number]> | null = null;
+  /** (projection text, ledger rows) - see _field_entries. */
+  private _field_entries_cache: [string, FieldEntry[]] | null = null;
   public comments_manager: CommentsManager;
   public clean_mapper: DocumentMapper | null = null;
   public original_mapper: DocumentMapper | null = null;
   public skipped_details: string[] = [];
+  /** CC-4 per-batch override opt-outs (spec-gates §1); all default false. */
+  public gate_overrides: GateOverrides = NO_OVERRIDES;
+  /** Protection state, read once at load (spec-gates §3). */
+  public protection: DocumentProtection = UNPROTECTED;
+  /** Controls whose locks an override actually bypassed, for the report
+   *  disclosure (spec-gates §5). Reset per batch. */
+  public _overridden_controls: SdtInfo[] = [];
+  /** Comment removals accept_all_revisions actually performed, attributed to
+   *  their authors ("Com:1 (by Sarah Chen)") — see B2 in
+   *  BUG_comment_threading_anchoring_and_typography.md. */
+  public removed_comment_notes: string[] = [];
+  /**
+   * Whether the LAST batch that was rejected provably left the document as it
+   * was (see _verify_rollback). A caller that reuses this engine's DOM after a
+   * rejection — the MCP hot-DOM slot pins it back for the retry that usually
+   * follows — MUST check this: `false` means the in-memory document no longer
+   * matches the file it was loaded from, and reusing it compounds the damage
+   * (BUG 2026-08-12: one comment collected three identical replies that way).
+   */
+  public rollback_verified: boolean = true;
+  public id_discovery_hint: string | null;
   /** Revision-element index for the review-action paths; self-invalidating on
    *  the document's mutation counter (see _getRevisionIndex). */
   private _revisionIndex: RevisionIndex | null = null;
 
-  constructor(doc: DocumentObject, author: string = "Adeu AI (TS)") {
+  constructor(
+    doc: DocumentObject,
+    author: string = "Adeu AI (TS)",
+    opts?: {
+      id_discovery_hint?: string;
+      ignore_control_locks?: boolean;
+      ignore_document_protection?: boolean;
+      allow_untracked_writes?: boolean;
+    },
+  ) {
     this.doc = doc;
     this.author = author;
+    this.id_discovery_hint = opts?.id_discovery_hint ?? null;
+    // CC-4 write-gate overrides. Constructor options rather than
+    // process_batch arguments because the gates run in three places —
+    // validate_edits, the resolver and the apply-path backstop — and only the
+    // first takes batch arguments today. Python twin: RedlineEngine.__init__.
+    this.gate_overrides = {
+      ignore_control_locks: opts?.ignore_control_locks ?? false,
+      ignore_document_protection: opts?.ignore_document_protection ?? false,
+      allow_untracked_writes: opts?.allow_untracked_writes ?? false,
+    };
+    // Read once at load (spec-gates §3), not per gate: it lives in
+    // word/settings.xml, which nothing else in a batch touches, and the
+    // gates, the projection banner and the fields ledger must all report the
+    // same state.
+    this.protection = readDocumentProtection(doc);
     this.timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 
     const w16du_ns =
@@ -494,6 +742,9 @@ export class RedlineEngine {
 
     this.current_id = this._scan_existing_ids();
     this.mapper = new DocumentMapper(this.doc);
+    // Offsets into mapper.full_text; rebuilt whenever the mapper is.
+    this._cc_anchor_pairs = null;
+    this._field_entries_cache = null;
     this.comments_manager = new CommentsManager(this.doc);
   }
 
@@ -552,6 +803,15 @@ export class RedlineEngine {
       final_target = target_str.slice(prefix_len, target_str.length - suffix_len);
       final_new = new_str.slice(prefix_len, new_str.length - suffix_len);
       start = base_offset + prefix_len;
+
+      // CC-14: see trimSharedTrailingParagraphMark. trim_common_context is
+      // word-boundary aware and will not trim across "\n\n", so a commented
+      // change like "A.\n\n" -> "Z.\n\nY.\n\n" arrives here whole.
+      [final_target, final_new] = trimSharedTrailingParagraphMark(
+        final_target,
+        final_new,
+      );
+
       if (!final_target && final_new) {
         op = "INSERTION";
       } else if (final_target && !final_new) {
@@ -1147,18 +1407,507 @@ export class RedlineEngine {
     return [critic_markup, clean_text];
   }
 
+  /**
+   * Every root a bulk revision pass must traverse: the main body plus every
+   * other wordprocessingml XML part (headers, footers, notes, comments, ...).
+   * Shared by accept_all_revisions / reject_all_revisions / _scan_existing_ids
+   * (issue #114 — the id scan used to read the body only, so a fresh engine
+   * minted duplicates of ids already present in a header).
+   */
+  private _revision_roots(): Element[] {
+    const roots: Element[] = [this.doc.element];
+    for (const part of this.doc.pkg.parts) {
+      if (part === this.doc.part) continue;
+      if (
+        part.contentType.includes("wordprocessingml") &&
+        part.contentType.endsWith("+xml")
+      ) {
+        roots.push(part._element);
+      }
+    }
+    return roots;
+  }
+
+  /**
+   * [element, part path] for every part a targeted accept/reject can address:
+   * the main body plus the story parts the mapper projects. This is where
+   * revision ids live per part (issue #114) — the resolution index walks
+   * exactly these roots.
+   */
+  private _story_roots(): [Element, string][] {
+    const roots: [Element, string][] = [
+      [this.doc.element, normalize_part_name(this.doc.part.partname)],
+    ];
+    for (const part of this.doc.pkg.parts) {
+      if (part === this.doc.part) continue;
+      if (STORY_PART_CONTENT_TYPES.includes(part.contentType)) {
+        roots.push([part._element, normalize_part_name(part.partname)]);
+      }
+    }
+    return roots;
+  }
+
   private _scan_existing_ids(): number {
     let maxId = 0;
     // w:pPrChange carries revision ids too (tracked paragraph restyles,
-    // QA 2026-07-23 F1) — a fresh engine must never mint a duplicate.
-    for (const tag of ["w:ins", "w:del", "w:pPrChange"]) {
-      const elements = findAllDescendants(this.doc.element, tag);
-      for (const el of elements) {
-        const val = parseInt(el.getAttribute("w:id") || "0", 10);
-        if (!isNaN(val) && val > maxId) maxId = val;
+    // QA 2026-07-23 F1) — a fresh engine must never mint a duplicate. The
+    // scan spans every wordprocessingml part: ids are numbered per part, but
+    // this engine mints one ascending sequence for the whole package, so the
+    // seed must clear the maximum ANYWHERE or a header edit reuses a header's
+    // own id (issue #114 F4).
+    for (const root of this._revision_roots()) {
+      for (const tag of ["w:ins", "w:del", "w:pPrChange"]) {
+        const elements = findAllDescendants(root, tag);
+        for (const el of elements) {
+          const val = parseInt(el.getAttribute("w:id") || "0", 10);
+          if (!isNaN(val) && val > maxId) maxId = val;
+        }
       }
     }
     return maxId;
+  }
+
+  // ------------------------------------------------------------------
+  // set_field (CC-5, spec-set-field.md) - twin of the Python engine's block
+  // ------------------------------------------------------------------
+
+  /**
+   * The ledger rows for the CURRENT document state.
+   *
+   * Deliberately re-collected whenever the projection has been rebuilt: a
+   * `set_field` earlier in the batch may have filled, cleared or unwrapped a
+   * control, and resolving a later one against a stale ledger would target an
+   * offset that no longer means what it did.
+   */
+  private _field_entries(): FieldEntry[] {
+    const text = this.mapper.full_text;
+    if (this._field_entries_cache && this._field_entries_cache[0] === text) {
+      return this._field_entries_cache[1];
+    }
+    const entries = collectFields(this.doc, text);
+    this._field_entries_cache = [text, entries];
+    return entries;
+  }
+
+  /** The controls this `set_field` names, or a FieldResolutionError. */
+  private _resolve_set_field_targets(edit: any): FieldEntry[] {
+    return resolveField(this._field_entries(), edit.field, edit.match_mode || "strict");
+  }
+
+  private _sdt_info_for_ordinal(ordinal: number): any | null {
+    const infos = (this.mapper as any)._sdt_infos;
+    if (!infos) return null;
+    for (const info of infos.values()) {
+      if (info.ordinal === ordinal) return info;
+    }
+    return null;
+  }
+
+  /**
+   * The projection offsets BETWEEN this control's anchor pair, or null when
+   * the control does not anchor (spec §1 leaves groups, repeating sections
+   * and nested rich-text ledger-only).
+   */
+  private _cc_content_range(ordinal: number): [number, number] | null {
+    this._field_label_at(0); // builds _cc_anchor_pairs if cold
+    for (const [start, end, ord] of this._cc_anchor_pairs ?? []) {
+      if (ord === ordinal) return [start, end];
+    }
+    return null;
+  }
+
+  /** Drop everything keyed on the projection after an untracked write. */
+  private _invalidate_projection_caches(): void {
+    this.mapper["_build_map"]();
+    this._cc_anchor_pairs = null;
+    this._field_entries_cache = null;
+    this._field_entries_cache = null;
+  }
+
+  /**
+   * `w:sdtContent` when `offset` is the content position of an EMPTY control.
+   *
+   * This is the "empty-pair insertion" surface (A4.10): the sanctioned way to
+   * fill a field with a text-first edit is to type between its anchors, which
+   * produces an insertion at the exact offset where the pair's open and close
+   * tokens meet. Offsets alone cannot express "inside" there - the control
+   * contains no run to anchor to - so without this the value lands NEXT TO
+   * the field and the control stays empty.
+   *
+   * Shared with `set_field` deliberately: A4.10 requires the two routes to
+   * produce identical XML, and the only way to guarantee that is for them to
+   * run the same code rather than to agree by inspection.
+   */
+  private _empty_control_fill_host(mapper: any, offset: number): any | null {
+    const text: string = mapper?.full_text ?? "";
+    if (!text) return null;
+    const opens = new Map<number, number>();
+    const re = /\{#(\/?)cc:(\d+)(?: [^}]*)?\}/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const ordinal = Number(m[2]);
+      if (m[1]) {
+        const openEnd = opens.get(ordinal);
+        opens.delete(ordinal);
+        if (openEnd !== undefined && openEnd === m.index && m.index === offset) {
+          const info = this._sdt_info_for_ordinal(ordinal);
+          if (!info) return null;
+          // Same untracked teardown Word performs, so a text-first fill of a
+          // placeholder control does not leave the ghost styling behind
+          // (CC-6(a)).
+          if (info.showingPlaceholder && clearPlaceholder(info)) {
+            this._cc_anchor_pairs = null;
+    this._field_entries_cache = null;
+            this._field_entries_cache = null;
+          }
+          return sdtContent(info.element);
+        }
+      } else {
+        opens.set(ordinal, m.index + m[0].length);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The checkbox fill (A4.6), which cannot desugar into a ModifyText.
+   *
+   * A checkbox has no anchor pair and no editable span - it projects as a
+   * virtual bracket token - so there is no offset for a pinned edit to
+   * target. It is written directly instead: the state attribute flips
+   * silently, and the glyph swap carries the redline.
+   *
+   * `w:ins` goes BEFORE `w:del`, which is Word's own order (CC-6(b)) and is
+   * visible rather than cosmetic: the projection reads document order, so the
+   * reverse would render the toggle backwards.
+   */
+  private _apply_checkbox_set_field(edit: any, entry: FieldEntry, info: any): boolean {
+    const checked = parseCheckboxValue(edit.value);
+    if (checked === null) {
+      const msg =
+        `CC:${entry.ordinal} is a checkbox; '${edit.value}' is neither checked nor unchecked. ` +
+        "Use true/false (also accepted: x, [x], 1, 0, yes, no).";
+      edit._applied_status = false;
+      edit._error_msg = msg;
+      this.skipped_details.push(`- ${msg}`);
+      return false;
+    }
+
+    const oldRun = glyphRun(info);
+    const [char, font] = checkboxGlyph(info, checked);
+    const xmlDoc = this.doc.part._element.ownerDocument!;
+
+    const newRun = oldRun ? (oldRun.cloneNode(true) as any) : xmlDoc.createElement("w:r");
+    for (const t of Array.from(newRun.getElementsByTagName("w:t") as any) as any[]) {
+      t.parentNode?.removeChild(t);
+    }
+    const tEl = xmlDoc.createElement("w:t");
+    tEl.appendChild(xmlDoc.createTextNode(char));
+    newRun.appendChild(tEl);
+    if (font) {
+      let rpr = findChild(newRun, "w:rPr");
+      if (!rpr) {
+        rpr = xmlDoc.createElement("w:rPr");
+        newRun.insertBefore(rpr, newRun.firstChild);
+      }
+      for (const existing of Array.from(rpr.getElementsByTagName("w:rFonts") as any) as any[]) {
+        existing.parentNode?.removeChild(existing);
+      }
+      const fonts = xmlDoc.createElement("w:rFonts");
+      for (const attr of ["w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"]) {
+        fonts.setAttribute(attr, font);
+      }
+      rpr.insertBefore(fonts, rpr.firstChild);
+    }
+
+    const ins = this._create_track_change_tag("w:ins", "", this._getNextId());
+    ins.appendChild(newRun);
+
+    const parent = oldRun ? oldRun.parentNode : null;
+    if (!parent) {
+      const content = sdtContent(info.element);
+      if (!content) return false;
+      content.appendChild(ins);
+    } else {
+      parent.insertBefore(ins, oldRun);
+      const delTag = this._create_track_change_tag("w:del", "", this._getNextId());
+      const delRun = oldRun.cloneNode(true) as any;
+      for (const t of Array.from(delRun.getElementsByTagName("w:t") as any) as any[]) {
+        const dt = xmlDoc.createElement("w:delText");
+        while (t.firstChild) dt.appendChild(t.firstChild);
+        for (let i = 0; i < t.attributes.length; i++) {
+          dt.setAttribute(t.attributes[i].name, t.attributes[i].value);
+        }
+        t.parentNode?.replaceChild(dt, t);
+      }
+      delTag.appendChild(delRun);
+      parent.replaceChild(delTag, oldRun);
+    }
+
+    setCheckboxChecked(info, checked);
+    edit._applied_status = true;
+    edit._occurrences_modified = (edit._occurrences_modified || 0) + 1;
+    return true;
+  }
+
+  /**
+   * Desugar one `set_field` into pinned `ModifyText` sub-edits.
+   *
+   * This is the whole design of CC-5 in one method. `set_field` writes
+   * nothing itself: it performs the untracked teardown Word performs
+   * (placeholder state, §4.1-4.2), then hands the actual content change to
+   * the ordinary edit pipeline as a position-pinned `ModifyText`. That is
+   * what makes A4.12 true by construction - the gates, atomicity, author
+   * resolution and reporting all see a normal edit, so `set_field` cannot
+   * acquire a special pass through any of them by accident.
+   */
+  private _resolve_set_field(edit: any, resolved_edits: Array<[any, any]>): void {
+    let hits: FieldEntry[];
+    try {
+      hits = this._resolve_set_field_targets(edit);
+    } catch (e: any) {
+      edit._applied_status = false;
+      edit._error_msg = e?.message ?? String(e);
+      this.skipped_details.push(`- ${edit._error_msg}`);
+      return;
+    }
+
+    const clsOf = (e: FieldEntry): string => {
+      const info = this._sdt_info_for_ordinal(e.ordinal);
+      return info ? info.cls : e.cls_word;
+    };
+
+    // Phase 0: refuse before touching anything. Class first (A4.11), then the
+    // structure rules (A4.7). Both are checked for EVERY target before any is
+    // written, so a match_mode="all" fan-out cannot half-apply and leave the
+    // document in a state no single call could have produced.
+    for (const entry of hits) {
+      const info = this._sdt_info_for_ordinal(entry.ordinal);
+      let msg = refuseClass(clsOf(entry), entry.ordinal);
+      if (!msg && info) msg = refuseValue(info, entry.ordinal, edit.value);
+      if (msg) {
+        edit._applied_status = false;
+        edit._error_msg = msg;
+        this.skipped_details.push(`- ${msg}`);
+        return;
+      }
+    }
+
+    // Phase 1: the untracked teardown, for every target, before any offsets
+    // are read. Clearing a placeholder deletes the ghost text from the
+    // projection, so ranges computed before it would be stale by exactly the
+    // length of the prompt.
+    let touched = false;
+    for (const entry of hits) {
+      const info = this._sdt_info_for_ordinal(entry.ordinal);
+      if (info?.showingPlaceholder && clearPlaceholder(info)) touched = true;
+    }
+    if (touched) this._invalidate_projection_caches();
+
+    // Phase 1b: per-class value translation. The caller's string is not
+    // always what gets written: a dropdown's `w:value` resolves to its
+    // display text, and a date renders through the control's own format.
+    const effective = new Map<number, string>();
+    const notes = new Map<number, string>();
+    for (const entry of hits) {
+      const info = this._sdt_info_for_ordinal(entry.ordinal);
+      if (!info) continue;
+      if (info.cls === "dropdown" || info.cls === "combobox") {
+        const [display, err] = resolveOption(info, edit.value);
+        if (err) {
+          const msg = `CC:${entry.ordinal}: ${err}`;
+          edit._applied_status = false;
+          edit._error_msg = msg;
+          this.skipped_details.push(`- ${msg}`);
+          return;
+        }
+        effective.set(entry.ordinal, display!);
+        if (info.cls === "combobox" && !optionIsListed(info, display!)) {
+          notes.set(entry.ordinal, `'${display}' is not in the option list`);
+        }
+      } else if (info.cls === "date") {
+        const parts = parseIsoDate(edit.value);
+        if (!parts) {
+          const msg =
+            `CC:${entry.ordinal} is a date control; '${edit.value}' is not a date. ` +
+            "Use the canonical YYYY-MM-DD form (e.g. 2026-03-01).";
+          edit._applied_status = false;
+          edit._error_msg = msg;
+          this.skipped_details.push(`- ${msg}`);
+          return;
+        }
+        const [text, unsupported] = renderDate(parts, info.dateFormat);
+        effective.set(entry.ordinal, text);
+        if (unsupported) {
+          notes.set(
+            entry.ordinal,
+            `the control's date format '${info.dateFormat}' is not supported in v1; wrote the canonical ${text}`,
+          );
+        }
+      }
+    }
+
+    // Phase 2: checkboxes are written directly; everything else desugars.
+    const direct = hits.filter((e) => clsOf(e) === "checkbox");
+    if (direct.length) {
+      let ok = true;
+      for (const entry of direct) {
+        const info = this._sdt_info_for_ordinal(entry.ordinal);
+        if (!info || !this._apply_checkbox_set_field(edit, entry, info)) ok = false;
+      }
+      if (ok) this._invalidate_projection_caches();
+      return;
+    }
+
+    // Phase 2b: one pinned sub-edit per target.
+    for (const entry of hits) {
+      const span = this._cc_content_range(entry.ordinal);
+      if (!span) {
+        const msg =
+          `CC:${entry.ordinal} has no editable content span, so set_field cannot write to it. ` +
+          "Run read_docx with mode='fields' to see what this control is.";
+        edit._applied_status = false;
+        edit._error_msg = msg;
+        this.skipped_details.push(`- ${msg}`);
+        return;
+      }
+
+      const [start, end] = span;
+      const current = this.mapper.full_text.slice(start, end);
+      const value = effective.get(entry.ordinal) ?? edit.value;
+      const info = this._sdt_info_for_ordinal(entry.ordinal);
+
+      const sub: any = {
+        type: "modify",
+        target_text: current,
+        new_text: value,
+        comment: edit.comment ?? null,
+      };
+      // Always atomic, comment or not (spec §3): a fill is one logical act,
+      // and word-splitting it would scatter a single field update across
+      // several review entries.
+      sub._internal_op = !current ? "INSERTION" : !value ? "DELETION" : "MODIFICATION";
+      sub._resolved_start_idx = start;
+      sub._active_mapper_ref = this.mapper;
+      sub._parent_edit_ref = edit;
+      if (!current && info) {
+        // Nothing left inside the control to anchor to; name the host.
+        sub._insert_host_el = sdtContent(info.element);
+      }
+
+      // The attribute syncs ride along with the content change and take no
+      // revision of their own (spec §5, the URL_RETARGET class).
+      if (info) {
+        if (info.cls === "dropdown" || info.cls === "combobox") {
+          setDropdownLastValue(info, value);
+        } else if (info.cls === "date") {
+          const parts = parseIsoDate(edit.value);
+          if (parts) setFullDate(info, parts);
+        }
+
+        // A bound control dual-writes. The store WINS ON OPEN (CC-6(e)), so
+        // content-only writing to a bound control is data loss with extra
+        // steps - Word silently rewrites the content back from the store,
+        // discarding the edit with no revision to show for it.
+        if (info.bound) {
+          const store = findBoundStore(this.doc, info.storeItemId);
+          const wrote =
+            !!store && writeBoundValue(store, info.bindingXpath, value, info.prefixMappings);
+          const prior = notes.get(entry.ordinal);
+          const suffix = prior ? `; ${prior}` : "";
+          notes.set(
+            entry.ordinal,
+            wrote
+              ? `bound store ${info.bindingXpath} updated to match${suffix}`
+              : `WARNING: this field is bound to ${info.bindingXpath} but the data store ` +
+                  "could not be resolved, so only the visible text was updated. If the store " +
+                  `is restored later, Word will overwrite this edit from it.${suffix}`,
+          );
+        }
+
+        // A `w:temporary` control does not survive being edited: Word unwraps
+        // it on ANY content change, tracked or not (CC-6(c)). One-way, so the
+        // report discloses it.
+        if (info.temporary) {
+          sub._unwrap_sdt_after = info.element;
+          const prior = notes.get(entry.ordinal);
+          const unwrapNote =
+            "this control was temporary and has been unwrapped, as Word does on any edit";
+          notes.set(entry.ordinal, prior ? `${prior}; ${unwrapNote}` : unwrapNote);
+        }
+      }
+
+      const note = notes.get(entry.ordinal);
+      if (note) {
+        edit._warning = edit._warning ? `${edit._warning}; ${note}` : note;
+      }
+
+      if (edit._resolved_start_idx === undefined || edit._resolved_start_idx === null) {
+        edit._resolved_start_idx = start;
+        edit._resolved_proxy_edit = sub;
+      }
+      resolved_edits.push([sub, value]);
+    }
+  }
+
+  /**
+   * `CC:<N> "<alias>" (tag: <tag>)` for the control containing `offset`.
+   *
+   * Audit-trail symmetry with `heading_path` (spec-fields-ledger §6): a
+   * reviewer reading the report needs to know an edit landed inside a content
+   * control, because that is what decides whether Word will let a human keep
+   * it.
+   *
+   * Resolves the INNERMOST containing control — an edit inside CC:9 reports
+   * CC:9, not the group CC:8 that wraps it, which is the more specific and
+   * more actionable answer.
+   */
+  private _field_label_at(offset: number): string {
+    if (this._cc_anchor_pairs === null) {
+      const pairs: Array<[number, number, number]> = [];
+      const text = this.mapper.full_text;
+      const opens = new Map<number, number>();
+      const re = /\{#(\/?)cc:(\d+)(?: [^}]*)?\}/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        const ordinal = Number(m[2]);
+        if (m[1]) {
+          const openEnd = opens.get(ordinal);
+          if (openEnd !== undefined) {
+            opens.delete(ordinal);
+            pairs.push([openEnd, m.index, ordinal]);
+          }
+        } else {
+          opens.set(ordinal, m.index + m[0].length);
+        }
+      }
+      this._cc_anchor_pairs = pairs;
+    }
+
+    let best: [number, number, number] | null = null;
+    for (const [start, end, ordinal] of this._cc_anchor_pairs) {
+      if (start <= offset && offset <= end) {
+        if (best === null || end - start < best[1] - best[0])
+          best = [start, end, ordinal];
+      }
+    }
+    if (best === null) return "";
+
+    const ordinal = best[2];
+    let info: any = null;
+    const infos = (this.mapper as any)._sdt_infos;
+    if (infos) {
+      for (const candidate of infos.values()) {
+        if (candidate.ordinal === ordinal) {
+          info = candidate;
+          break;
+        }
+      }
+    }
+    let label = `CC:${ordinal}`;
+    if (info?.alias) label += ` "${info.alias}"`;
+    if (info?.tag) label += ` (tag: ${info.tag})`;
+    return label;
   }
 
   private _get_heading_path_and_page(
@@ -1202,18 +1951,20 @@ export class RedlineEngine {
     return [path.join(" > "), page];
   }
 
-  public accept_all_revisions() {
-    const parts_to_process: Element[] = [this.doc.element];
-
-    for (const part of this.doc.pkg.parts) {
-      if (part === this.doc.part) continue;
-      if (
-        part.contentType.includes("wordprocessingml") &&
-        part.contentType.endsWith("+xml")
-      ) {
-        parts_to_process.push(part._element);
-      }
-    }
+  /**
+   * Accepts every tracked change.
+   *
+   * `remove_comments` defaults to FALSE, matching the Python engine's signature:
+   * comments are annotations, not revisions, and this call used to eject every
+   * one of them unconditionally with no way to opt out. A caller asking to
+   * "accept all changes" then also got "delete the reviewer's comments"
+   * (BUG_comment_threading_anchoring_and_typography.md B2). Comments whose
+   * anchored text an accepted DELETION consumes are still removed either way —
+   * Word does the same — and `removed_comments` counts exactly the bodies this
+   * call deleted, with `removed_comment_notes` naming each one and its author.
+   */
+  public accept_all_revisions(remove_comments: boolean = false) {
+    const parts_to_process: Element[] = this._revision_roots();
 
     // Pre-count revisions before mutating. Unit is REVISION ELEMENTS, matching
     // the Python engine and sanitize's count_tracked_changes so no two surfaces
@@ -1229,12 +1980,14 @@ export class RedlineEngine {
       }
     }
 
-    // accept_all removes EVERY comment (the final pass below ejects the
-    // comment parts wholesale), so the reported count is the number of
-    // comments present at entry — counting only the bodies deleted during
-    // wrapping-cleanup under-reported the removal as 0 while the output
-    // document demonstrably had no comments left (QA round 3, finding 3.4).
-    const removed_comments = this._existing_comment_ids().length;
+    // Snapshot the comment ids AND authors so the count below reflects what
+    // this call actually deleted (QA round 3, finding 3.4 fixed the opposite
+    // failure: counting only wrapping-cleanup deletions reported 0 while the
+    // output had no comments left). Attribution is what makes a removal
+    // impossible to mistake for engine bookkeeping (B2).
+    const comment_authors_before = this._comment_authors();
+    const comments_before = new Set(Object.keys(comment_authors_before));
+    this.removed_comment_notes = [];
 
     for (const root_element of parts_to_process) {
       const insNodes = findAllDescendants(root_element, "w:ins");
@@ -1322,32 +2075,35 @@ export class RedlineEngine {
       }
     }
 
-    // Final pass: completely eject all comments, anchors, and parts
-    for (const root_element of parts_to_process) {
-      for (const tag of ["w:commentRangeStart", "w:commentRangeEnd"]) {
-        for (const el of findAllDescendants(root_element, tag)) {
-          el.parentNode?.removeChild(el);
+    // Final pass: completely eject all comments, anchors, and parts — only when
+    // the caller actually asked for it (B2).
+    if (remove_comments) {
+      for (const root_element of parts_to_process) {
+        for (const tag of ["w:commentRangeStart", "w:commentRangeEnd"]) {
+          for (const el of findAllDescendants(root_element, tag)) {
+            el.parentNode?.removeChild(el);
+          }
         }
-      }
 
-      const refs = findAllDescendants(root_element, "w:commentReference");
-      for (const ref of refs) {
-        const parent = ref.parentNode as Element | null;
-        if (parent) {
-          if (parent.tagName === "w:r" || parent.tagName.endsWith(":r")) {
-            const nonRprChildren = Array.from(parent.childNodes).filter(
-              (c) =>
-                c.nodeType === 1 &&
-                (c as Element).tagName !== "w:rPr" &&
-                (c as Element).tagName !== "rPr",
-            );
-            if (nonRprChildren.length <= 1) {
-              parent.parentNode?.removeChild(parent);
+        const refs = findAllDescendants(root_element, "w:commentReference");
+        for (const ref of refs) {
+          const parent = ref.parentNode as Element | null;
+          if (parent) {
+            if (parent.tagName === "w:r" || parent.tagName.endsWith(":r")) {
+              const nonRprChildren = Array.from(parent.childNodes).filter(
+                (c) =>
+                  c.nodeType === 1 &&
+                  (c as Element).tagName !== "w:rPr" &&
+                  (c as Element).tagName !== "rPr",
+              );
+              if (nonRprChildren.length <= 1) {
+                parent.parentNode?.removeChild(parent);
+              } else {
+                parent.removeChild(ref);
+              }
             } else {
               parent.removeChild(ref);
             }
-          } else {
-            parent.removeChild(ref);
           }
         }
       }
@@ -1356,7 +2112,7 @@ export class RedlineEngine {
     const pkg = this.doc.pkg;
     const comment_partnames = new Set<string>();
     for (const part of pkg.parts) {
-      if (part.partname.toLowerCase().includes("comments")) {
+      if (remove_comments && part.partname.toLowerCase().includes("comments")) {
         comment_partnames.add(part.partname);
         const withSlash = part.partname.startsWith("/")
           ? part.partname
@@ -1428,11 +2184,26 @@ export class RedlineEngine {
       }
     }
 
+    // Books that match the document: when remove_comments ejected the parts the
+    // "after" set is empty, so this still equals the total; when it did not, it
+    // counts exactly the anchors this call consumed (B2).
+    const after = new Set(this._existing_comment_ids());
+    const removed_ids = Array.from(comments_before)
+      .filter((cid) => !after.has(cid))
+      .sort((a, b) => {
+        const na = /^\d+$/.test(a) ? parseInt(a, 10) : 0;
+        const nb = /^\d+$/.test(b) ? parseInt(b, 10) : 0;
+        return na - nb || a.localeCompare(b);
+      });
+    this.removed_comment_notes = removed_ids.map(
+      (cid) => `Com:${cid} (by ${comment_authors_before[cid] ?? "Unknown"})`,
+    );
+
     return {
       accepted_insertions,
       accepted_deletions,
       accepted_formatting,
-      removed_comments,
+      removed_comments: removed_ids.length,
     };
   }
 
@@ -1465,17 +2236,7 @@ export class RedlineEngine {
    * common case) is exact. This limitation is shared with the Python engine.
    */
   public reject_all_revisions() {
-    const parts_to_process: Element[] = [this.doc.element];
-
-    for (const part of this.doc.pkg.parts) {
-      if (part === this.doc.part) continue;
-      if (
-        part.contentType.includes("wordprocessingml") &&
-        part.contentType.endsWith("+xml")
-      ) {
-        parts_to_process.push(part._element);
-      }
-    }
+    const parts_to_process: Element[] = this._revision_roots();
 
     for (const root_element of parts_to_process) {
       // 0. Reject tracked paragraph restyles: restore the ORIGINAL pPr the
@@ -1688,16 +2449,20 @@ export class RedlineEngine {
    * start_element and end_element must both be direct children of parent_element
    * and start_element must come before (or equal) end_element in document order.
    * Ported from Python `RedlineEngine._attach_comment`.
+   *
+   * Returns the id of the comment it created, or null when nothing was written
+   * (empty text, a missing element, an anchor outside the main story). Callers
+   * that only want the side effect can keep ignoring it.
    */
   private _attach_comment(
     parent_element: Element,
     start_element: Element,
     end_element: Element,
     text: string,
-  ) {
-    if (!text) return;
-    if (!parent_element || !start_element || !end_element) return;
-    if (this._skip_comment_outside_main_story(parent_element, text)) return;
+  ): string | null {
+    if (!text) return null;
+    if (!parent_element || !start_element || !end_element) return null;
+    if (this._skip_comment_outside_main_story(parent_element, text)) return null;
 
     const comment_id = this.comments_manager.addComment(this.author, text);
     const xmlDoc = parent_element.ownerDocument!;
@@ -1733,6 +2498,7 @@ export class RedlineEngine {
       parent_element.appendChild(range_end);
       parent_element.appendChild(ref_run);
     }
+    return comment_id;
   }
 
   /**
@@ -1826,7 +2592,34 @@ export class RedlineEngine {
    *
    * Does NOT attach comments; callers handle that.
    */
-  private _clone_pPr_scrubbing_headings(existing_pPr: Element): Element {
+  /**
+   * Is `p_el` a heading in the sense the text projection uses — i.e. does it
+   * render with "#" markers?
+   *
+   * Style NAMES are not enough: real templates declare their heading-ness as
+   * <w:outlineLvl> inside styles.xml under a house name ("LegalNum2L1"), which
+   * Word honours and a startsWith("Heading") test does not. is_native_heading
+   * resolves the style chain, and is the very function the mapper projects
+   * with, so the scrub below cannot drift away from what the agent reads.
+   */
+  private _is_native_heading_element(p_el: Element): boolean {
+    try {
+      const part = (this.doc as any).part || this.doc;
+      const [style_cache, default_pstyle] = _get_style_cache(part);
+      return is_native_heading(
+        { _element: p_el } as any,
+        style_cache,
+        default_pstyle,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private _clone_pPr_scrubbing_headings(
+    existing_pPr: Element,
+    source_paragraph: Element | null = null,
+  ): Element {
     const pPr_clone = existing_pPr.cloneNode(true) as Element;
     const pStyle_el = findChild(pPr_clone, "w:pStyle");
     if (pStyle_el) {
@@ -1835,7 +2628,9 @@ export class RedlineEngine {
         const is_heading =
           style_val.startsWith("Heading") ||
           style_val === "Title" ||
-          style_val.replace(/\s+/g, "").startsWith("Heading");
+          style_val.replace(/\s+/g, "").startsWith("Heading") ||
+          (source_paragraph !== null &&
+            this._is_native_heading_element(source_paragraph));
         if (is_heading) {
           pPr_clone.removeChild(pStyle_el);
         }
@@ -1978,7 +2773,19 @@ export class RedlineEngine {
     // Inspect the first line for heading/list markers.
     const [first_clean, first_style] = this._parse_markdown_style(lines[0]);
     const have_paragraph_context = current_p !== null;
-    const block_mode = first_style !== null && have_paragraph_context;
+    // Block conversion additionally requires a REAL line break in the source
+    // text. Without one the text is by construction a fragment spliced into an
+    // existing paragraph, and a leading "- "/"* "/"# " is literal content, not
+    // a block marker. Word-diffing makes this routine: modify
+    // "Product" -> "Product - Draft" trims the common prefix and hands us the
+    // fragment " - Draft", which _parse_markdown_style reads as a bullet. Left
+    // ungated, that silently split the paragraph, minted a numbered
+    // ListParagraph, ate the "- " as a fabricated marker, and still reported
+    // status "applied". Note the em-dash spelling was never affected, so the
+    // corruption tracked the punctuation an author chose.
+    const have_line_break = /[\r\n]/.test(text);
+    const block_mode =
+      first_style !== null && have_paragraph_context && have_line_break;
 
     let first_node: Element | null = null;
     let inline_ins: Element | null = null;
@@ -2052,8 +2859,10 @@ export class RedlineEngine {
         // Inherit pPr from the anchor paragraph (preserves list numbering).
         const existing_pPr = findChild(current_p, "w:pPr");
         if (existing_pPr) {
-          new_p.appendChild(this._clone_pPr_scrubbing_headings(existing_pPr));
-        }
+          new_p.appendChild(
+            this._clone_pPr_scrubbing_headings(existing_pPr, current_p),
+          );
+            }
       }
 
       // Track the paragraph break itself as an insertion.
@@ -2708,6 +3517,366 @@ export class RedlineEngine {
     return deleted;
   }
 
+  /** [intersecting, at_start, at_end] control stacks for a changed range. */
+  private _control_gate_context(
+    mapper: any,
+    start: number,
+    length: number,
+  ): [SdtInfo[], SdtInfo[], SdtInfo[]] {
+    const intersecting =
+      typeof mapper?.controls_intersecting === "function"
+        ? mapper.controls_intersecting(start, length)
+        : [];
+    const at_start =
+      typeof mapper?.controls_at === "function" ? mapper.controls_at(start) : [];
+    const at_end =
+      typeof mapper?.controls_at === "function"
+        ? mapper.controls_at(Math.max(start + length - 1, start))
+        : [];
+    return [intersecting, at_start, at_end];
+  }
+
+  /**
+   * Would this edit dissolve `info`'s wrapper rather than empty it?
+   *
+   * G2 protects a control's EXISTENCE, not its text: emptying a delete-locked
+   * control is allowed and leaves the wrapper with an empty pair (A3.3). Only
+   * a deletion that also consumes text outside the control would have to hoist
+   * the wrapper away, so the test is "covers all of the content AND reaches
+   * past it".
+   */
+  private _deletes_entire_control(
+    mapper: any,
+    info: SdtInfo,
+    start: number,
+    length: number,
+    final_new: string,
+  ): boolean {
+    if (final_new.trim() !== "") return false;
+    const ranges: [number, number, SdtInfo][] = mapper?.control_ranges ?? [];
+    const rng = ranges.find((r) => r[2] === info);
+    if (!rng) return false;
+    const [c_start, c_end] = rng;
+    const covers_all = start <= c_start && start + length >= c_end;
+    const reaches_outside = start < c_start || start + length > c_end;
+    return covers_all && reaches_outside;
+  }
+
+  /**
+   * Run the CC-4 gate matrix over one resolved edit; first failure wins.
+   *
+   * Order is deliberate, most-fundamental first: document protection binds
+   * regardless of where the edit lands, so it is checked before anything about
+   * the control; then the two category errors that no override can reasonably
+   * bypass (bound content, placeholder ghosts), because telling the caller
+   * "this text is not what you think it is" is more useful than telling them a
+   * lock stopped them; then the lock gates; then structure.
+   *
+   * Python twin: RedlineEngine._check_control_gates.
+   */
+  private _check_control_gates(
+    edit_number: number,
+    edit: any,
+    mapper: any,
+    start: number,
+    length: number,
+    final_target: string = "",
+    final_new: string = "",
+    known_controls: SdtInfo[] | null = null,
+    from_set_field: boolean = false,
+  ): string | null {
+    const overrides = this.gate_overrides;
+    const infos: SdtInfo[] = Array.from(
+      (mapper?._sdt_infos as Map<any, SdtInfo> | undefined)?.values() ?? [],
+    );
+    let [intersecting, at_start, at_end] = this._control_gate_context(
+      mapper,
+      start,
+      length,
+    );
+    if (known_controls !== null) {
+      // A `set_field` names its target; it does not infer it from a range.
+      // That matters for an EMPTY control, whose content span is zero-length,
+      // so nothing intersects it - and G5 would then refuse the fill as "body
+      // text outside a content control", the single most common legitimate
+      // operation under forms protection.
+      intersecting = known_controls;
+    }
+
+    const is_comment_only =
+      !!edit.comment && (edit.new_text || "") === (edit.target_text || "");
+
+    let err = checkProtectionBlocksEdit(edit_number, this.protection, {
+      controls: intersecting,
+      isCommentOnly: is_comment_only,
+      overrides,
+    });
+    if (err) return err;
+    // Comment-only edits mutate no text, so the tracking guarantee that G5's
+    // untracked-write gate defends is not at stake for them.
+    if (!is_comment_only) {
+      err = checkUntrackedWrite(edit_number, this.protection, overrides);
+      if (err) return err;
+    }
+
+    // G8 works off the target string, not the range: an empty control has no
+    // content spans to intersect (see gates.checkPlaceholderTarget).
+    err = checkPlaceholderTarget(edit_number, edit.target_text || "", infos);
+    if (err) return err;
+
+    if (intersecting.length === 0) return null;
+
+    // G13 refuses TEXT edits to bound content and recommends set_field.
+    // Running it against a set_field would refuse the recommendation.
+    if (!from_set_field) {
+      err = checkBoundControl(edit_number, intersecting);
+      if (err) return err;
+    }
+    err = checkCheckboxEdit(
+      edit_number,
+      intersecting,
+      edit.target_text || "",
+      edit.new_text || "",
+    );
+    if (err) return err;
+    err = checkContentLock(edit_number, intersecting, overrides);
+    if (err) return err;
+    err = checkGroupRegion(edit_number, intersecting, overrides);
+    if (err) return err;
+    for (const info of intersecting) {
+      if (this._deletes_entire_control(mapper, info, start, length, final_new)) {
+        err = checkDeleteLock(edit_number, [info], true, overrides);
+        if (err) return err;
+      }
+    }
+
+    // G15: a merge is what makes a wall crossing structural rather than
+    // segmentable. Without a paragraph break being consumed, a crossing is
+    // G14's business (auto-segment), not a refusal.
+    if (final_target.includes("\n\n") && !final_new.includes("\n\n")) {
+      const crossed = crossedControlWalls(intersecting, at_start, at_end);
+      err = checkBlockMergeAcrossControl(edit_number, crossed);
+      if (err) return err;
+    }
+
+    // G14: the edit is valid on both sides of a wall it crosses, so it
+    // applies — the word-level sub-edit splitter already lands each half on
+    // its own side. What was missing is the disclosure: an agent that asked to
+    // change text "in CC:3" and silently got a change half outside it has been
+    // told something untrue by omission.
+    const crossed = crossedControlWalls(intersecting, at_start, at_end);
+    if (crossed.length > 0) {
+      edit._warning = segmentationNote(crossed);
+    }
+
+    // Record what an override let through, for the report disclosure.
+    if (overrides.ignore_control_locks) {
+      for (const info of intersecting) {
+        if (info.contentLocked || info.cls === "group") {
+          if (!this._overridden_controls.includes(info)) {
+            this._overridden_controls.push(info);
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The apply-path subset of the gate matrix; a reason string, or null.
+   *
+   * Only the document-property gates run here — content locks, group regions,
+   * data binding and protection. Deliberately not the whole matrix: G8 and G11
+   * depend on the target STRING, and G14/G15 on the edit's shape, none of
+   * which a positionally-pinned edit has resolved in a form this layer can
+   * trust. Those stay validate-only, exactly as the paragraph-merge refusal
+   * does.
+   */
+  private _apply_gate_refusal(
+    mapper: any,
+    start: number,
+    length: number,
+    fromSetField: boolean = false,
+  ): string | null {
+    const overrides = this.gate_overrides;
+    if (
+      isProtectionActive(this.protection) &&
+      !overrides.ignore_document_protection &&
+      this.protection.edit === "readOnly"
+    ) {
+      return "document is read-only protected";
+    }
+    const controls: SdtInfo[] =
+      typeof mapper?.controls_intersecting === "function"
+        ? mapper.controls_intersecting(start, length)
+        : [];
+    if (controls.length === 0) return null;
+    // G13 refuses TEXT edits to bound content and points the caller at
+    // set_field. A fill desugars into pinned ModifyText sub-edits, so without
+    // this exemption the backstop would refuse the very operation the error
+    // recommends - and the recommendation would be a dead end. set_field is
+    // safe here precisely because it dual-writes the store, which is the
+    // whole reason the text path is not. Mirrors the Python engine (674c8c0).
+    const bound = controls.find((i) => i.bound);
+    if (bound && !fromSetField) return `${describeControl(bound)} is data-bound`;
+    if (overrides.ignore_control_locks) return null;
+    const locked = controls.find((i) => i.contentLocked);
+    if (locked) return `${describeControl(locked)} is content-locked`;
+    return null;
+  }
+
+  private _resolve_structural_table_edit(edit: any): {
+    sub_edits: Array<[any, string | null]>;
+    err_msg: string | null;
+  } {
+    let matches = this.mapper.drop_virtual_only_matches(
+      this.mapper.find_all_match_indices(edit.target_text),
+    );
+    let resolved_mapper = this.mapper;
+    if (matches.length === 0) {
+      if (!this.clean_mapper) {
+        this.clean_mapper = new DocumentMapper(this.doc, true);
+      }
+      matches = this.clean_mapper.drop_virtual_only_matches(
+        this.clean_mapper.find_all_match_indices(edit.target_text),
+      );
+      resolved_mapper = this.clean_mapper;
+    }
+
+    if (matches.length === 0) {
+      const target_snippet = (edit.target_text || "").trim().substring(0, 40);
+      return {
+        sub_edits: [],
+        err_msg: `- Failed to apply structural edit targeting: '${target_snippet}...'`,
+      };
+    }
+
+    const match_mode = edit.match_mode || "strict";
+    const unique_matches: [number, number][] = [];
+    const seen_trs = new Set<any>();
+
+    for (const match of matches) {
+      const start_idx = match[0];
+      const [anchor_run, anchor_para] = resolved_mapper.get_insertion_anchor(start_idx, false);
+      let target_element: Element | null = null;
+      if (anchor_run) target_element = anchor_run._element;
+      else if (anchor_para) target_element = anchor_para._element;
+
+      let tr: Element | null = target_element;
+      while (tr && tr.tagName !== "w:tr") tr = tr.parentNode as Element;
+
+      if (tr && !seen_trs.has(tr)) {
+        seen_trs.add(tr);
+        unique_matches.push(match);
+      }
+    }
+
+    if (unique_matches.length === 0) {
+      const target_snippet = (edit.target_text || "").trim().substring(0, 40);
+      return {
+        sub_edits: [],
+        err_msg: `- Failed to locate row target: '${target_snippet}...'`,
+      };
+    }
+
+    let matches_to_apply = unique_matches;
+    if (match_mode === "strict" || match_mode === "first") {
+      matches_to_apply = unique_matches.slice(0, 1);
+    }
+
+    const sub_edits: Array<[any, string | null]> = [];
+    if (match_mode === "all" || matches_to_apply.length > 1) {
+      for (const m of matches_to_apply) {
+        const sub_edit = {
+          ...edit,
+          _resolved_start_idx: m[0],
+          _active_mapper_ref: resolved_mapper,
+          _parent_edit_ref: edit,
+        };
+        sub_edits.push([sub_edit, null]);
+      }
+    } else {
+      edit._resolved_start_idx = matches_to_apply[0][0];
+      edit._active_mapper_ref = resolved_mapper;
+      sub_edits.push([edit, null]);
+    }
+
+    return { sub_edits, err_msg: null };
+  }
+
+  private _validate_set_field_edit(edit: any, edit_idx: number): string[] {
+    const errors: string[] = [];
+    let hits: FieldEntry[];
+    try {
+      hits = this._resolve_set_field_targets(edit);
+    } catch (e: any) {
+      return [`- Edit ${edit_idx} Failed: ${e?.message ?? e}`];
+    }
+
+    let refusal: string | null = null;
+    for (const entry of hits) {
+      const info = this._sdt_info_for_ordinal(entry.ordinal);
+      refusal = refuseClass(info ? info.cls : entry.cls_word, entry.ordinal);
+      if (!refusal && info) refusal = refuseValue(info, entry.ordinal, edit.value);
+      if (refusal) {
+        return [`- Edit ${edit_idx} Failed: ${refusal}`];
+      }
+    }
+
+    for (const entry of hits) {
+      const span = this._cc_content_range(entry.ordinal);
+      const info = this._sdt_info_for_ordinal(entry.ordinal);
+      if (!span) {
+        if (!info || info.cls !== "checkbox") continue;
+        const wanted = parseCheckboxValue(edit.value);
+        const cbCurrent = info.checked ? CHECKBOX_STATES[1] : CHECKBOX_STATES[0];
+        const cbNew = wanted ? CHECKBOX_STATES[1] : CHECKBOX_STATES[0];
+        const cbErr = this._check_control_gates(
+          edit_idx,
+          { type: "modify", target_text: cbCurrent, new_text: cbNew, comment: null } as any,
+          this.mapper,
+          0,
+          0,
+          cbCurrent,
+          cbNew,
+          [info],
+          true,
+        );
+        if (cbErr) {
+          errors.push(cbErr);
+          break;
+        }
+        continue;
+      }
+      const [start, end] = span;
+      const current = this.mapper.full_text.slice(start, end);
+      const probe: any = {
+        type: "modify",
+        target_text: current,
+        new_text: edit.value,
+        comment: edit.comment ?? null,
+      };
+      probe._parent_edit_ref = edit;
+      const gate_err = this._check_control_gates(
+        edit_idx,
+        probe,
+        this.mapper,
+        start,
+        end - start,
+        current,
+        edit.value,
+        info ? [info] : null,
+        true,
+      );
+      if (gate_err) {
+        errors.push(gate_err);
+        break;
+      }
+    }
+
+    return errors;
+  }
+
   public validate_edits(edits: any[], index_offset: number = 0): string[] {
     const errors: string[] = [];
     if (!this.mapper.full_text) this.mapper["_build_map"]();
@@ -2728,6 +3897,10 @@ export class RedlineEngine {
       // unrelated text (a comment timestamp, an earlier redline). The
       // string-shape checks above still apply. Checked BEFORE the empty-target
       // rejection below: pinned pure insertions legitimately carry no target.
+      if (edit.type === "set_field") {
+        errors.push(...this._validate_set_field_edit(edit, i + 1 + index_offset));
+        continue;
+      }
       if (
         (edit._match_start_index !== undefined &&
           edit._match_start_index !== null) ||
@@ -2979,6 +4152,28 @@ export class RedlineEngine {
         // shared context are fine.
         const eff_start = m_start + pfx;
         const eff_end = m_start + m_len - sfx;
+
+        // CC-4 content-control gates (spec-gates §2). Same shape as the
+        // part-boundary refusal above, for the same reason: a control wall is
+        // a place where an edit that looks fine in the flattened projection
+        // cannot be applied to the XML.
+        //
+        // The CHANGED range (eff_*), not the raw match, so shared context
+        // reaching into a locked control does not by itself refuse the edit —
+        // the caller is not modifying it. This is the image-marker gate's
+        // rule, not the part gate's: the part gate uses the raw range because
+        // the insertion ANCHOR is ambiguous at a part gap, which has no
+        // analogue here.
+        const gate_error = this._check_control_gates(
+          i + 1 + index_offset,
+          edit,
+          target_mapper,
+          eff_start,
+          Math.max(eff_end - eff_start, 0),
+          final_target,
+          final_new,
+        );
+        if (gate_error) errors.push(gate_error);
         if (eff_end > eff_start) {
           const overlapping = target_mapper.spans.filter(
             (s) =>
@@ -3078,8 +4273,8 @@ export class RedlineEngine {
         const spans = target_mapper.spans.filter(
           (s) => s.end > start && s.start < start + length,
         );
-        const insAuthors = new Set<string>();
-        const commentAuthors = new Set<string>();
+        const insAuthorsToIds = new Map<string, Set<string>>();
+        const commentAuthorsToIds = new Map<string, Set<string>>();
         // Does any real (run-backed) text in the target lie OUTSIDE a foreign
         // insertion? If so the target only partially overlaps the insertion and
         // replacing it as one span would straddle the <w:ins> boundary — that
@@ -3096,7 +4291,10 @@ export class RedlineEngine {
             if (insNodes.length > 0) {
               const auth = insNodes[0].getAttribute("w:author");
               if (auth && auth !== this.author) {
-                insAuthors.add(auth);
+                if (!insAuthorsToIds.has(auth)) {
+                  insAuthorsToIds.set(auth, new Set());
+                }
+                insAuthorsToIds.get(auth)!.add(s.ins_id);
                 isForeignIns = true;
               }
             }
@@ -3108,12 +4306,15 @@ export class RedlineEngine {
             for (const cid of s.comment_ids) {
               const c_data = this.mapper.comments_map[cid];
               if (c_data && c_data.author && c_data.author !== this.author) {
-                commentAuthors.add(c_data.author);
+                if (!commentAuthorsToIds.has(c_data.author)) {
+                  commentAuthorsToIds.set(c_data.author, new Set());
+                }
+                commentAuthorsToIds.get(c_data.author)!.add(`Com:${cid}`);
               }
             }
           }
         }
-        if (insAuthors.size > 0) {
+        if (insAuthorsToIds.size > 0) {
           // A single (strict/first) modification whose target lies ENTIRELY
           // inside foreign-authored insertion(s) is allowed: track_delete_run
           // splits the enclosing <w:ins> and nests the change, producing valid
@@ -3127,9 +4328,41 @@ export class RedlineEngine {
               fullyWithinForeignIns
             )
           ) {
-            errors.push(
-              `- Edit ${i + 1 + index_offset} Failed: Modification targets an active insertion from another author (${Array.from(insAuthors).join(", ")}). Accept that change first or scope your edit outside of it.`,
-            );
+            // Keep the hint bounded: naming every author and every id
+            // makes the refusal grow without limit, blowing the message
+            // token budget. One author with up to two ids is enough to
+            // act on; the rest are summarised as a count.
+            const sortedAuthors = Array.from(insAuthorsToIds.keys()).sort();
+            const namedAuthor = sortedAuthors[0];
+            const authorIds = Array.from(insAuthorsToIds.get(namedAuthor)!);
+            const sortedIds = authorIds.sort((a, b) => {
+              const numA = /^\d+$/.test(a) ? parseInt(a, 10) : 0;
+              const numB = /^\d+$/.test(b) ? parseInt(b, 10) : 0;
+              if (numA !== numB) return numA - numB;
+              return a.localeCompare(b);
+            });
+            const firstTargetId =
+              sortedIds.length > 0 ? `Chg:${sortedIds[0]}` : null;
+            const idHints = sortedIds
+              .slice(0, 2)
+              .map((cid) => `Chg:${cid}`)
+              .join(", ");
+            let hintSuffix = idHints ? ` (e.g. ${idHints})` : "";
+            if (sortedAuthors.length > 1) {
+              hintSuffix += ` (+${sortedAuthors.length - 1} more)`;
+            }
+            const acceptJson = firstTargetId
+              ? `{"type": "accept", "target_id": "${firstTargetId}"}`
+              : "";
+            const advice =
+              match_mode === "all" && fullyWithinForeignIns
+                ? 'or use match_mode="strict" or "first", or scope your edit outside of it.'
+                : "or scope your edit outside of it.";
+            const head = `- Edit ${i + 1 + index_offset} Failed: Modification targets an active insertion from another author (`;
+            const tail = `${hintSuffix}). Accept first with ${acceptJson} ${advice}`;
+            const authorBudget = GUARD_MESSAGE_CAP - head.length - tail.length;
+            const msg = head + clamp_text(namedAuthor, authorBudget) + tail;
+            errors.push(clamp_text(msg, GUARD_MESSAGE_CAP));
             continue;
           }
         }
@@ -3139,9 +4372,26 @@ export class RedlineEngine {
         // Only blind match_mode="all" fan-outs are refused, so a bulk
         // replacement cannot silently sweep through another author's
         // annotations (transactional rollback).
-        if (commentAuthors.size > 0 && match_mode === "all") {
+        if (commentAuthorsToIds.size > 0 && match_mode === "all") {
+          const authorHints: string[] = [];
+          const sortedCommentAuthors = Array.from(
+            commentAuthorsToIds.keys(),
+          ).sort();
+          for (const auth of sortedCommentAuthors) {
+            const cids = Array.from(commentAuthorsToIds.get(auth)!);
+            const sortedCids = cids.sort((a, b) => {
+              const numAStr = a.split(":").pop() || "";
+              const numBStr = b.split(":").pop() || "";
+              const numA = /^\d+$/.test(numAStr) ? parseInt(numAStr, 10) : 0;
+              const numB = /^\d+$/.test(numBStr) ? parseInt(numBStr, 10) : 0;
+              if (numA !== numB) return numA - numB;
+              return a.localeCompare(b);
+            });
+            const idHints = sortedCids.join(", ");
+            authorHints.push(idHints ? `${auth} (e.g. ${idHints})` : auth);
+          }
           errors.push(
-            `- Edit ${i + 1 + index_offset} Failed: match_mode="all" would sweep through a comment range from another author (${Array.from(commentAuthors).join(", ")}). Target the commented text deliberately with match_mode "strict" or "first", or scope your edit outside of it.`,
+            `- Edit ${i + 1 + index_offset} Failed: match_mode="all" would sweep through a comment range from another author (${authorHints.join(", ")}). Target the commented text deliberately with match_mode "strict" or "first", or scope your edit outside of it.`,
           );
         }
       }
@@ -3236,8 +4486,18 @@ export class RedlineEngine {
     return null;
   }
 
-  public validate_review_actions(actions: any[]): string[] {
+  /**
+   * `indices` maps each action's position in this array to its position in the
+   * caller's `changes` array, so every "- Action N" names the item the caller
+   * actually submitted. Omitted (direct callers): the array's own positions.
+   */
+  public validate_review_actions(
+    actions: any[],
+    indices?: number[],
+    shape_only = false,
+  ): string[] {
     const errors: string[] = [];
+    const gidx = (pos: number) => (indices ? indices[pos] : pos);
 
     // Document-context-free shape checks (QA 2026-07-19 v8 F-07), mirroring
     // Python's validate_review_action_batch: blank replies render as empty
@@ -3254,7 +4514,7 @@ export class RedlineEngine {
       if (type === "reply") {
         if (!String(action.text ?? "").trim()) {
           errors.push(
-            `- Action ${i + 1} Failed: reply text for ${target_id} is empty or ` +
+            `- Action ${gidx(i) + 1} Failed: reply text for ${target_id} is empty or ` +
               `whitespace-only. Word would show a blank comment bubble — provide the ` +
               `reply content in 'text'.`,
           );
@@ -3263,34 +4523,48 @@ export class RedlineEngine {
         const reply_key = target_id + '\x00' + String(action.text).trim();
         if (seen_replies.has(reply_key)) {
           errors.push(
-            `- Action ${i + 1} Failed: duplicate reply — this batch already replies to ` +
+            `- Action ${gidx(i) + 1} Failed: duplicate reply — this batch already replies to ` +
               `${target_id} with the same text. Remove the duplicate action.`,
           );
         }
         seen_replies.add(reply_key);
       } else if (type === "accept" || type === "reject") {
-        const prior = seen_resolutions.get(target_id);
+        // Ids are numbered per part (issue #114): the same target_id with
+        // different explicit `part` selectors names two unrelated changes,
+        // so duplicates/conflicts are tracked per (part, id). Bare ids keep
+        // one shared bucket — two bare actions on one id are the same
+        // target today as before.
+        const { part: action_part } = this._action_part_filter(action);
+        const resolution_key = `${action_part ?? ""}\x00${target_id}`;
+        const prior = seen_resolutions.get(resolution_key);
         if (prior !== undefined) {
           const [first_idx, first_type] = prior;
           if (first_type === type) {
             errors.push(
-              `- Action ${i + 1} Failed: duplicate action — Action ${first_idx + 1} in this ` +
+              `- Action ${gidx(i) + 1} Failed: duplicate action — Action ${gidx(first_idx) + 1} in this ` +
                 `batch already applies '${type}' to ${target_id}. A change can only be ` +
                 `resolved once; remove the duplicate action.`,
             );
           } else {
             errors.push(
-              `- Action ${i + 1} Failed: conflicting actions — Action ${first_idx + 1} in ` +
+              `- Action ${gidx(i) + 1} Failed: conflicting actions — Action ${gidx(first_idx) + 1} in ` +
                 `this batch applies '${first_type}' to ${target_id}, but this action applies ` +
                 `'${type}'. Decide the outcome and keep exactly one of them.`,
             );
           }
         } else {
-          seen_resolutions.set(target_id, [i, type]);
+          seen_resolutions.set(resolution_key, [i, type]);
         }
       }
     }
     if (errors.length > 0) return errors;
+
+    // `shape_only`: skip the document-context (id-exists) pass. Salvage mode
+    // needs a stale id to be a SKIPPED action, not a fatal batch error, and
+    // apply_review_actions already reports it that way with the same message
+    // — which is exactly how Python splits the two (validate_review_action_batch
+    // is shape-only; not-found surfaces inside apply, engine.py:2691,5246).
+    if (shape_only) return errors;
 
     for (let i = 0; i < actions.length; i++) {
       const action = actions[i];
@@ -3310,30 +4584,45 @@ export class RedlineEngine {
         }
         if (!found) {
           errors.push(
-            this._action_not_found_error(action.target_id, "reply", `- Action ${i + 1} Failed:`),
+            this._action_not_found_error(action.target_id, "reply", `- Action ${gidx(i) + 1} Failed:`),
           );
         }
       } else if (type === "accept" || type === "reject") {
         const target_id = action.target_id.replace("Chg:", "");
-        const all_ins = findAllDescendants(this.doc.element, "w:ins").filter(
-          (n) => n.getAttribute("w:id") === target_id,
-        );
-        const all_del = findAllDescendants(this.doc.element, "w:del").filter(
-          (n) => n.getAttribute("w:id") === target_id,
-        );
+        const { part, error: part_error } = this._action_part_filter(action);
+        if (part_error) {
+          errors.push(
+            `- Action ${gidx(i) + 1} Failed: ${type} on ${action.target_id} — ${part_error}`,
+          );
+          continue;
+        }
+        // Existence spans every story part (issue #114): revisions live in
+        // headers/footers/notes too, and the projection advertises their ids.
         // Tracked paragraph restyles (w:pPrChange) are resolvable revisions
         // too (QA 2026-07-23 F1a).
-        const all_ppc = findAllDescendants(
-          this.doc.element,
-          "w:pPrChange",
-        ).filter((n) => n.getAttribute("w:id") === target_id);
-        if (
-          all_ins.length === 0 &&
-          all_del.length === 0 &&
-          all_ppc.length === 0
-        ) {
+        let found = false;
+        for (const tag of ["w:ins", "w:del", "w:pPrChange"]) {
+          if (
+            this._revisionsByTagIn(tag, part).some((n) => n.id === target_id)
+          ) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
           errors.push(
-            this._action_not_found_error(action.target_id, type, `- Action ${i + 1} Failed:`),
+            part !== null
+              ? this._not_found_in_part_error(
+                  action.target_id,
+                  type,
+                  part,
+                  `- Action ${gidx(i) + 1} Failed:`,
+                )
+              : this._action_not_found_error(
+                  action.target_id,
+                  type,
+                  `- Action ${gidx(i) + 1} Failed:`,
+                ),
           );
         }
       }
@@ -3341,7 +4630,110 @@ export class RedlineEngine {
     return errors;
   }
 
-  public process_batch(changes: DocumentChange[]): any {
+  /**
+   * Collects author names from all pending revisions and comments.
+   *
+   * The `w:author` attribute is the signal: every tracked-change and comment
+   * marker carries it (w:ins, w:del, w:moveTo, w:pPrChange, w:tblPrChange,
+   * w:cellIns, w:cellDel, w:comment, ...).
+   *
+   * Word's persona registry (people.xml) is skipped: its entries survive accepting
+   * every revision, so its w:author attributes are metadata rather than pending revisions.
+   */
+  public get_pending_revision_authors(): Set<string> {
+    const authors = new Set<string>();
+
+    const collect = (root: any) => {
+      if (!root) return;
+      try {
+        if (typeof root.getAttribute === "function") {
+          const rootAuth = root.getAttribute("w:author");
+          if (rootAuth) {
+            authors.add(rootAuth);
+          }
+        }
+        const descendants = findAllDescendants(root, "*");
+        for (const el of descendants) {
+          const auth = el.getAttribute("w:author");
+          if (auth) {
+            authors.add(auth);
+          }
+        }
+      } catch {
+        /* ignore element scan errors */
+      }
+    };
+
+    try {
+      if (this.doc?.element) {
+        collect(this.doc.element);
+      }
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      if (this.doc?.pkg) {
+        const commentsData = extract_comments_data(this.doc.pkg);
+        for (const cInfo of Object.values(commentsData)) {
+          const cAuthor = (cInfo as any)?.author;
+          if (cAuthor && cAuthor !== "Unknown") {
+            authors.add(cAuthor);
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      const parts = this.doc?.pkg?.parts || [];
+      for (const part of parts) {
+        if (
+          part === this.doc?.part ||
+          !String(part.contentType || "").endsWith("+xml")
+        ) {
+          continue;
+        }
+        const partname = String(part.partname || "").toLowerCase();
+        const contentType = String(part.contentType || "");
+        if (
+          contentType === "application/vnd.ms-word.people+xml" ||
+          partname.includes("people")
+        ) {
+          continue;
+        }
+        try {
+          let root: any = part._element;
+          if (!root && part.blob) {
+            root = parseXml(part.blob);
+          }
+          if (root) {
+            collect(root);
+          }
+        } catch {
+          /* unparsable payload: ignore */
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    return authors;
+  }
+
+  /**
+   * `original_indices` maps each element of `changes` to its position in the
+   * caller's ORIGINAL array, for callers that already dropped items (the MCP
+   * schema-salvage path): every "- Edit N" / "- Action N" and every `failed`
+   * index then names what the caller submitted. Signature parity with
+   * python/src/adeu/redline/engine.py process_batch (:2551-2556).
+   */
+  public process_batch(
+    changes: DocumentChange[],
+    original_indices?: number[],
+    partial: boolean = false,
+  ): any {
     // Defensive sanitization: some LLM clients "double-serialize" nested
     // arrays, delivering each element of `changes` as a JSON string instead of
     // a parsed object. Downstream code mutates state trackers (e.g.
@@ -3370,10 +4762,92 @@ export class RedlineEngine {
       }) as DocumentChange[];
     }
 
-    return this._process_batch_internal(changes);
+    return this._process_batch_internal(changes, original_indices, partial);
   }
 
-  private _process_batch_internal(changes: DocumentChange[]): any {
+  /**
+   * Everything a batch can change, cheaply. Compared before the batch and
+   * after a rollback to VERIFY the rollback rather than assume it (see
+   * rollback_verified).
+   *
+   * Every way a batch mutates a document lands here: an applied edit mints
+   * new w:ins/w:del ids, accept/reject retires them, reply (and an edit's
+   * `comment`) adds a comment id. Count AND ids, because a document may reuse
+   * one w:id across several elements.
+   *
+   * Read from the TREE, never from the mapper: the mapper is rebuilt by the
+   * rollback but not by every operation that precedes a batch (accept_all
+   * leaves it stale by design), so a mapper-derived value would compare a
+   * stale "before" against a fresh "after" and report a clean rollback as a
+   * leak.
+   */
+  private _batch_fingerprint(): string {
+    let revisions = 0;
+    const ids = new Set<string>();
+    for (const tag of ALL_REVISION_TAGS) {
+      for (const n of this._revisionsByTag(tag)) {
+        revisions++;
+        if (n.id) ids.add(n.id);
+      }
+    }
+    return [
+      revisions,
+      [...ids].sort().join(","),
+      this._existing_comment_ids().join(","),
+    ].join("|");
+  }
+
+  /** Undo everything this batch did and put the engine's projections back. */
+  private _restore_batch_snapshot(snapshot: any, originalCurrentId: any): void {
+    if (!snapshot) return;
+    restoreSnapshot(this.doc, snapshot);
+    this.current_id = originalCurrentId;
+    this.mapper = new DocumentMapper(this.doc);
+    // Offsets into mapper.full_text; rebuilt whenever the mapper is.
+    this._cc_anchor_pairs = null;
+    this._field_entries_cache = null;
+    this.comments_manager = new CommentsManager(this.doc);
+    this.clean_mapper = null;
+    // The restore can swap whole parts for freshly parsed ones, so the
+    // revision index's owner-document identity check is not enough to catch
+    // every shape of it. Drop it: _batch_fingerprint reads through it, and a
+    // stale index would let a leak verify itself as clean.
+    this._revisionIndex = null;
+  }
+
+  /**
+   * Did the rollback actually roll back? A rejected batch is a promise that
+   * the document is untouched; this is the check that the promise held, and
+   * the ONLY thing a caching caller can safely key document reuse off.
+   */
+  private _verify_rollback(pre_batch_fingerprint: string | null): void {
+    // null = not fingerprinted (an edit-only batch): the edit rollback path is
+    // unchanged and separately pinned, and fingerprinting every batch would
+    // force a whole-document revision walk on the hot path for it.
+    if (pre_batch_fingerprint === null) return;
+    try {
+      this.rollback_verified =
+        this._batch_fingerprint() === pre_batch_fingerprint;
+    } catch {
+      this.rollback_verified = false;
+    }
+  }
+
+  private _process_batch_internal(
+    changes: DocumentChange[],
+    original_indices?: number[],
+    partial: boolean = false,
+  ): any {
+    // A fresh verdict per batch: a rejection that never mutated anything (a
+    // validation failure before the first apply) is a verified rollback too.
+    this.rollback_verified = true;
+
+    const pending_authors = this.get_pending_revision_authors();
+    const author_impersonation_warning =
+      this.author && pending_authors.has(this.author)
+        ? `[!] Warning: acting author '${this.author}' matches an author with pending revisions in this document.`
+        : null;
+
     // Pre-process edits: strip identical leading heading hashes from target_text and new_text
     for (const c of changes) {
       if (
@@ -3393,19 +4867,29 @@ export class RedlineEngine {
     }
 
     this.skipped_details = [];
+    this._overridden_controls = [];
+    // (0-based index in the CALLER's array, reason) for every failure, whatever
+    // bucket it came from — the machine-readable half of the failure envelope
+    // (B9, mirrors engine.py:2673).
+    const failed_list: [number, string][] = [];
 
-    const actions = changes.filter(
-      (c) =>
-        c !== null &&
-        typeof c === "object" &&
-        ["accept", "reject", "reply"].includes(c.type),
-    );
-    const edits = changes.filter(
-      (c) =>
-        c === null ||
-        typeof c !== "object" ||
-        !["accept", "reject", "reply"].includes(c.type),
-    );
+    // Buckets carry the caller's index with them: numbering each bucket from 1
+    // blamed "Edit 1" for the caller's changes[1] whenever an action preceded
+    // it (engine.py:2675-2687).
+    const idx_of = (i: number) => (original_indices ? original_indices[i] : i);
+    const is_action = (c: any) =>
+      c !== null &&
+      typeof c === "object" &&
+      ["accept", "reject", "reply"].includes(c.type);
+    const actions_with_idx = changes
+      .map((c, i) => ({ c, i: idx_of(i) }))
+      .filter(({ c }) => is_action(c));
+    const edits_with_idx = changes
+      .map((c, i) => ({ c, i: idx_of(i) }))
+      .filter(({ c }) => !is_action(c));
+    const actions = actions_with_idx.map(({ c }) => c);
+    const action_indices = actions_with_idx.map(({ i }) => i);
+    const edits = edits_with_idx.map(({ c }) => c);
 
     // Never pre-unwrap a foreign author's <w:ins> to make a partially
     // straddling edit fit: that turns their tracked-inserted text into
@@ -3421,28 +4905,96 @@ export class RedlineEngine {
     // The document-aware pairing check runs BEFORE any action mutates the
     // DOM: accept + reject across one replacement's del+ins pair is a
     // contradiction, not two independent operations (ADEU-QA-004).
-    let action_errors =
-      actions.length > 0 ? this.validate_review_actions(actions) : [];
+    // G7/G4 (spec-gates §2): protection gates review actions BEFORE the
+    // id-existence check, because "that id does not exist" would be a
+    // misleading answer to "why did my Accept fail" in a document where no
+    // Accept can succeed at all.
+    let action_errors: string[] = [];
+    for (let n = 0; n < actions.length; n++) {
+      const err = checkProtectionBlocksReview(
+        action_indices[n] + 1,
+        (actions[n] as any)?.type ?? "",
+        this.protection,
+        this.gate_overrides,
+      );
+      if (err) action_errors.push(err);
+    }
+    if (action_errors.length === 0) {
+      action_errors =
+        actions.length > 0
+          ? this.validate_review_actions(actions, action_indices, partial)
+          : [];
+    }
     if (actions.length > 0 && action_errors.length === 0) {
-      action_errors = this.validate_action_pairing(actions);
+      action_errors = this.validate_action_pairing(actions, action_indices);
     }
     const validate_edits_now = edits.length > 0 && action_errors.length > 0;
-    const edit_errors = validate_edits_now ? this.validate_edits(edits) : [];
+    const edit_errors: string[] = [];
+    if (validate_edits_now) {
+      // One call per edit so each carries its own caller index; validate_edits
+      // is a per-edit loop, so this is the same work in the same order.
+      for (const { c, i } of edits_with_idx) {
+        const single = this.validate_edits([c], i);
+        if (single.length > 0) {
+          edit_errors.push(...single);
+          failed_list.push([i, single.join("\n")]);
+        }
+      }
+    }
     const all_errors = [...action_errors, ...edit_errors];
     if (all_errors.length > 0) {
-      throw new BatchValidationError(all_errors);
+      // Action prose already names the caller's index — read it back rather
+      // than tracking it twice (engine.py:2693,2700).
+      failed_list.unshift(...extract_failed_indices(action_errors));
+      throw new BatchValidationError(all_errors, failed_list);
     }
 
     let applied_actions = 0;
     let skipped_actions = 0;
     let already_resolved_actions = 0;
+
+    // ONE transaction for the WHOLE batch. The snapshot has to predate the
+    // review actions, not just the edits: they mutate the document too, and a
+    // rejection promises the caller that "it was rolled back and nothing was
+    // saved". Snapshotting after apply_review_actions made that promise false
+    // for every accept/reject/reply in a batch that a later edit — or a later
+    // ACTION — rejected, and the MCP layer then pinned the mutated DOM back
+    // for the retry, so each rejected attempt stacked another reply on the
+    // reviewer's comment (BUG 2026-08-12).
+    //
+    // Cost: an action-only batch now takes a snapshot it did not take before.
+    // takeSnapshot skips the deep clone for parts that are still clean (the
+    // ordinary case — the MCP loads a fresh document per call), so this is a
+    // few array copies there, and the correctness it buys is not optional.
+    const transactional = actions.length > 0 || edits.length > 0;
+    const snapshot = transactional ? takeSnapshot(this.doc) : null;
+    const pre_batch_fingerprint =
+      actions.length > 0 ? this._batch_fingerprint() : null;
+    const originalCurrentId = this.current_id;
+
     if (actions.length > 0) {
-      const res = this.apply_review_actions(actions);
-      applied_actions = res[0];
-      skipped_actions = res[1];
-      already_resolved_actions = res[2];
-      if (skipped_actions > 0) {
-        throw new BatchValidationError(this.skipped_details);
+      try {
+        const res = this.apply_review_actions(actions, action_indices);
+        applied_actions = res[0];
+        skipped_actions = res[1];
+        already_resolved_actions = res[2];
+        if (skipped_actions > 0) {
+          failed_list.push(...extract_failed_indices(this.skipped_details));
+          // Salvage mode keeps the skips as reported failures and carries on
+          // with the edits (engine.py:2705-2709).
+          if (!partial) {
+            throw new BatchValidationError(this.skipped_details, failed_list);
+          }
+        }
+      } catch (err) {
+        if (!partial) {
+          // An action can also fail at APPLY time (a reply whose parent cannot
+          // be threaded, a w:id shared across authors) — long after validation
+          // passed and after earlier actions in the batch already applied.
+          this._restore_batch_snapshot(snapshot, originalCurrentId);
+          this._verify_rollback(pre_batch_fingerprint);
+          throw err;
+        }
       }
       if (applied_actions > 0) {
         this.mapper["_build_map"]();
@@ -3480,8 +5032,8 @@ export class RedlineEngine {
           return e._match_start_index;
         return null;
       };
-      const ordered_edits = edits
-        .map((edit, i) => ({ edit: edit as any, i }))
+      const ordered_edits = edits_with_idx
+        .map(({ c, i: orig_idx }, i) => ({ edit: c as any, i, orig_idx }))
         .sort((a, b) => {
           const ka = pinned_idx(a.edit);
           const kb = pinned_idx(b.edit);
@@ -3492,27 +5044,38 @@ export class RedlineEngine {
         });
 
       {
-        // Sequential validate-and-apply with transactional rollback.
-        const snapshot = takeSnapshot(this.doc);
-        const originalCurrentId = this.current_id;
+        // Sequential validate-and-apply, rolling back to the snapshot taken
+        // above — before this batch's ACTIONS applied, not after them.
         try {
           const sequential_errors: string[] = [];
           let applied_so_far = 0;
-          for (const { edit, i } of ordered_edits) {
+          for (const { edit, orig_idx } of ordered_edits) {
             let single_errors: string[];
             try {
-              single_errors = this.validate_edits([edit], i);
+              single_errors = this.validate_edits([edit], orig_idx);
             } catch (e) {
               // Clean per-edit failure for time-budget violations (QA F5).
               if (!(e instanceof RegexTimeoutError)) throw e;
-              single_errors = [`- Edit ${i + 1} Failed: ${e.message}`];
+              single_errors = [`- Edit ${orig_idx + 1} Failed: ${e.message}`];
             }
             if (single_errors.length > 0) {
-              if (applied_so_far > 0) {
+              const reason = single_errors.join("\n");
+              failed_list.push([orig_idx, reason]);
+              // The rollback hint is transactional-mode context: in salvage
+              // mode nothing is rolled back, so it would be a lie
+              // (engine.py:2811).
+              if (applied_so_far > 0 && !partial) {
                 const hint = sequential_context_hint(applied_so_far);
                 single_errors = single_errors.map((err) => err + hint);
               }
               sequential_errors.push(...single_errors);
+              // Salvage mode reaches the per-edit report builder below, which
+              // reads the reason off the edit itself. A raw non-object change
+              // cannot carry it (assigning to a string primitive throws under
+              // ESM strict mode) — its reason already travels in `failed`.
+              if (edit && typeof edit === "object") {
+                (edit as any)._error_msg = reason;
+              }
             } else {
               this.apply_edits([edit], page_offsets);
               if (
@@ -3521,6 +5084,9 @@ export class RedlineEngine {
               ) {
                 applied_so_far++;
                 this.mapper = new DocumentMapper(this.doc);
+    // Offsets into mapper.full_text; rebuilt whenever the mapper is.
+    this._cc_anchor_pairs = null;
+    this._field_entries_cache = null;
                 this.clean_mapper = null;
               } else {
                 // QA 2026-07-23 F2: an APPLY-stage failure ("Failed to locate
@@ -3531,24 +5097,39 @@ export class RedlineEngine {
                 // failed edit's partial mutations.
                 let msg =
                   (edit as any)._error_msg ||
-                  `- Edit ${i + 1} Failed: Failed to apply edit.`;
-                if (applied_so_far > 0) {
+                  `- Edit ${orig_idx + 1} Failed: Failed to apply edit.`;
+                if (edit && typeof edit === "object") {
+                  (edit as any)._error_msg = msg;
+                }
+                failed_list.push([orig_idx, msg]);
+                if (applied_so_far > 0 && !partial) {
                   msg += sequential_context_hint(applied_so_far);
                 }
                 sequential_errors.push(msg);
-                break;
+                if (!partial) break;
+                // Salvage mode continues, so the projections must describe the
+                // document as it actually reads now: a sub-edit failure can
+                // have mutated the tree before giving up, and the next edit
+                // validates against that state.
+                if ((edit as any)._applied_status) {
+                  this.mapper = new DocumentMapper(this.doc);
+    // Offsets into mapper.full_text; rebuilt whenever the mapper is.
+    this._cc_anchor_pairs = null;
+    this._field_entries_cache = null;
+                  this.clean_mapper = null;
+                }
               }
             }
           }
-          if (sequential_errors.length > 0) {
-            throw new BatchValidationError(sequential_errors);
+          // Transactional rejection is the strict mode's contract only: with
+          // partial the applied edits stay applied and every failure travels
+          // in `failed` / the per-edit reports (engine.py:2851-2858).
+          if (!partial && sequential_errors.length > 0) {
+            throw new BatchValidationError(sequential_errors, failed_list);
           }
         } catch (err) {
-          restoreSnapshot(this.doc, snapshot);
-          this.current_id = originalCurrentId;
-          this.mapper = new DocumentMapper(this.doc);
-          this.comments_manager = new CommentsManager(this.doc);
-          this.clean_mapper = null;
+          this._restore_batch_snapshot(snapshot, originalCurrentId);
+          this._verify_rollback(pre_batch_fingerprint);
           throw err;
         }
 
@@ -3592,13 +5173,41 @@ export class RedlineEngine {
             clean_text: clean_text,
             pages: (edit as any)._pages || [],
             heading_path: (edit as any)._heading_path || "",
+            field: (edit as any)._field || "",
             occurrences_modified: (edit as any)._occurrences_modified || 0,
             match_mode: (edit as any).match_mode || "strict",
           });
         }
       }
     }
+
+    // Cross-edit advisory: individually legal deletions can still add up to a
+    // sentence that reads as gibberish once accepted. Runs only after the
+    // batch has committed, and only ever appends to skipped_details.
+    if (applied_edits > 0) {
+      try {
+        this._warn_stranded_comment_anchors(originalCurrentId);
+      } catch {
+        /* an advisory must never be able to fail a committed batch */
+      }
+    }
+
     return {
+      // Uniform outcome keys (B9): a caller reads `status` and `failed`
+      // without knowing which bucket a failure came from. Only salvage mode
+      // can report "partial" — strict mode throws instead (B5);
+      // engine.py:2864-2869.
+      status: partial && failed_list.length > 0 ? "partial" : "ok",
+      author_impersonation_warning: author_impersonation_warning,
+      // spec-gates §5: an override that was actually exercised is disclosed in
+      // the report header. Silence here would let a batch bypass a safety rail
+      // with no trace for the human reviewing it.
+      overrides_note: overridesNote(this.gate_overrides, this._overridden_controls),
+      failed: failed_list.map(([index, reason]) => ({
+        index,
+        reason,
+        error: reason,
+      })),
       actions_applied: applied_actions,
       actions_skipped: skipped_actions,
       // Actions whose target was already resolved by an earlier action of
@@ -3619,7 +5228,7 @@ export class RedlineEngine {
       skipped_details: this.skipped_details,
       edits: edits_reports,
       engine: "node",
-      version: "1.18.2",
+      version: CORE_VERSION,
     };
   }
 
@@ -3715,6 +5324,16 @@ export class RedlineEngine {
     for (const edit of edits) {
       if (typeof edit !== "object" || edit === null) continue;
 
+      if (edit.type === "set_field") {
+        // Before the pinned branch: `set_field` addresses its target by id,
+        // so a caller-supplied offset would be meaningless - and taking the
+        // pinned path would hand the apply layer a change with no
+        // target_text at all.
+        this._resolve_set_field(edit, resolved_edits);
+        if (edit._error_msg) skipped += 1;
+        continue;
+      }
+
       if (
         (edit._resolved_start_idx !== undefined &&
           edit._resolved_start_idx !== null) ||
@@ -3727,6 +5346,24 @@ export class RedlineEngine {
         ) {
           edit._resolved_start_idx = edit._match_start_index;
         }
+        // CC-14: caller-pinned edits skip resolution entirely and go straight
+        // to the apply layer, so the shared-trailing-mark normalisation the
+        // resolution path performs has to happen here too. Widening a target
+        // to make it unique routinely produces this shape WITH a pinned index,
+        // and such a batch applied in-process -- no JSON round trip to drop
+        // the index -- silently lost a paragraph break. Structural ops carry
+        // an explicit _internal_op and are left alone.
+        if (
+          edit.type === "modify" &&
+          !edit._internal_op &&
+          edit.target_text &&
+          edit.new_text
+        ) {
+          [edit.target_text, edit.new_text] = trimSharedTrailingParagraphMark(
+            edit.target_text,
+            edit.new_text,
+          );
+        }
         // Caller-pinned indices (diff output) are CLEAN-view character
         // offsets; the raw-view mapper fallback would mis-anchor them on
         // documents whose views differ (AP-05).
@@ -3736,90 +5373,30 @@ export class RedlineEngine {
           }
           edit._active_mapper_ref = this.clean_mapper;
         }
+        // A pure insertion landing exactly between an empty control's anchors
+        // is a field fill expressed as text (A4.10).
+        if (
+          edit.type === "modify" &&
+          !edit.target_text &&
+          edit.new_text &&
+          !edit._insert_host_el
+        ) {
+          const host = this._empty_control_fill_host(
+            edit._active_mapper_ref,
+            edit._resolved_start_idx ?? 0,
+          );
+          if (host) edit._insert_host_el = host;
+        }
         resolved_edits.push([edit, edit.new_text || null]);
       } else if (edit.type === "insert_row" || edit.type === "delete_row") {
-        let matches = this.mapper.drop_virtual_only_matches(
-          this.mapper.find_all_match_indices(edit.target_text),
-        );
-        let resolved_mapper = this.mapper;
-        if (matches.length === 0) {
-          if (!this.clean_mapper) {
-            this.clean_mapper = new DocumentMapper(this.doc, true);
-          }
-          matches = this.clean_mapper.drop_virtual_only_matches(
-            this.clean_mapper.find_all_match_indices(edit.target_text),
-          );
-          resolved_mapper = this.clean_mapper;
-        }
-
-        if (matches.length > 0) {
-          const match_mode = edit.match_mode || "strict";
-
-          // We need to resolve matches to unique w:tr elements to deduplicate them.
-          const unique_matches: [number, number][] = [];
-          const seen_trs = new Set<any>();
-
-          for (const match of matches) {
-            const start_idx = match[0];
-            const [anchor_run, anchor_para] = resolved_mapper.get_insertion_anchor(start_idx, false);
-            let target_element: Element | null = null;
-            if (anchor_run) target_element = anchor_run._element;
-            else if (anchor_para) target_element = anchor_para._element;
-
-            let tr: Element | null = target_element;
-            while (tr && tr.tagName !== "w:tr") tr = tr.parentNode as Element;
-
-            if (tr) {
-              if (!seen_trs.has(tr)) {
-                seen_trs.add(tr);
-                unique_matches.push(match);
-              }
-            }
-          }
-
-          if (unique_matches.length > 0) {
-            let matches_to_apply = unique_matches;
-            if (match_mode === "strict" || match_mode === "first") {
-              matches_to_apply = unique_matches.slice(0, 1);
-            }
-
-            if (match_mode === "all" || matches_to_apply.length > 1) {
-              // Create sub-edits for each match so that they are processed as independent operations,
-              // and the occurrences_modified and applied_status are tracked correctly on the parent.
-              for (const m of matches_to_apply) {
-                const sub_edit = {
-                  ...edit,
-                  _resolved_start_idx: m[0],
-                  _active_mapper_ref: resolved_mapper,
-                  _parent_edit_ref: edit,
-                };
-                resolved_edits.push([sub_edit, null]);
-              }
-            } else {
-              // Single match case for non-"all" modes
-              edit._resolved_start_idx = matches_to_apply[0][0];
-              edit._active_mapper_ref = resolved_mapper;
-              resolved_edits.push([edit, null]);
-            }
-          } else {
-            skipped++;
-            edit._applied_status = false;
-            const target_snippet = (edit.target_text || "")
-              .trim()
-              .substring(0, 40);
-            const msg = `- Failed to locate row target: '${target_snippet}...'`;
-            this.skipped_details.push(msg);
-            edit._error_msg = msg;
-          }
-        } else {
+        const { sub_edits, err_msg } = this._resolve_structural_table_edit(edit);
+        if (err_msg) {
           skipped++;
           edit._applied_status = false;
-          const target_snippet = (edit.target_text || "")
-            .trim()
-            .substring(0, 40);
-          const msg = `- Failed to locate row target: '${target_snippet}...'`;
-          this.skipped_details.push(msg);
-          edit._error_msg = msg;
+          this.skipped_details.push(err_msg);
+          edit._error_msg = err_msg;
+        } else {
+          resolved_edits.push(...sub_edits);
         }
       } else {
         let resolved: any;
@@ -3978,6 +5555,12 @@ export class RedlineEngine {
       } else if (edit.type === "insert_row" || edit.type === "delete_row") {
         success = this._apply_table_edit(edit, false);
       }
+      if (success && edit._unwrap_sdt_after) {
+        // After the content change, never before: the edit resolves against
+        // offsets inside the control, and dissolving the wrapper first would
+        // move them (CC-6(c), spec-set-field §4.4).
+        unwrapSdt(edit._unwrap_sdt_after);
+      }
       if (success) {
         const owner = edit._parent_edit_ref || edit;
         if (!Array.isArray(owner._minted_change_ids)) {
@@ -4029,6 +5612,7 @@ export class RedlineEngine {
           if (!pages.includes(page)) pages.unshift(page);
           parent._pages = pages;
           parent._heading_path = path;
+          parent._field = this._field_label_at(start);
         } else {
           if (first_in_group) {
             edit._occurrences_modified = (edit._occurrences_modified || 0) + 1;
@@ -4042,6 +5626,7 @@ export class RedlineEngine {
           if (!pages.includes(page)) pages.unshift(page);
           edit._pages = pages;
           edit._heading_path = path;
+          edit._field = this._field_label_at(start);
         }
       } else {
         skipped++;
@@ -4248,18 +5833,28 @@ export class RedlineEngine {
    * All revision ids that resolve as ONE unit with `target_id`: the ids of
    * every contiguous same-author w:ins/w:del sibling of its elements (a
    * replacement's del+ins pair), plus the id itself.
+   *
+   * `part` scopes the lookup to one OPC part. Ids are numbered per part
+   * (issue #114), so a group is only well-defined within one part — callers
+   * that pass null accept matches from anywhere and must have established
+   * the id is unambiguous first.
    */
-  private _resolution_group_ids(target_id: string): Set<string> {
+  private _resolution_group_ids(
+    target_id: string,
+    part: string | null = null,
+  ): Set<string> {
     const nodes = [
-      ...findAllDescendants(this.doc.element, "w:ins"),
-      ...findAllDescendants(this.doc.element, "w:del"),
-    ].filter((n) => n.getAttribute("w:id") === target_id);
+      ...this._revisionsByTagIn("w:ins", part),
+      ...this._revisionsByTagIn("w:del", part),
+    ]
+      .filter((n) => n.id === target_id)
+      .map((n) => n.el);
     const group = new Set<string>();
     if (nodes.length === 0) {
       // A tracked paragraph restyle (w:pPrChange) is a revision of its own
       // (QA 2026-07-23 F1a) — resolvable even with no ins/del elements.
-      const has_ppc = findAllDescendants(this.doc.element, "w:pPrChange").some(
-        (n) => n.getAttribute("w:id") === target_id,
+      const has_ppc = this._revisionsByTagIn("w:pPrChange", part).some(
+        (n) => n.id === target_id,
       );
       if (has_ppc) group.add(target_id);
       return group;
@@ -4280,9 +5875,12 @@ export class RedlineEngine {
    * batch that accepts one side and rejects the other is contradictory.
    * Rejecting it up front — before any action mutates the document — keeps
    * the batch transactional.
+   *
+   * `indices` as in validate_review_actions: caller-index space for the prose.
    */
-  public validate_action_pairing(actions: any[]): string[] {
+  public validate_action_pairing(actions: any[], indices?: number[]): string[] {
     const errors: string[] = [];
+    const gidx = (pos: number) => (indices ? indices[pos] : pos);
     const group_first = new Map<string, [number, string, string]>();
     for (let pos = 0; pos < actions.length; pos++) {
       const act = actions[pos];
@@ -4290,11 +5888,26 @@ export class RedlineEngine {
       const raw_id = String(act.target_id ?? "");
       if (raw_id.startsWith("Com:")) continue;
       const target_id = raw_id.startsWith("Chg:") ? raw_id.slice(4) : raw_id;
-      const group = this._resolution_group_ids(target_id);
+      // Groups are per-part (issue #114): accepting header1's Chg:1 and
+      // rejecting the body's Chg:1 is NOT a contradiction. Scope to the
+      // action's explicit part, else to the only part holding the id; an
+      // ambiguous or unknown bare id is skipped here — apply/validation
+      // report those with their own errors.
+      const { part: requested_part, error: part_error } =
+        this._action_part_filter(act);
+      if (part_error) continue;
+      let scope = requested_part;
+      if (scope === null) {
+        const parts_with_id = this._parts_holding_id(target_id);
+        if (parts_with_id.length !== 1) continue;
+        scope = parts_with_id[0];
+      }
+      const group = this._resolution_group_ids(target_id, scope);
       if (group.size === 0) continue; // unknown ids fail with their own not-found error
+      const group_key = (gid: string) => `${scope} ${gid}`;
       let conflict: [number, string, string] | null = null;
       for (const gid of group) {
-        const prior = group_first.get(gid);
+        const prior = group_first.get(group_key(gid));
         if (prior !== undefined && prior[1] !== act.type) {
           conflict = prior;
           break;
@@ -4303,8 +5916,8 @@ export class RedlineEngine {
       if (conflict !== null) {
         const [first_pos, first_type, first_id] = conflict;
         errors.push(
-          `- Action ${pos + 1} Failed: conflicting actions on one replacement — Action ` +
-            `${first_pos + 1} applies '${first_type}' to Chg:${first_id}, and Chg:${target_id} is ` +
+          `- Action ${gidx(pos) + 1} Failed: conflicting actions on one replacement — Action ` +
+            `${gidx(first_pos) + 1} applies '${first_type}' to Chg:${first_id}, and Chg:${target_id} is ` +
             `part of the same change (a replacement's contiguous del+ins pair resolves as one ` +
             `unit, so '${first_type}' already decides both sides). Accepting one side and ` +
             `rejecting the other is contradictory — decide the outcome and submit exactly one ` +
@@ -4313,8 +5926,8 @@ export class RedlineEngine {
         continue;
       }
       for (const gid of group) {
-        if (!group_first.has(gid)) {
-          group_first.set(gid, [pos, act.type, target_id]);
+        if (!group_first.has(group_key(gid))) {
+          group_first.set(group_key(gid), [pos, act.type, target_id]);
         }
       }
     }
@@ -4337,82 +5950,171 @@ export class RedlineEngine {
    * sibling pointers — fast-xml's nextSibling is an indexOf scan, which would
    * make the walk itself quadratic (see docx/cell-anchor.ts).
    */
-  private _buildRevisionIndex(ownerDoc: any, inc: number | null): RevisionIndex {
+  private _buildRevisionIndex(
+    storyRoots: [Element, string][],
+  ): RevisionIndex {
     const byTag = new Map<string, IndexedRevision[]>();
     for (const tag of ALL_REVISION_TAGS) byTag.set(tag, []);
+    const roots: RevisionIndex["roots"] = [];
 
-    const root: any = this.doc.element;
-    const nodes: any[] = [root];
-    const cursors: number[] = [0];
-    // Enclosing ins/del entries, with the stack depth each was opened at so
-    // they can be closed when the walk leaves them.
-    const openRevisions: IndexedRevision[] = [];
-    const openAtDepth: number[] = [];
+    for (const [root, part] of storyRoots) {
+      const od: any = (root as any).ownerDocument;
+      roots.push({
+        el: root,
+        doc: od,
+        inc: typeof od?._inc === "number" ? od._inc : null,
+      });
 
-    while (nodes.length) {
-      const top = nodes.length - 1;
-      const children = nodes[top].childNodes;
-      if (!children || cursors[top] >= children.length) {
-        nodes.pop();
-        cursors.pop();
-        while (
-          openAtDepth.length &&
-          openAtDepth[openAtDepth.length - 1] > nodes.length
-        ) {
-          openAtDepth.pop();
-          openRevisions.pop();
+      const nodes: any[] = [root];
+      const cursors: number[] = [0];
+      // Enclosing ins/del entries, with the stack depth each was opened at so
+      // they can be closed when the walk leaves them.
+      const openRevisions: IndexedRevision[] = [];
+      const openAtDepth: number[] = [];
+
+      while (nodes.length) {
+        const top = nodes.length - 1;
+        const children = nodes[top].childNodes;
+        if (!children || cursors[top] >= children.length) {
+          nodes.pop();
+          cursors.pop();
+          while (
+            openAtDepth.length &&
+            openAtDepth[openAtDepth.length - 1] > nodes.length
+          ) {
+            openAtDepth.pop();
+            openRevisions.pop();
+          }
+          continue;
         }
-        continue;
-      }
-      const child = children[cursors[top]++];
-      if (child.nodeType !== 1) continue;
+        const child = children[cursors[top]++];
+        if (child.nodeType !== 1) continue;
 
-      const bucket = byTag.get(child.tagName);
-      let entry: IndexedRevision | null = null;
-      if (bucket) {
-        entry = { el: child, id: child.getAttribute("w:id"), nested: [] };
-        bucket.push(entry);
-      }
-      const isRevisionNode =
-        child.tagName === "w:ins" || child.tagName === "w:del";
-      if (entry && isRevisionNode) {
-        for (const ancestor of openRevisions) ancestor.nested.push(entry);
-      }
+        const bucket = byTag.get(child.tagName);
+        let entry: IndexedRevision | null = null;
+        if (bucket) {
+          entry = {
+            el: child,
+            id: child.getAttribute("w:id"),
+            part,
+            nested: [],
+          };
+          bucket.push(entry);
+        }
+        const isRevisionNode =
+          child.tagName === "w:ins" || child.tagName === "w:del";
+        if (entry && isRevisionNode) {
+          for (const ancestor of openRevisions) ancestor.nested.push(entry);
+        }
 
-      nodes.push(child);
-      cursors.push(0);
-      if (entry && isRevisionNode) {
-        openRevisions.push(entry);
-        openAtDepth.push(nodes.length);
+        nodes.push(child);
+        cursors.push(0);
+        if (entry && isRevisionNode) {
+          openRevisions.push(entry);
+          openAtDepth.push(nodes.length);
+        }
       }
     }
-    return { doc: ownerDoc, inc, byTag };
+    return { roots, byTag };
   }
 
-  /** Cached revision index, rebuilt when the document changed (or was
-   *  swapped out by a rollback) since the last build. */
+  /** Cached revision index, rebuilt when any story part changed (or was
+   *  swapped out by a rollback), or the set of story parts itself changed,
+   *  since the last build. */
   private _getRevisionIndex(): RevisionIndex {
-    const ownerDoc: any = (this.doc.element as any).ownerDocument;
-    const inc: number | null =
-      typeof ownerDoc?._inc === "number" ? ownerDoc._inc : null;
+    const storyRoots = this._story_roots();
     const cached = this._revisionIndex;
-    if (cached && cached.doc === ownerDoc && inc !== null && cached.inc === inc) {
-      return cached;
-    }
-    // inc === null (a DOM without a mutation counter) intentionally rebuilds
-    // every time rather than risking a stale index.
-    const built = this._buildRevisionIndex(ownerDoc, inc);
+    const cacheValid =
+      cached !== null &&
+      cached.roots.length === storyRoots.length &&
+      cached.roots.every((r, i) => {
+        const el = storyRoots[i][0];
+        const od: any = (el as any).ownerDocument;
+        // inc === null (a DOM without a mutation counter) intentionally
+        // rebuilds every time rather than risking a stale index.
+        return (
+          r.el === el &&
+          r.doc === od &&
+          r.inc !== null &&
+          typeof od?._inc === "number" &&
+          r.inc === od._inc
+        );
+      });
+    if (cacheValid) return cached!;
+    const built = this._buildRevisionIndex(storyRoots);
     this._revisionIndex = built;
     return built;
   }
 
-  /** Revision elements of `tag` in document order, id already read. */
+  /** Revision elements of `tag` across every story part, per-part document
+   *  order, id already read. */
   private _revisionsByTag(tag: string): IndexedRevision[] {
     return this._getRevisionIndex().byTag.get(tag) ?? [];
   }
 
-  /** Distinct tracked-change ids (w:id on w:ins/w:del/w:pPrChange) in the
-   *  main story. */
+  /** As _revisionsByTag, filtered to one OPC part (normalized path). A null
+   *  part means no filter. */
+  private _revisionsByTagIn(
+    tag: string,
+    part: string | null,
+  ): IndexedRevision[] {
+    const all = this._revisionsByTag(tag);
+    if (part === null) return all;
+    return all.filter((n) => n.part === part);
+  }
+
+  /**
+   * Distinct normalized part paths holding a revision element (w:ins/w:del or
+   * a format-change record) with `target_id`, in story-root order. More than
+   * one entry means the bare id is ambiguous (issue #114): ids are numbered
+   * per part.
+   */
+  private _parts_holding_id(target_id: string): string[] {
+    const parts: string[] = [];
+    for (const tag of ALL_REVISION_TAGS) {
+      for (const n of this._revisionsByTag(tag)) {
+        if (n.id === target_id && !parts.includes(n.part)) parts.push(n.part);
+      }
+    }
+    return parts;
+  }
+
+  /**
+   * Resolves an accept/reject action's optional `part` selector to a
+   * normalized story-part path, or an error string when it names no part a
+   * targeted action can address. `part: null` = no restriction (bare id).
+   */
+  private _action_part_filter(action: any): {
+    part: string | null;
+    error?: string;
+  } {
+    const raw = (action as any).part;
+    if (raw === undefined || raw === null || raw === "") {
+      return { part: null };
+    }
+    const story_parts = this._story_roots().map(([, name]) => name);
+    if (typeof raw !== "string") {
+      return {
+        part: null,
+        error:
+          `\`part\` must be a string naming a package part ` +
+          `(one of: ${story_parts.join(", ")}).`,
+      };
+    }
+    const wanted = normalize_part_name(raw);
+    if (!story_parts.includes(wanted)) {
+      return {
+        part: null,
+        error:
+          `part '${raw}' is not a package part that can carry tracked ` +
+          `changes. Parts addressable by accept/reject: ${story_parts.join(", ")}.`,
+      };
+    }
+    return { part: wanted };
+  }
+
+  /** Distinct tracked-change ids (w:id on w:ins/w:del/w:pPrChange) across
+   *  every story part. */
   private _existing_change_ids(): string[] {
     const ids = new Set<string>();
     for (const tag of ALL_REVISION_TAGS) {
@@ -4425,6 +6127,151 @@ export class RedlineEngine {
       const nb = /^\d+$/.test(b) ? parseInt(b, 10) : 0;
       return na - nb || a.localeCompare(b);
     });
+  }
+
+  /**
+   * Batch-level advisory for the "stranded comment anchor" shape (demo run
+   * 2026-08-12, defect B).
+   *
+   * Editing around a foreign comment — deleting the words before its anchor
+   * and the words after it, while keeping the anchored phrase so the comment
+   * survives — is a legitimate move, and each of those deletions is legal on
+   * its own. Nothing cross-checked them against each other, so a batch could
+   * leave "...shall not be disclosed Attorney's Eyes Only ;" behind and report
+   * two cleanly applied edits. The caller never learned the sentence it wrote
+   * is gibberish once accepted.
+   *
+   * So: warn, never reject. The condition is deliberately narrow, because a
+   * false positive here trains the caller to ignore the warning:
+   *   - the anchored text must SURVIVE (text deleted along with its comment
+   *     is the normal case and is already reported elsewhere),
+   *   - there must be deleted text on BOTH sides of it in its own paragraph,
+   *   - and at least one of those deletions must come from THIS batch, so a
+   *     condition the caller inherited is not re-reported on every batch.
+   *
+   * `watermark` is the engine's revision-id counter as it stood before the
+   * batch: every id above it was minted by this batch (ids are monotonic, and
+   * a rejected batch restores the counter along with the DOM).
+   */
+  private _warn_stranded_comment_anchors(watermark: number): void {
+    let starts: Element[];
+    try {
+      starts = findAllDescendants(this.doc.element, "w:commentRangeStart");
+    } catch {
+      return;
+    }
+    if (starts.length === 0) return;
+
+    // Document-order index of every element in a paragraph, so "before the
+    // anchor" and "after the anchor" are decidable for nested runs too.
+    const order = (p: Element): Map<Element, number> => {
+      const seq = new Map<Element, number>();
+      let i = 0;
+      const walk = (node: Element) => {
+        seq.set(node, i++);
+        for (let c = node.firstChild; c; c = c.nextSibling) {
+          if (c.nodeType === 1) walk(c as Element);
+        }
+      };
+      walk(p);
+      return seq;
+    };
+
+    const paragraphOf = (el: Element): Element | null => {
+      let n: any = el.parentNode;
+      while (n && n.nodeType === 1) {
+        if (n.tagName === "w:p") return n as Element;
+        n = n.parentNode;
+      }
+      return null;
+    };
+
+    const hasDeletedAncestorWithin = (el: Element, root: Element): boolean => {
+      let n: any = el.parentNode;
+      while (n && n.nodeType === 1 && n !== root) {
+        if (n.tagName === "w:del") return true;
+        n = n.parentNode;
+      }
+      return false;
+    };
+
+    let authors: Record<string, string> | null = null;
+    const stranded: Array<[string, string]> = [];
+
+    for (const start of starts) {
+      const cid = start.getAttribute("w:id");
+      if (!cid) continue;
+      const para = paragraphOf(start);
+      if (!para) continue;
+
+      // A range that closes in a LATER paragraph is a block-level annotation,
+      // not the single-sentence shape this advisory is about.
+      const end = findAllDescendants(para, "w:commentRangeEnd").find(
+        (e) => e.getAttribute("w:id") === cid,
+      );
+      if (!end) continue;
+
+      const seq = order(para);
+      const startPos = seq.get(start);
+      const endPos = seq.get(end);
+      if (startPos === undefined || endPos === undefined || endPos < startPos) {
+        continue;
+      }
+
+      // Text inside the range that is NOT itself deleted: what a reader is
+      // left with after accepting everything.
+      let surviving = "";
+      for (const t of findAllDescendants(para, "w:t")) {
+        const pos = seq.get(t);
+        if (pos === undefined || pos < startPos || pos > endPos) continue;
+        if (hasDeletedAncestorWithin(t, para)) continue;
+        surviving += t.textContent || "";
+      }
+      if (!surviving.trim()) continue;
+
+      let deletedBefore = false;
+      let deletedAfter = false;
+      let ownedByThisBatch = false;
+      for (const del of findAllDescendants(para, "w:del")) {
+        const pos = seq.get(del);
+        if (pos === undefined) continue;
+        const side = pos < startPos ? "before" : pos > endPos ? "after" : null;
+        if (!side) continue;
+        const hasText = findAllDescendants(del, "w:delText").some((d) =>
+          (d.textContent || "").trim(),
+        );
+        if (!hasText) continue;
+        if (side === "before") deletedBefore = true;
+        else deletedAfter = true;
+        const rid = del.getAttribute("w:id") || "";
+        if (/^\d+$/.test(rid) && parseInt(rid, 10) > watermark) {
+          ownedByThisBatch = true;
+        }
+      }
+
+      if (deletedBefore && deletedAfter && ownedByThisBatch) {
+        if (authors === null) authors = this._comment_authors();
+        stranded.push([cid, surviving.trim()]);
+      }
+    }
+
+    for (const [cid, text] of stranded) {
+      const who = authors?.[cid];
+      const label = who ? `comment Com:${cid} (by ${who})` : `comment Com:${cid}`;
+      this.skipped_details.push(
+        `- Warning: this batch deleted text on both sides of ${label} but left its ` +
+          `anchored text "${truncate_middle(text, 60)}" in place, so once the changes are ` +
+          `accepted that text stands alone in its sentence. If you kept it to preserve the ` +
+          `comment's anchor, re-read the sentence; if you meant to remove the clause, extend ` +
+          `one edit over the anchored text too. The edits themselves were applied.`,
+      );
+    }
+  }
+
+  /** Public, read-only view of the document's tracked-change ids — the ledger
+   *  (A1) filters against it so a stale bubble id never reaches the agent. */
+  public existing_change_ids(): string[] {
+    return this._existing_change_ids();
   }
 
   /** Comment ids present in the document, sorted for display. */
@@ -4440,6 +6287,44 @@ export class RedlineEngine {
       const nb = /^\d+$/.test(b) ? parseInt(b, 10) : 0;
       return na - nb || a.localeCompare(b);
     });
+  }
+
+  /**
+   * comment id -> author, for attributing a removal to a human. Callers that
+   * also need the id SET derive it from `Object.keys` rather than calling
+   * `_existing_comment_ids` as well: each call re-parses the comments part.
+   */
+  private _comment_authors(): Record<string, string> {
+    const out: Record<string, string> = {};
+    try {
+      for (const [cid, data] of Object.entries(extract_comments_data(this.doc.pkg))) {
+        out[cid] = (data as any)?.author || "Unknown";
+      }
+    } catch {
+      /* a package without comments has no authors to report */
+    }
+    return out;
+  }
+
+  /**
+   * Renders removed comments WITH their authors: an anonymous "removed comment
+   * Com:1" reads like the engine's own bookkeeping, which is exactly how the
+   * reported run rationalised destroying the reviewer's comment as success (B2).
+   * "comment Com:1 (by Sarah Chen)" cannot be misread.
+   */
+  private static _describe_removed_comments(
+    removed: string[],
+    authors: Record<string, string>,
+  ): string {
+    const ids = [...removed].sort((a, b) => {
+      const na = /^\d+$/.test(a) ? parseInt(a, 10) : 0;
+      const nb = /^\d+$/.test(b) ? parseInt(b, 10) : 0;
+      return na - nb || a.localeCompare(b);
+    });
+    const rendered = ids
+      .map((cid) => (authors[cid] ? `Com:${cid} (by ${authors[cid]})` : `Com:${cid}`))
+      .join(", ");
+    return `${ids.length === 1 ? "comment" : "comments"} ${rendered}`;
   }
 
   private static _format_id_list(ids: string[], prefix: string, limit = 20): string {
@@ -4472,8 +6357,8 @@ export class RedlineEngine {
     // Bare numeric id, regardless of which prefix (or none) the caller used.
     const bare = raw_id.replace(/^(Chg:|Com:)/, "");
     const find_hint =
-      "Call `read_docx` on the document again to list the current change (Chg:) " +
-      "and comment (Com:) ids — ids shift between document states.";
+      this.id_discovery_hint ||
+      "Call `read_docx` with `mode='changes'` on the document again to list the current change (Chg:) and comment (Com:) ids — ids shift between document states.";
 
     if (type === "reply") {
       const echo = has_prefix ? raw_id : `Com:${bare}`;
@@ -4509,11 +6394,65 @@ export class RedlineEngine {
     );
   }
 
-  public apply_review_actions(actions: any[]): [number, number, number] {
+  /** Not-found variant for an action that named an explicit `part` (issue
+   *  #114): says where the id DOES live instead of denying it exists. */
+  private _not_found_in_part_error(
+    raw_id: string,
+    type: string,
+    part: string,
+    lead = "- Failed to apply action:",
+  ): string {
+    const bare = raw_id.replace(/^(Chg:|Com:)/, "");
+    const echo = raw_id.startsWith("Chg:") ? raw_id : `Chg:${bare}`;
+    const elsewhere = this._parts_holding_id(bare);
+    const where =
+      elsewhere.length > 0
+        ? `Revisions with that id exist in: ${elsewhere.join(", ")}. `
+        : "";
+    const find_hint =
+      this.id_discovery_hint ||
+      "Call `read_docx` with `mode='changes'` on the document again to list the current change (Chg:) and comment (Com:) ids — ids shift between document states.";
+    return (
+      `${lead} ${type} on ${echo} — no tracked change with w:id=${bare} exists ` +
+      `in part '${part}'. ${where}${find_hint}`
+    );
+  }
+
+  /**
+   * Refusal for a bare id matching revisions in several OPC parts (issue
+   * #114). Mirrors the same-id-different-authors guard's principle: when an
+   * id cannot name one change, refuse rather than guess — but unlike that
+   * terminal case, this one is actionable, so the message says exactly how.
+   */
+  private _ambiguous_part_error(
+    raw_id: string,
+    type: string,
+    parts: string[],
+    lead: string,
+  ): string {
+    const bare = raw_id.replace(/^Chg:/, "");
+    return (
+      `${lead} ${type} on Chg:${bare} is ambiguous: revisions with ` +
+      `w:id=${bare} exist in ${parts.length} document parts (${parts.join(", ")}). ` +
+      `Revision ids are numbered per part, so the bare id cannot name one change. ` +
+      `Re-issue the action with \`part\` set to the part whose change you mean, ` +
+      `e.g. {"type": "${type}", "target_id": "${bare}", "part": "${parts[0]}"}.`
+    );
+  }
+
+  /** `indices` as in validate_review_actions: caller-index space for the prose. */
+  public apply_review_actions(
+    actions: any[],
+    indices?: number[],
+  ): [number, number, number] {
+    const gidx = (pos: number) => (indices ? indices[pos] : pos);
     let applied = 0;
     let skipped = 0;
     let already_resolved = 0;
-    const resolved_history = new Map<string, string>(); // id -> resolving action type
+    // id -> how and WHERE it was resolved: ids are per-part (issue #114), so
+    // a follow-up naming an explicit different part is a fresh lookup, not a
+    // duplicate of this entry.
+    const resolved_history = new Map<string, { type: string; part: string }>();
 
     // Sort actions internally: non-destructive metadata operations (ReplyComment) first,
     // followed by destructive structural operations (AcceptChange, RejectChange).
@@ -4534,11 +6473,35 @@ export class RedlineEngine {
       const type = action.type;
       if (type === "reply") {
         const cid = action.target_id.replace("Com:", "");
-        const new_id = this.comments_manager.addComment(
-          this.author,
-          action.text,
-          cid,
-        );
+        if (!this._existing_comment_ids().includes(cid)) {
+          skipped++;
+          this.skipped_details.push(
+            this._action_not_found_error(
+              action.target_id,
+              "reply",
+              `- Action ${gidx(pos) + 1} Failed:`,
+            ),
+          );
+          continue;
+        }
+        let new_id: string;
+        try {
+          new_id = this.comments_manager.addComment(this.author, action.text, cid);
+        } catch (e) {
+          if (e instanceof CommentThreadingError) {
+            // A reply that cannot be threaded must NOT be written as a new
+            // top-level comment. The old path wrote it anyway and reported
+            // success, so the agent believed it had answered the reviewer, saw
+            // a stray comment instead, retried, and made the document worse
+            // (BUG_comment_threading_anchoring_and_typography.md B1).
+            skipped++;
+            this.skipped_details.push(
+              `- Action ${gidx(pos) + 1} Failed: reply on ${action.target_id} — ${e.message}`,
+            );
+            continue;
+          }
+          throw e;
+        }
         this._anchor_reply_comment(cid, new_id);
         applied++;
         continue;
@@ -4546,15 +6509,29 @@ export class RedlineEngine {
 
       const target_id = action.target_id.replace("Chg:", "");
 
-      const prior_type = resolved_history.get(target_id);
-      if (prior_type !== undefined) {
-        if (prior_type === type) {
+      // Issue #114: the action may carry an explicit `part` selector.
+      const { part: requested_part, error: part_error } =
+        this._action_part_filter(action);
+      if (part_error) {
+        skipped++;
+        this.skipped_details.push(
+          `- Action ${gidx(pos) + 1} Failed: ${type} on ${action.target_id} — ${part_error}`,
+        );
+        continue;
+      }
+
+      const prior = resolved_history.get(target_id);
+      if (
+        prior !== undefined &&
+        (requested_part === null || requested_part === prior.part)
+      ) {
+        if (prior.type === type) {
           // Consistent follow-up on the pair: legitimate agent workflow
           // ("accept both ids of the replacement"), but no state transition
           // happens — report it accurately (ADEU-QA-004).
           already_resolved++;
           this.skipped_details.push(
-            `- Note: Action ${pos + 1} ('${type}' on ${action.target_id}) had no additional effect — ` +
+            `- Note: Action ${gidx(pos) + 1} ('${type}' on ${action.target_id}) had no additional effect — ` +
               `the change was already resolved together with its replacement pair by an earlier ` +
               `action in this batch. Counted as already_resolved, not applied.`,
           );
@@ -4563,8 +6540,8 @@ export class RedlineEngine {
         // Contradiction. validate_action_pairing rejects this shape before
         // anything mutates; this guard covers direct callers.
         this.skipped_details.push(
-          `- Action ${pos + 1} Failed: contradictory action — '${type}' on ${action.target_id}, but ` +
-            `the change was already resolved as '${prior_type}' together with its replacement ` +
+          `- Action ${gidx(pos) + 1} Failed: contradictory action — '${type}' on ${action.target_id}, but ` +
+            `the change was already resolved as '${prior.type}' together with its replacement ` +
             `pair by an earlier action in this batch.`,
         );
         skipped++;
@@ -4572,12 +6549,37 @@ export class RedlineEngine {
       }
 
       // One document walk backs every lookup below (see _getRevisionIndex);
-      // it is rebuilt only after this batch's own mutations bump the
-      // document's counter, so consecutive non-mutating actions share it.
-      const all_ins = this._revisionsByTag("w:ins")
+      // it is rebuilt only after this batch's own mutations bump a part's
+      // counter, so consecutive non-mutating actions share it.
+      //
+      // The part a bare id acts on must be UNIQUE (issue #114): ids are
+      // numbered per part, so one w:id in two parts names two unrelated
+      // changes, and resolving whichever a body-first walk happens to find
+      // is exactly the silent mis-resolution this refuses. Same principle
+      // as the different-authors guard below — refuse over guess — but this
+      // one is actionable: the error says which parts and how to choose.
+      const parts_with_id = this._parts_holding_id(target_id);
+      let acting_part: string | null = requested_part;
+      if (acting_part === null) {
+        if (parts_with_id.length > 1) {
+          skipped++;
+          this.skipped_details.push(
+            this._ambiguous_part_error(
+              action.target_id,
+              type,
+              parts_with_id,
+              `- Action ${gidx(pos) + 1} Failed:`,
+            ),
+          );
+          continue;
+        }
+        acting_part = parts_with_id.length === 1 ? parts_with_id[0] : null;
+      }
+
+      const all_ins = this._revisionsByTagIn("w:ins", acting_part)
         .filter((n) => n.id === target_id)
         .map((n) => n.el);
-      const all_del = this._revisionsByTag("w:del")
+      const all_del = this._revisionsByTagIn("w:del", acting_part)
         .filter((n) => n.id === target_id)
         .map((n) => n.el);
       const all_nodes = [...all_ins, ...all_del];
@@ -4587,7 +6589,7 @@ export class RedlineEngine {
       // as "[Chg:N format]" — all of them actionable by id
       // (QA round 3, finding 2.2).
       const direct_ppc = PPC_TAGS.flatMap((tag) =>
-        this._revisionsByTag(tag)
+        this._revisionsByTagIn(tag, acting_part)
           .filter((n) => n.id === target_id)
           .map((n) => n.el),
       );
@@ -4595,7 +6597,22 @@ export class RedlineEngine {
       if (all_nodes.length === 0 && direct_ppc.length === 0) {
         skipped++;
         this.skipped_details.push(
-          this._action_not_found_error(action.target_id, type),
+          // Indexed lead, as the reply branch above and Python
+          // (engine.py:5246) already do: the failure envelope reads the
+          // caller's index back out of this prose, and an unnumbered skip is
+          // blamed on change #1.
+          requested_part !== null
+            ? this._not_found_in_part_error(
+                action.target_id,
+                type,
+                requested_part,
+                `- Action ${gidx(pos) + 1} Failed:`,
+              )
+            : this._action_not_found_error(
+                action.target_id,
+                type,
+                `- Action ${gidx(pos) + 1} Failed:`,
+              ),
         );
         continue;
       }
@@ -4634,7 +6651,7 @@ export class RedlineEngine {
       // left the paired insertion pending (engine divergence,
       // QA 2026-07-19 ADEU-QA-004).
       //
-      // QA 2026-07-23 F1: the group is resolved by ID, document-wide. A
+      // QA 2026-07-23 F1: the group is resolved by ID, part-wide. A
       // multi-paragraph replacement spreads ONE insert id across several
       // paragraphs (content <w:ins> elements plus tracked paragraph marks),
       // and the old node-set walk unwound only the sibling-contiguous
@@ -4660,8 +6677,13 @@ export class RedlineEngine {
       // so newly added ids can match elements ELSEWHERE in the document whose
       // own nested revisions then join the group. It is now pure in-memory
       // work over the index — the nested lists were recorded during the walk.
+      //
+      // Everything in the group stays inside acting_part: group ids are only
+      // meaningful within the part that minted them (issue #114) — the same
+      // number in another part is an unrelated change that must not resolve
+      // along with this one.
       const indexedRevisionNodes = REVISION_NODE_TAGS.flatMap((tag) =>
-        this._revisionsByTag(tag),
+        this._revisionsByTagIn(tag, acting_part),
       );
       let group_size = -1;
       while (group_size !== group_ids.size) {
@@ -4680,7 +6702,7 @@ export class RedlineEngine {
       // comment spanning the del+ins pair survives an accept (QA round 3,
       // finding 1.1).
       for (const tag of REVISION_NODE_TAGS) {
-        for (const entry of this._revisionsByTag(tag)) {
+        for (const entry of this._revisionsByTagIn(tag, acting_part)) {
           if (entry.id && group_ids.has(entry.id)) group_nodes.push(entry.el);
         }
       }
@@ -4688,10 +6710,24 @@ export class RedlineEngine {
       // (F1a / QA round 3 finding 2.2): accept strips the change record,
       // reject restores the original properties.
       const group_ppc = PPC_TAGS.flatMap((tag) =>
-        this._revisionsByTag(tag)
+        this._revisionsByTagIn(tag, acting_part)
           .filter((entry) => entry.id !== null && group_ids.has(entry.id))
           .map((entry) => entry.el),
       );
+      // The paragraph that holds the change, captured BEFORE resolving it:
+      // afterwards the change element is gone (reject unwraps or deletes it),
+      // and with it the only path back to its host (same upward walk as
+      // _column_count_at). Used to anchor an accept/reject rationale below.
+      const host_p = (() => {
+        let curr: Node | null = all_nodes[0] ?? direct_ppc[0] ?? null;
+        while (curr) {
+          if (curr.nodeType === 1 && (curr as Element).tagName === "w:p")
+            return curr as Element;
+          curr = curr.parentNode;
+        }
+        return null;
+      })();
+
       const resolved_now = new Set<string>();
       for (const node of [...group_nodes, ...group_ppc]) {
         const rid = node.getAttribute("w:id");
@@ -4699,10 +6735,13 @@ export class RedlineEngine {
       }
 
       // Accept/reject can delete a comment as a side effect when the comment's
-      // anchor falls inside the resolved change. Snapshot the comment ids first
-      // so a removal is reported explicitly instead of happening silently under
-      // "1 applied" (QA 2026-07-22 bug #1).
-      const comments_before = new Set(this._existing_comment_ids());
+      // anchor falls inside the resolved change. Snapshot the comment ids AND
+      // their authors first so a removal is reported explicitly — and
+      // attributed — instead of happening silently under "1 applied"
+      // (QA 2026-07-22 bug #1; authorship added for B2: "never silently delete
+      // a comment authored by someone other than the caller").
+      const comment_authors_before = this._comment_authors();
+      const comments_before = new Set(Object.keys(comment_authors_before));
 
       // Paragraphs whose INSERTED paragraph mark was rejected: the paragraph
       // break never existed, so each merges back into the paragraph before it
@@ -4818,7 +6857,9 @@ export class RedlineEngine {
       }
 
       for (const rid of resolved_now) {
-        resolved_history.set(rid, type);
+        // acting_part is non-null here: matches existed, and every index
+        // entry carries its part.
+        resolved_history.set(rid, { type, part: acting_part! });
       }
       applied++;
 
@@ -4826,18 +6867,45 @@ export class RedlineEngine {
         const after = new Set(this._existing_comment_ids());
         const removed = Array.from(comments_before).filter((c) => !after.has(c));
         if (removed.length > 0) {
-          const removed_list = removed
-            .sort((a, b) => {
-              const na = /^\d+$/.test(a) ? parseInt(a, 10) : 0;
-              const nb = /^\d+$/.test(b) ? parseInt(b, 10) : 0;
-              return na - nb || a.localeCompare(b);
-            })
-            .map((c) => `Com:${c}`)
-            .join(", ");
           this.skipped_details.push(
-            `- Note: ${type} on ${action.target_id} also removed comment ${removed_list} ` +
+            `- Note: ${type} on ${action.target_id} also removed ` +
+              `${RedlineEngine._describe_removed_comments(removed, comment_authors_before)} ` +
               `(including any reply thread) because its anchor was inside the resolved change. ` +
               `This note is informational — the action itself succeeded.`,
+          );
+        }
+      }
+
+      // B4 (docs/improvement_spec.md §4): Node leads here; the Python mirror is required before release.
+      // The rationale for an accept/reject is a margin comment, not a field the
+      // engine swallows. The text it is about may have just been deleted, so it
+      // lands on the nearest surviving run of the host paragraph — and on
+      // nothing at all if there is none. Both outcomes are `- Note:` lines: the
+      // resolution itself succeeded either way, and the counters keep meaning
+      // what they say (spec §10).
+      if (action.comment && String(action.comment).trim()) {
+        const pos_label = gidx(pos) + 1;
+        const anchor = host_p
+          ? ((Array.from(host_p.childNodes).find(
+              (n) => (n as Element).tagName === "w:r",
+            ) as Element | undefined) ?? null)
+          : null;
+        if (host_p && anchor) {
+          const cid = this._attach_comment(
+            host_p,
+            anchor,
+            anchor,
+            String(action.comment),
+          );
+          if (cid) {
+            this.skipped_details.push(
+              `- Note: Action ${pos_label} ('${type}' on ${action.target_id}) — rationale recorded as Com:${cid}.`,
+            );
+          }
+        } else {
+          this.skipped_details.push(
+            `- Note: Action ${pos_label} ('${type}' on ${action.target_id}) — the rationale could not be anchored ` +
+              `(the resolved text left no surviving run); the ${type} itself succeeded.`,
           );
         }
       }
@@ -4920,6 +6988,52 @@ export class RedlineEngine {
       if (edit.position === "above") tr.parentNode?.insertBefore(new_tr, tr);
       else insertAfter(new_tr, tr);
       return true;
+    }
+    return false;
+  }
+
+  /**
+   * True when [start_idx, start_idx + match_len) covers exactly one whole
+   * paragraph's projected span.
+   *
+   * A markdown block marker only means "block" when the edit governs the whole
+   * block. Gating the restyle on this is what stops a mid-paragraph fragment
+   * from restyling its host: modify("Gamma", "- Delta") against "Alpha Gamma"
+   * used to bullet the entire paragraph AND corrupt the deletion — the anchor
+   * resolution split the run without rebuilding the map, so the <w:del> came
+   * out empty and "Gamma" survived, projecting "* Alpha DeltaGamma". Mirrors
+   * the Python engine's bounds test in _maybe_paragraph_replace.
+   */
+  private _match_spans_whole_paragraph(
+    active_mapper: any,
+    start_idx: number,
+    match_len: number,
+  ): boolean {
+    const end_idx = start_idx + match_len;
+    // Per paragraph: [lo, hi] over every span, plus real_lo over spans backed
+    // by an actual run. They differ when the projection prepends a virtual
+    // marker — a Heading 1 paragraph "2. Confidentiality" projects as
+    // "# 2. Confidentiality", so an edit targeting the bare heading text
+    // starts at real_lo, not lo. That is still a whole-paragraph edit, so
+    // either start is admissible (repro_heading_bug TC-4).
+    const bounds = new Map<any, [number, number, number]>();
+    for (const s of active_mapper.spans as any[]) {
+      if (s.paragraph === null || s.paragraph === undefined) continue;
+      // Skip the inter-paragraph "\n\n" virtual separator.
+      if (s.run === null && s.text === "\n\n") continue;
+      const cur = bounds.get(s.paragraph);
+      const real_lo = s.run !== null && s.run !== undefined ? s.start : Infinity;
+      if (cur === undefined) {
+        bounds.set(s.paragraph, [s.start, s.end, real_lo]);
+      } else {
+        if (s.start < cur[0]) cur[0] = s.start;
+        if (s.end > cur[1]) cur[1] = s.end;
+        if (real_lo < cur[2]) cur[2] = real_lo;
+      }
+    }
+    for (const [lo, hi, real_lo] of bounds.values()) {
+      if (hi !== end_idx) continue;
+      if (lo === start_idx || real_lo === start_idx) return true;
     }
     return false;
   }
@@ -5068,6 +7182,20 @@ export class RedlineEngine {
         );
       }
 
+      // The matcher forgave a typographic mismatch to find this occurrence (an
+      // LLM writes "parties' Master", the document reads "parties’ Master"), so
+      // the writer must forgive the same one: otherwise the caller's straight
+      // quotes are written back verbatim and every untargeted curly character
+      // becomes a real tracked change on a provision nobody touched (B4,
+      // BUG_comment_threading_anchoring_and_typography.md). Keyed on the MATCH
+      // being typography-forgiving — a caller who quotes the document's own
+      // characters and asks for different ones still gets the change.
+      current_effective_new_text = restore_matched_typography(
+        actual_doc_text,
+        edit.target_text,
+        current_effective_new_text,
+      );
+
       // Stash the first occurrence's full match for the report preview, so it
       // can show the complete logical change rather than only the first
       // word-diff sub-edit (e.g. "{--two--}{++five++} (2) years" for a
@@ -5086,7 +7214,10 @@ export class RedlineEngine {
         current_effective_new_text,
       );
 
-      if (edit_target_style !== edit_new_style) {
+      if (
+        edit_target_style !== edit_new_style &&
+        this._match_spans_whole_paragraph(active_mapper, start_idx, match_len)
+      ) {
         const [actual_clean] = this._parse_markdown_style(actual_doc_text);
         const final_target = actual_clean;
         const final_new = edit_new_clean;
@@ -5399,6 +7530,56 @@ export class RedlineEngine {
     grandparent.removeChild(parent_ins);
   }
 
+  private _apply_comment_only(
+    edit: any,
+    active_mapper: any,
+    start_idx: number,
+    length: number,
+    rebuild_map: boolean,
+  ): boolean {
+    const target_runs = active_mapper.find_target_runs_by_index(
+      start_idx,
+      length,
+      rebuild_map,
+    );
+    if (target_runs.length === 0) return false;
+    if (!edit.comment) return true;
+
+    const first_el = target_runs[0]._element;
+    const last_el = target_runs[target_runs.length - 1]._element;
+
+    let start_p: Element | null = first_el;
+    while (start_p && start_p.tagName !== "w:p")
+      start_p = start_p.parentNode as Element;
+    let end_p: Element | null = last_el;
+    while (end_p && end_p.tagName !== "w:p")
+      end_p = end_p.parentNode as Element;
+    if (!start_p || !end_p) return false;
+
+    const ascend_to_paragraph_child = (el: Element, p: Element): Element => {
+      let cur: Element = el;
+      while (cur.parentNode && cur.parentNode !== p) {
+        cur = cur.parentNode as Element;
+      }
+      return cur;
+    };
+    const first_anchor = ascend_to_paragraph_child(first_el, start_p);
+    const last_anchor = ascend_to_paragraph_child(last_el, end_p);
+
+    if (start_p === end_p) {
+      this._attach_comment(start_p, first_anchor, last_anchor, edit.comment);
+    } else {
+      this._attach_comment_spanning(
+        start_p,
+        first_anchor,
+        end_p,
+        last_anchor,
+        edit.comment,
+      );
+    }
+    return true;
+  }
+
   private _apply_single_edit_indexed(
     edit: any,
     orig_new: string | null,
@@ -5557,53 +7738,7 @@ export class RedlineEngine {
     }
 
     if (op === "COMMENT_ONLY") {
-      // Resolve the runs covering [start_idx, start_idx+length) and attach a
-      // comment around them. No tracked-change is produced.
-      const target_runs = active_mapper.find_target_runs_by_index(
-        start_idx,
-        length,
-        rebuild_map,
-      );
-      if (target_runs.length === 0) return false;
-      if (!edit.comment) return true;
-
-      const first_el = target_runs[0]._element;
-      const last_el = target_runs[target_runs.length - 1]._element;
-
-      // Walk up from the first/last run to their containing <w:p>.
-      let start_p: Element | null = first_el;
-      while (start_p && start_p.tagName !== "w:p")
-        start_p = start_p.parentNode as Element;
-      let end_p: Element | null = last_el;
-      while (end_p && end_p.tagName !== "w:p")
-        end_p = end_p.parentNode as Element;
-      if (!start_p || !end_p) return false;
-
-      // first_el / last_el may live inside a <w:ins> or <w:del>. We need their
-      // top-level child-of-paragraph ancestor so the comment markers become
-      // siblings of those wrappers, not children.
-      const ascend_to_paragraph_child = (el: Element, p: Element): Element => {
-        let cur: Element = el;
-        while (cur.parentNode && cur.parentNode !== p) {
-          cur = cur.parentNode as Element;
-        }
-        return cur;
-      };
-      const first_anchor = ascend_to_paragraph_child(first_el, start_p);
-      const last_anchor = ascend_to_paragraph_child(last_el, end_p);
-
-      if (start_p === end_p) {
-        this._attach_comment(start_p, first_anchor, last_anchor, edit.comment);
-      } else {
-        this._attach_comment_spanning(
-          start_p,
-          first_anchor,
-          end_p,
-          last_anchor,
-          edit.comment,
-        );
-      }
-      return true;
+      return this._apply_comment_only(edit, active_mapper, start_idx, length, rebuild_map);
     }
     if (op === "INSERTION") {
       let final_new_text = edit.new_text || "";
@@ -5647,13 +7782,24 @@ export class RedlineEngine {
         if (!final_new_text.startsWith("\n")) {
           final_new_text = "\n\n" + final_new_text;
         }
+      } else if (edit._insert_host_el) {
+        // An empty content control names its host explicitly, because
+        // position alone can no longer reach it: once the ghost run is gone
+        // there is no run inside `w:sdtContent` to anchor to, and the nearest
+        // run by offset lives OUTSIDE the control. The insertion would then
+        // land next to the field instead of in it - a filled-looking document
+        // whose control is still empty, and whose value Word will not treat
+        // as the field's content. Same shape as the OPC part boundary: a wall
+        // that offsets cannot see, so the container is carried explicitly.
+        anchor_run = null;
+        anchor_para = null;
       } else {
         [anchor_run, anchor_para] = active_mapper.get_insertion_anchor(
           start_idx,
           rebuild_map,
         );
       }
-      if (!anchor_run && !anchor_para) return false;
+      if (!anchor_run && !anchor_para && !edit._insert_host_el) return false;
 
       // QA 2026-07-18 C2 (apply-level backstop, pinned edits bypass
       // validate_edits): refuse insertions that would write row-shaped pipe
@@ -5710,7 +7856,12 @@ export class RedlineEngine {
           } else {
             const existing_pPr = findChild(_bug233_target_para, "w:pPr");
             if (existing_pPr) {
-              new_p.appendChild(this._clone_pPr_scrubbing_headings(existing_pPr));
+              new_p.appendChild(
+                this._clone_pPr_scrubbing_headings(
+                  existing_pPr,
+                  _bug233_target_para,
+                ),
+              );
             }
           }
           let pPr = findChild(new_p, "w:pPr");
@@ -5766,9 +7917,20 @@ export class RedlineEngine {
         ins_id!,
         null,
         suppress_emphasis,
-        // Paragraph-start insertions attach BEFORE the anchor (see
-        // before_anchor below): the suffix relocation must know.
-        start_idx === 0,
+        // Insertions that attach BEFORE the anchor: the suffix relocation must
+        // know, because everything it precedes belongs in the LAST inserted
+        // paragraph. Two shapes reach here:
+        //   - start_idx === 0: get_insertion_anchor(0) resolves to the
+        //     document's FIRST run, which the insertion precedes (see
+        //     before_anchor below).
+        //   - no anchor RUN, only an anchor PARAGRAPH: nothing inside that
+        //     paragraph precedes the insertion point, so it lands at paragraph
+        //     START (the anchor_para branch below) and the paragraph's existing
+        //     content is the suffix. Keying this on start_idx === 0 alone left
+        //     the host text welded onto the first inserted line for every
+        //     paragraph but the document's first. Mirrors the Python engine,
+        //     which keys on the anchor kind (engine.py `insert_before`).
+        start_idx === 0 || (anchor_run === null && anchor_para !== null),
       );
 
       if (!result.first_node) return false;
@@ -5778,7 +7940,10 @@ export class RedlineEngine {
       // inline case needs DOM splicing here.
       const is_inline_first = result.first_node.tagName === "w:ins";
       if (is_inline_first) {
-        if (anchor_run) {
+        if (edit._insert_host_el) {
+          // The control IS the anchor: append into its emptied sdtContent.
+          edit._insert_host_el.appendChild(result.first_node);
+        } else if (anchor_run) {
           let anchor_el: Element = anchor_run._element;
           let anchor_parent = anchor_el.parentNode as Element | null;
           // A tracked-deleted anchor (run inside <w:del>) cannot host the
@@ -5911,6 +8076,28 @@ export class RedlineEngine {
         console.error(
           `Refusing edit that spans OPC part boundary (start=${start_idx}, parts=${Array.from(crossed_parts).sort().join(",")})`,
         );
+        return false;
+      }
+    }
+
+    // CC-4 (apply-level backstop, same reason as C1 above): pinned edits skip
+    // validate_edits AND the resolver, so a diff-generated batch reaches here
+    // with no gate having run. Only the gates whose answer cannot change
+    // between validate and apply are repeated — locks, binding and protection
+    // are properties of the document, not of the match, so re-deriving them
+    // here is cheap and cannot disagree.
+    if ((op === "DELETION" || op === "MODIFICATION") && length) {
+      const blocked = this._apply_gate_refusal(
+        active_mapper,
+        start_idx,
+        length,
+        edit._parent_edit_ref?.type === "set_field",
+      );
+      if (blocked) {
+        console.error(
+          `Refusing edit inside a gated content control (start=${start_idx}, reason=${blocked})`,
+        );
+        if (!edit._error_msg) edit._error_msg = blocked;
         return false;
       }
     }

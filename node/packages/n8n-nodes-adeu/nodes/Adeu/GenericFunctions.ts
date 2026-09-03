@@ -2,9 +2,28 @@
 
 import type { IExecuteFunctions, IBinaryData, JsonObject } from "n8n-workflow";
 import { NodeApiError, NodeOperationError } from "n8n-workflow";
+import { BATCH_RECOVERY_PROTOCOL, failure_envelope } from "@adeu/core";
 
 export const DOCX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+/**
+ * Where a caller of THIS package re-reads Chg:/Com: ids from. Core's default
+ * hint names the MCP tool `read_docx`, which does not exist in n8n — passing
+ * this into every RedlineEngine keeps stale-id errors actionable on the
+ * canvas. See node/packages/core/src/engine.ts:5162 for the substitution.
+ */
+export const N8N_ID_DISCOVERY_HINT =
+  "Run the Extract Markdown operation on the current document again to list the current change (Chg:) and comment (Com:) ids — ids shift between document states.";
+
+export function docOpDisplayOptions(operation: string) {
+  return {
+    show: {
+      resource: ["document"],
+      operation: [operation],
+    },
+  };
+}
 
 /**
  * Resolves a dot-notation JSON path (e.g., "body.data.changes") safely.
@@ -13,12 +32,15 @@ export function getNestedProperty(
   obj: Record<string, unknown>,
   path: string,
 ): unknown {
-  return path.split(".").reduce((acc, part) => {
-    if (acc && typeof acc === "object") {
-      return (acc as Record<string, unknown>)[part];
-    }
-    return undefined;
-  }, obj as unknown);
+  return path.split(".").reduce<unknown>((acc, part) => {
+    // Own properties only: the path is a user-supplied node parameter, so a
+    // segment like "constructor" or "__proto__" must resolve to undefined —
+    // which surfaces the actionable "No property … found" error in
+    // applyEdits.operation.ts — instead of leaking an Object.prototype member.
+    if (typeof acc !== "object" || acc === null) return undefined;
+    if (!Object.hasOwn(acc, part)) return undefined;
+    return (acc as Record<string, unknown>)[part];
+  }, obj);
 }
 
 /**
@@ -305,7 +327,12 @@ export function coerceChangeItemInPlace(item: any): void {
     if (typeof raw !== "string") {
       delete item.match_mode;
     } else {
-      const mapped = MATCH_MODE_SYNONYMS[raw.trim().toLowerCase()];
+      // Own keys only: "constructor" and "__proto__" must miss the table and be
+      // dropped, not resolve through Object.prototype.
+      const key = raw.trim().toLowerCase();
+      const mapped = Object.hasOwn(MATCH_MODE_SYNONYMS, key)
+        ? MATCH_MODE_SYNONYMS[key]
+        : undefined;
       if (mapped === undefined) delete item.match_mode;
       else item.match_mode = mapped;
     }
@@ -441,15 +468,57 @@ export function mapAdeuErrorToNodeApiError(
         joined;
     }
 
+    // 0-based blame + the two-call recovery the engine teaches. `failed` is
+    // populated by BatchValidationError itself (core engine.ts:240-245), so
+    // the index reported is the caller's own position in `changes`.
+    const failed =
+      (error as unknown as { failed?: [number, string][] }).failed ?? [];
+    const envelope = failure_envelope(
+      "batch_validation_failed",
+      failed,
+      joined,
+      errors,
+    );
+    const blame = envelope.failed.length
+      ? "\n\nFailed changes (0-based index into the submitted array):\n" +
+        envelope.failed
+          .map((f) => `  [${f.index}] ${f.reason}`)
+          .join("\n")
+      : "";
+
     return new NodeApiError(
       this.getNode(),
-      { message: joined, errors } as JsonObject,
+      envelope as unknown as JsonObject,
       {
         message: messageContext,
-        description: descriptionContext,
+        description: `${descriptionContext}${blame}\n\n${BATCH_RECOVERY_PROTOCOL}`,
         itemIndex, // Applied to pass node-operation-error-itemindex rule
       },
     );
+  }
+
+  if (errorName === "TextRevisionVerificationError") {
+    return new NodeApiError(this.getNode(), { message } as JsonObject, {
+      message:
+        "The revised text could not be realized in the document, so nothing was applied.",
+      description:
+        `${message}\n\n` +
+        "No file is written by this node — ignore the paths named above; the input document is returned unchanged and no binary is produced. " +
+        "Structure such as headings, table rows, and footnotes cannot be removed by text replacement. " +
+        "Re-read the document with the Extract Markdown operation (Clean View on, Page 0), edit that exact text, and resend it in 'Revised Text'.",
+      itemIndex,
+    });
+  }
+
+  if (errorName === "TextRevisionError") {
+    return new NodeApiError(this.getNode(), { message } as JsonObject, {
+      message: "The revised text was refused before anything was applied.",
+      description:
+        `${message}\n\n` +
+        "Send the COMPLETE clean text of the document in 'Revised Text' — read it with the Extract Markdown operation using Clean View on and Page 0 — with no CriticMarkup tags. " +
+        "If the revision is genuinely meant to delete most of the document, switch 'Allow Major Deletions' on.",
+      itemIndex,
+    });
   }
 
   if (

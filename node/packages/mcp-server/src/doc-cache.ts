@@ -1,28 +1,5 @@
 // FILE: node/packages/mcp-server/src/doc-cache.ts
-/**
- * Server-layer projection cache (docs/PERFORMANCE.md §5.1).
- *
- * read_docx used to re-run the whole pipeline (unzip → parse every XML part →
- * project → paginate) on EVERY call — a page turn on a 45 MB document.xml
- * cost ~16 s of work identical to the previous call's. This cache keeps the
- * finished PRODUCTS of one ingest (projected text, pagination, outline
- * nodes) keyed by (resolved path, mtime, size), so any later read of the
- * same document VERSION is string slicing.
- *
- * Deliberate properties:
- * - The parsed DOM is never cached (gigabytes); only its products (a few MB).
- * - Freshness is stat-checked on every call: any rewrite changes mtime/size,
- *   so a new document version can never be served stale. (Accepted edge: a
- *   rewrite that preserves BOTH mtime and size — e.g. some sync tools —
- *   is indistinguishable without hashing the file on every page turn.)
- * - Responses must be byte-identical cached vs uncached — this module only
- *   precomputes what response-builders would compute from the same text.
- * - Clean-view text is filled in the BACKGROUND after the first response is
- *   sent (single-flight), so the first read pays only for what it returns,
- *   and a later clean_view request finds the text already warm.
- * - Cache lives in the MCP server layer only; @adeu/core stays stateless
- *   (cross-engine parity: the Python server can mirror this 1:1).
- */
+/** Server-layer projection cache keyed by path, mtime, and size. */
 
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
@@ -33,9 +10,9 @@ import {
   extract_outline,
   OutlineNode,
   paginate,
-  split_structural_appendix,
 } from "@adeu/core";
 import type { ProjectionBundle } from "./response-builders.js";
+import { split_projection } from "./shared.js";
 
 export type ProgressFn = (
   message: string,
@@ -64,6 +41,8 @@ export interface DocCacheEntry {
   clean_text: string | null;
   /** Lazily derived on the first clean_view paginated/search read. */
   clean_bundle: ProjectionBundle | null;
+  /** Clean-view heading map; lazily derived (see ensureCleanOutline). */
+  clean_outline_nodes: OutlineNode[] | null;
   /** In-flight background clean fill; ensureCleanText awaits it. */
   clean_fill: Promise<void> | null;
   /** Set by ensureCleanText: skip the quiet-period wait and fill NOW. */
@@ -71,7 +50,7 @@ export interface DocCacheEntry {
 }
 
 function makeBundle(text: string): ProjectionBundle {
-  const [body, appendix] = split_structural_appendix(text);
+  const [body, appendix] = split_projection(text);
   return { body, appendix, pagination: paginate(body, "") };
 }
 
@@ -209,6 +188,13 @@ export class DocCache {
    * Put a DOM back in the slot after an operation that provably left it
    * equal to the on-disk file (a rolled-back failed batch — restored via
    * the engine's transactional snapshot).
+   *
+   * "Provably" is the caller's obligation, and it is not satisfied by the
+   * operation merely having thrown: the engine reports whether its rollback
+   * verified (RedlineEngine.rollback_verified), and only that answer makes a
+   * post-failure DOM safe to re-pin. Pinning an unverified one publishes a
+   * half-applied document under the UNCHANGED file's cache key, where the
+   * next call picks it up as if it had come from disk.
    */
   public restoreHotDoc(file_path: string, doc: DocumentObject): void {
     try {
@@ -424,6 +410,7 @@ export class DocCache {
       outline_nodes,
       clean_text: null,
       clean_bundle: null,
+      clean_outline_nodes: null,
       clean_fill: null,
     };
     this.store(entry);
@@ -571,6 +558,41 @@ export class DocCache {
       );
     }
     return entry.clean_bundle;
+  }
+
+  /**
+   * Clean-view heading map. The raw outline cannot stand in for it: its page
+   * numbers and CriticMarkup-bearing heading text describe a different
+   * projection. Python fills outline nodes per VIEW (doc_cache.py:155-188), so
+   * both engines' clean-view readers get a real heading map.
+   *
+   * Costs a parse: the paragraph-offset map the extractor needs references
+   * live elements from ITS OWN parse, so it can never be derived from the
+   * cached clean string. Cached on the entry, so at most once per version.
+   */
+  public async ensureCleanOutline(
+    entry: DocCacheEntry,
+    readBytes: () => Buffer,
+    loadDoc: LoadDocFn,
+  ): Promise<OutlineNode[]> {
+    this.lastTouch = Date.now();
+    if (entry.clean_outline_nodes) return entry.clean_outline_nodes;
+    const doc = await loadDoc(readBytes());
+    const extract_res = _extractTextFromDoc(doc, true, true, true) as {
+      text: string;
+      paragraph_offsets: Map<any, [number, number]>;
+    };
+    if (entry.clean_text === null) entry.clean_text = extract_res.text;
+    if (!entry.clean_bundle) entry.clean_bundle = makeBundle(extract_res.text);
+    const bundle = entry.clean_bundle;
+    entry.clean_outline_nodes = extract_outline(
+      doc,
+      bundle.body,
+      bundle.pagination.body_pages,
+      bundle.pagination.body_page_offsets,
+      extract_res.paragraph_offsets,
+    );
+    return entry.clean_outline_nodes;
   }
 
   private store(entry: DocCacheEntry) {

@@ -57,9 +57,46 @@ vi.mock("n8n-workflow", () => {
 // Node import MUST come after vi.mock() in source order. Vitest hoists
 // vi.mock() calls to the top of the file, so this ordering is safe.
 import { Adeu } from "../nodes/Adeu/Adeu.node";
-import { extractTextFromBuffer } from "@adeu/core";
+import { DocumentObject, extractTextFromBuffer } from "@adeu/core";
 
 const GOLDEN_FIXTURE = resolve(process.env.ADEU_FIXTURES!, "golden.docx");
+const INITIAL_FIXTURE = resolve(process.env.ADEU_FIXTURES!, "initial.docx");
+
+/**
+ * A .docx whose body is two Heading 1 sections with one body paragraph each.
+ * Built from initial.docx (which has no headings, tracked changes, or
+ * comments) so outline assertions do not depend on fixture content.
+ */
+async function buildHeadingsDocx(): Promise<Buffer> {
+  const doc = await DocumentObject.load(readFileSync(INITIAL_FIXTURE));
+  const body = doc.element;
+  while (body.firstChild) body.removeChild(body.firstChild);
+  const xml = body.ownerDocument!;
+
+  const para = (text: string, style: string | null) => {
+    const p = xml.createElement("w:p");
+    if (style) {
+      const pPr = xml.createElement("w:pPr");
+      const st = xml.createElement("w:pStyle");
+      st.setAttribute("w:val", style);
+      pPr.appendChild(st);
+      p.appendChild(pPr);
+    }
+    const r = xml.createElement("w:r");
+    const t = xml.createElement("w:t");
+    t.textContent = text;
+    t.setAttribute("xml:space", "preserve");
+    r.appendChild(t);
+    p.appendChild(r);
+    return p;
+  };
+
+  body.appendChild(para("Article 1 Definitions", "Heading1"));
+  body.appendChild(para("The term 'Agreement' means this document.", null));
+  body.appendChild(para("Article 2 Term", "Heading1"));
+  body.appendChild(para("This Agreement runs for twelve months.", null));
+  return Buffer.from(await doc.save());
+}
 
 function createMockExecuteFunctions(): IExecuteFunctions {
   return {
@@ -86,6 +123,13 @@ function createMockExecuteFunctions(): IExecuteFunctions {
     },
   } as unknown as IExecuteFunctions;
 }
+function mockParams(execFns: IExecuteFunctions, params: Record<string, any>) {
+  (execFns.getNodeParameter as ReturnType<typeof vi.fn>).mockImplementation(
+    (paramName: string, _itemIndex?: number, fallback?: any) =>
+      paramName in params ? params[paramName] : fallback,
+  );
+}
+
 describe("Test Adeu n8n Node", () => {
   let node: Adeu;
   let mockExecuteFunctions: ReturnType<typeof createMockExecuteFunctions>;
@@ -108,14 +152,11 @@ describe("Test Adeu n8n Node", () => {
           typeof vi.fn
         >
       ).mockResolvedValue(goldenBuffer);
-      (
-        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
-      ).mockImplementation((paramName: string) => {
-        if (paramName === "resource") return "document";
-        if (paramName === "operation") return "extractMarkdown";
-        if (paramName === "binaryPropertyName") return "data";
-        if (paramName === "cleanView") return false;
-        return undefined;
+      mockParams(mockExecuteFunctions, {
+        resource: "document",
+        operation: "extractMarkdown",
+        binaryPropertyName: "data",
+        cleanView: false,
       });
     });
 
@@ -133,15 +174,12 @@ describe("Test Adeu n8n Node", () => {
     });
 
     it("should return paginated output with pagination metadata when Page >= 1", async () => {
-      (
-        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
-      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
-        if (paramName === "resource") return "document";
-        if (paramName === "operation") return "extractMarkdown";
-        if (paramName === "binaryPropertyName") return "data";
-        if (paramName === "cleanView") return false;
-        if (paramName === "page") return 1;
-        return fallback;
+      mockParams(mockExecuteFunctions, {
+        resource: "document",
+        operation: "extractMarkdown",
+        binaryPropertyName: "data",
+        cleanView: false,
+        page: 1,
       });
 
       const result = await node.execute.call(mockExecuteFunctions);
@@ -156,16 +194,14 @@ describe("Test Adeu n8n Node", () => {
       expect(typeof item.json.total_pages).toBe("number");
       expect((item.json.total_pages as number) >= 1).toBe(true);
     });
+
     it("should throw when Page exceeds total_pages", async () => {
-      (
-        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
-      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
-        if (paramName === "resource") return "document";
-        if (paramName === "operation") return "extractMarkdown";
-        if (paramName === "binaryPropertyName") return "data";
-        if (paramName === "cleanView") return false;
-        if (paramName === "page") return 999;
-        return fallback;
+      mockParams(mockExecuteFunctions, {
+        resource: "document",
+        operation: "extractMarkdown",
+        binaryPropertyName: "data",
+        cleanView: false,
+        page: 999,
       });
 
       await expect(node.execute.call(mockExecuteFunctions)).rejects.toThrow(
@@ -174,15 +210,12 @@ describe("Test Adeu n8n Node", () => {
     });
 
     it("should omit the structural appendix when includeAppendix is false", async () => {
-      (
-        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
-      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
-        if (paramName === "resource") return "document";
-        if (paramName === "operation") return "extractMarkdown";
-        if (paramName === "binaryPropertyName") return "data";
-        if (paramName === "cleanView") return false;
-        if (paramName === "includeAppendix") return false;
-        return fallback;
+      mockParams(mockExecuteFunctions, {
+        resource: "document",
+        operation: "extractMarkdown",
+        binaryPropertyName: "data",
+        cleanView: false,
+        includeAppendix: false,
       });
 
       const result = await node.execute.call(mockExecuteFunctions);
@@ -205,13 +238,10 @@ describe("Test Adeu n8n Node", () => {
           typeof vi.fn
         >
       ).mockResolvedValue(goldenBuffer);
-      (
-        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
-      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
-        if (paramName === "resource") return "document";
-        if (paramName === "operation") return "extractOutline";
-        if (paramName === "binaryPropertyName") return "data";
-        return fallback;
+      mockParams(mockExecuteFunctions, {
+        resource: "document",
+        operation: "extractOutline",
+        binaryPropertyName: "data",
       });
     });
 
@@ -240,6 +270,31 @@ describe("Test Adeu n8n Node", () => {
         expect(typeof node.page).toBe("number");
         expect(typeof node.has_table).toBe("boolean");
         expect(Array.isArray(node.footnote_ids)).toBe(true);
+      }
+    });
+
+    it("should return end_page on every outline node", async () => {
+      const headingsBuffer = await buildHeadingsDocx();
+      (
+        mockExecuteFunctions.helpers.getBinaryDataBuffer as ReturnType<
+          typeof vi.fn
+        >
+      ).mockResolvedValue(headingsBuffer);
+
+      const result = await node.execute.call(mockExecuteFunctions);
+      const outline = result[0][0].json.outline as Array<
+        Record<string, unknown>
+      >;
+
+      expect(outline.map((n) => n.text)).toEqual([
+        "Article 1 Definitions",
+        "Article 2 Term",
+      ]);
+      for (const entry of outline) {
+        expect(typeof entry.end_page).toBe("number");
+        expect(entry.end_page as number).toBeGreaterThanOrEqual(
+          entry.page as number,
+        );
       }
     });
   });
@@ -299,34 +354,27 @@ describe("Test Adeu n8n Node", () => {
           typeof vi.fn
         >
       ).mockResolvedValue(goldenBuffer);
-      (
-        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
-      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
-        if (paramName === "resource") return "document";
-        if (paramName === "operation") return "applyEdits";
-        if (paramName === "binaryPropertyName") return "data";
-        if (paramName === "outputBinaryPropertyName") return "data";
-        if (paramName === "author") return "n8n AI";
-        if (paramName === "editsSource") return "fromInputJson";
-        if (paramName === "editsJsonPath") return "changes";
-        return fallback;
+      mockParams(mockExecuteFunctions, {
+        resource: "document",
+        operation: "applyEdits",
+        binaryPropertyName: "data",
+        outputBinaryPropertyName: "data",
+        author: "n8n AI",
+        editsSource: "fromInputJson",
+        editsJsonPath: "changes",
       });
     });
 
     it("should echo reasoning into the output JSON when supplied", async () => {
-      (
-        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
-      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
-        if (paramName === "resource") return "document";
-        if (paramName === "operation") return "applyEdits";
-        if (paramName === "binaryPropertyName") return "data";
-        if (paramName === "outputBinaryPropertyName") return "data";
-        if (paramName === "author") return "n8n AI";
-        if (paramName === "editsSource") return "fromInputJson";
-        if (paramName === "editsJsonPath") return "changes";
-        if (paramName === "reasoning")
-          return "Standardizing governing law per playbook.";
-        return fallback;
+      mockParams(mockExecuteFunctions, {
+        resource: "document",
+        operation: "applyEdits",
+        binaryPropertyName: "data",
+        outputBinaryPropertyName: "data",
+        author: "n8n AI",
+        editsSource: "fromInputJson",
+        editsJsonPath: "changes",
+        reasoning: "Standardizing governing law per playbook.",
       });
 
       const result = await node.execute.call(mockExecuteFunctions);
@@ -346,6 +394,26 @@ describe("Test Adeu n8n Node", () => {
       // "reasoning"; the operation coerces that to "" via its fallback and
       // omits the key.
       expect(item.json).not.toHaveProperty("reasoning");
+    });
+
+    it("should point stale-id failures at Extract Markdown, not read_docx", async () => {
+      (
+        mockExecuteFunctions.getInputData as ReturnType<typeof vi.fn>
+      ).mockReturnValue([
+        {
+          json: { changes: [{ type: "accept", target_id: "Chg:999" }] },
+          binary: { data: { fileName: "contract.docx" } },
+        },
+      ]);
+
+      await expect(node.execute.call(mockExecuteFunctions)).rejects.toThrow();
+
+      const err = await node.execute
+        .call(mockExecuteFunctions)
+        .catch((e: Error & { description?: string }) => e);
+      const text = `${err.message}\n${(err as { description?: string }).description ?? ""}`;
+      expect(text).toContain("Extract Markdown");
+      expect(text).not.toContain("read_docx");
     });
 
     it("should successfully apply edits and output binary data", async () => {
@@ -435,6 +503,175 @@ describe("Test Adeu n8n Node", () => {
       const edits = stats.edits as Array<Record<string, unknown>>;
       expect(edits[0]).toHaveProperty("status", "applied");
       expect(edits[0]).toHaveProperty("match_mode", "all");
+    });
+
+    it("should name the failing change index and the recovery protocol", async () => {
+      (
+        mockExecuteFunctions.getInputData as ReturnType<typeof vi.fn>
+      ).mockReturnValue([
+        {
+          json: {
+            changes: [
+              { type: "modify", target_text: "document", new_text: "instrument" },
+              { type: "modify", target_text: "NOT_IN_DOC_ZZZ", new_text: "x" },
+            ],
+          },
+          binary: { data: { fileName: "contract.docx" } },
+        },
+      ]);
+
+      const err = await node.execute
+        .call(mockExecuteFunctions)
+        .catch((e: Error & { description?: string }) => e);
+
+      expect(err.name).toBe("NodeApiError");
+      expect(err.message).toContain("target text not found");
+      expect(err.description).toContain("[1]");
+      expect(err.description).toContain("Recover in two calls");
+    });
+
+    it("should reject the whole batch when Allow Partial Application is off", async () => {
+      (
+        mockExecuteFunctions.getInputData as ReturnType<typeof vi.fn>
+      ).mockReturnValue([
+        {
+          json: {
+            changes: [
+              { type: "modify", target_text: "document", new_text: "instrument" },
+              { type: "modify", target_text: "NOT_IN_DOC_ZZZ", new_text: "x" },
+            ],
+          },
+          binary: { data: { fileName: "contract.docx" } },
+        },
+      ]);
+
+      await expect(node.execute.call(mockExecuteFunctions)).rejects.toThrow();
+    });
+
+    it("should apply the valid change and report the failure when Allow Partial Application is on", async () => {
+      (
+        mockExecuteFunctions.getInputData as ReturnType<typeof vi.fn>
+      ).mockReturnValue([
+        {
+          json: {
+            changes: [
+              { type: "modify", target_text: "document", new_text: "instrument" },
+              { type: "modify", target_text: "NOT_IN_DOC_ZZZ", new_text: "x" },
+            ],
+          },
+          binary: { data: { fileName: "contract.docx" } },
+        },
+      ]);
+      (
+        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
+      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
+        if (paramName === "resource") return "document";
+        if (paramName === "operation") return "applyEdits";
+        if (paramName === "binaryPropertyName") return "data";
+        if (paramName === "outputBinaryPropertyName") return "data";
+        if (paramName === "author") return "n8n AI";
+        if (paramName === "editsSource") return "fromInputJson";
+        if (paramName === "editsJsonPath") return "changes";
+        if (paramName === "allowPartial") return true;
+        return fallback;
+      });
+
+      const result = await node.execute.call(mockExecuteFunctions);
+      const item = result[0][0];
+      const stats = item.json.stats as Record<string, any>;
+
+      expect(item.json).toHaveProperty("status", "partial");
+      expect(stats.edits_applied).toBe(1);
+      expect(stats.edits_skipped).toBe(1);
+      expect(stats.failed.map((f: any) => f.index)).toEqual([1]);
+      expect(item.binary?.data).toBeDefined();
+    });
+  });
+
+  describe("Operation: Apply Text Revision", () => {
+    const initialBuffer = readFileSync(INITIAL_FIXTURE);
+
+    beforeEach(() => {
+      (
+        mockExecuteFunctions.getInputData as ReturnType<typeof vi.fn>
+      ).mockReturnValue([
+        { json: {}, binary: { data: { fileName: "contract.docx" } } },
+      ]);
+      (
+        mockExecuteFunctions.helpers.getBinaryDataBuffer as ReturnType<
+          typeof vi.fn
+        >
+      ).mockResolvedValue(initialBuffer);
+      mockParams(mockExecuteFunctions, {
+        resource: "document",
+        operation: "applyTextRevision",
+        binaryPropertyName: "data",
+        outputBinaryPropertyName: "data",
+        author: "n8n AI",
+        revisedText: "This is the revised initial document",
+        allowMajorDeletions: false,
+      });
+    });
+
+    it("should redline the document from revised text and verify the result", async () => {
+      const result = await node.execute.call(mockExecuteFunctions);
+      const item = result[0][0];
+      const stats = item.json.stats as Record<string, any>;
+
+      expect(item.json).toHaveProperty("fileName", "contract_redlined.docx");
+      expect(item.json).toHaveProperty("author", "n8n AI");
+      expect(stats.verified).toBe(true);
+      expect(stats.edits_applied).toBe(1);
+      // No filesystem in n8n: path-shaped fields must not be echoed.
+      expect(stats).not.toHaveProperty("output_path");
+      expect(item.binary?.data).toBeDefined();
+    });
+
+    it("should refuse revised text containing CriticMarkup", async () => {
+      (
+        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
+      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
+        if (paramName === "resource") return "document";
+        if (paramName === "operation") return "applyTextRevision";
+        if (paramName === "binaryPropertyName") return "data";
+        if (paramName === "outputBinaryPropertyName") return "data";
+        if (paramName === "author") return "n8n AI";
+        if (paramName === "revisedText")
+          return "This is the {++revised++} initial document";
+        if (paramName === "allowMajorDeletions") return false;
+        return fallback;
+      });
+
+      const err = await node.execute
+        .call(mockExecuteFunctions)
+        .catch((e: Error & { description?: string }) => e);
+
+      expect(err.name).toBe("NodeApiError");
+      expect(`${err.message}\n${err.description}`).toContain("CriticMarkup");
+    });
+
+    it("should refuse a revision that deletes most of the document", async () => {
+      (
+        mockExecuteFunctions.getNodeParameter as ReturnType<typeof vi.fn>
+      ).mockImplementation((paramName: string, _itemIndex, fallback?) => {
+        if (paramName === "resource") return "document";
+        if (paramName === "operation") return "applyTextRevision";
+        if (paramName === "binaryPropertyName") return "data";
+        if (paramName === "outputBinaryPropertyName") return "data";
+        if (paramName === "author") return "n8n AI";
+        if (paramName === "revisedText") return "This";
+        if (paramName === "allowMajorDeletions") return false;
+        return fallback;
+      });
+
+      const err = await node.execute
+        .call(mockExecuteFunctions)
+        .catch((e: Error & { description?: string }) => e);
+
+      expect(err.name).toBe("NodeApiError");
+      expect(`${err.message}\n${err.description}`).toContain(
+        "Allow Major Deletions",
+      );
     });
   });
 
@@ -715,6 +952,15 @@ describe("Test Adeu n8n Node", () => {
       expect(item.json).toHaveProperty("diffFormat", "structuredChanges");
       expect(item.json).toHaveProperty("changes");
       expect(Array.isArray(item.json.changes)).toBe(true);
+    });
+
+    it("should state that identical documents have no textual differences", async () => {
+      const result = await node.execute.call(mockExecuteFunctions);
+      const diff = result[0][0].json.diff as string;
+
+      expect(diff).toContain("No textual differences found between the documents");
+      expect(diff).toContain("--- orig.docx");
+      expect(diff).toContain("+++ mod.docx");
     });
   });
 

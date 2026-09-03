@@ -1,61 +1,17 @@
 # FILE: src/adeu/mcp_components/_response_builders.py
-"""
-Shared response builders for read_docx mode dispatch.
-
-Lives in mcp_components (not in tools/) because both tools/document.py and
-tools/live_word.py call into it. Keeping it here avoids the circular import
-that would result if these helpers lived in document.py and live_word.py
-imported them at module load time.
-
-PARITY INVARIANT
-----------------
-Both the disk path (_read_docx_disk) and the Live Word path
-(read_active_word_document) MUST converge on these builders for outline and
-pagination output. The contract is:
-
-  Given the same DOCX content (whether read from disk or extracted via
-  WordOpenXML from a saved-state Live Word doc), build_paginated_response and
-  build_outline_response MUST return byte-identical results.
-
-This invariant is what justifies the design — there is no Live-Word-specific
-pagination or outline code. Any future feature that touches projection,
-pagination, or outline should be added to ingest/pagination/outline so both
-paths inherit the change automatically.
-
-CHANNEL CONTRACT
-----------------
-Per the MCP spec, `content` is LLM-facing markdown and `structured_content` is
-machine-facing JSON for the host UI. We do NOT mirror them; instead we ensure
-each channel is self-sufficient for its audience:
-
-  - `content`: contains the projected document text PLUS an inline pagination
-    banner (top, and bottom-of-page when has_next) so the LLM knows its
-    position in the document without consulting structured_content.
-
-  - `structured_content`: contains only fields the markdown UI widget actually
-    reads — `markdown`, `title`, `file_path`. Nothing else is consumed.
-
-APPENDIX SEPARATION
--------------------
-The Structural Appendix (defined terms, anchors, diagnostics) is NOT included
-in body pages. It is fetched on demand via mode='appendix', and body pages get
-a small one-line footer pointing the agent at the appendix mode. Rationale: on
-large legal documents the appendix can exceed 400KB, which (a) blows the
-per-page payload ceiling and (b) gets silently chunked by the MCP client.
-
-The appendix is paginated using the same paginator as the body, with the
-appendix text passed AS the body input.
-"""
+"""Shared response builders for read_docx mode dispatch across disk and Live Word paths."""
 
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, List, Tuple
 
-from adeu.outline import _offset_to_page, extract_outline
+from adeu.fields import collect_fields, read_document_protection, render_ledger
+from adeu.outline import _offset_to_page, extract_outline, heading_path_at
 from adeu.pagination import (
     PAGE_RANGE_MAX_PAGES,
     PaginationResult,
@@ -146,53 +102,29 @@ def _emphasized_snippet(region: str, spans: List[Tuple[int, int]]) -> str:
     return "".join(parts)
 
 
-# Search-response size budget. A search response is sized at ~60 tokens per
-# requested match; tokens are estimated at 4 characters each (the same crude
-# ratio the test suite measures with). SNIPPET_RADIUS_LADDER is the descending
-# set of per-hit context radii the renderer tries, widest first: 120 chars is
-# the documented clamp, the rest are fallbacks for documents whose paragraphs
-# are long enough that 20 full-width snippets would not fit the budget. The
-# ladder does NOT bottom out at 0: a `...**Supplier**...` snippet costs chrome
-# to tell the agent only what it already typed, so 16 chars each side is the
-# floor and the budget pass drops trailing entries instead.
+def _make_builder_result(llm_content: Any, ui_markdown: str, file_path: str) -> BuilderResult:
+    p = Path(file_path)
+    return BuilderResult(
+        content=llm_content,
+        structured_content={
+            "markdown": ui_markdown,
+            "title": p.name,
+            "file_path": str(p.resolve()),
+        },
+    )
+
+
 SEARCH_TOKENS_PER_MATCH = 60
 CHARS_PER_TOKEN = 4
 SNIPPET_RADIUS_LADDER = (120, 60, 30, 16)
 
-# `max_matches * 60` is an allowance for match CONTENT, but a response also
-# carries chrome that no radius can shrink. Measured on a 50-hit document at
-# max_matches=1: the `> **File Path:**` line 7 tokens, the results header 23,
-# the cross-page distribution summary 33, the continuation note 20 and the
-# trim note 15 — ~110 fixed, plus ~22 per entry for the `---` rule, the
-# `### Match N (pX)` heading, the `**Path:**` breadcrumb and the
-# `*Occurrences:*` line, and ~13 for a floor-radius snippet. So one entry
-# costs ~140 tokens no matter how hard the snippet is squeezed, and a budget
-# of `1 * 60` was unreachable at ANY radius: every rung of the ladder
-# "failed", the response shipped a context-free `...**hit**...`, and at
-# max_matches=2..3 entries the caller had explicitly asked for were dropped
-# (QA finding 1). Sizing from chrome + a minimum snippet per entry keeps
-# every requested entry payable, and leaves the max_matches=5 and 20 ceilings
-# at the content-derived 300 and 1200 they already were.
 SEARCH_FIXED_CHROME_TOKENS = 120
 SEARCH_ENTRY_CHROME_TOKENS = 22
 SEARCH_MIN_SNIPPET_TOKENS = 13
 
 
 def search_budget_tokens(max_matches: int, rendered_count: int | None = None) -> int:
-    """
-    Approximate-token ceiling for a search response that was ASKED for
-    `max_matches` hits and actually rendered `rendered_count` of them
-    (defaults to all of them). Never below the fixed chrome plus a usable
-    snippet per rendered hit, so small pages stay renderable instead of
-    degenerating to context-free hits.
-
-    The chrome term is sized on hits RENDERED, not hits requested: it exists
-    to keep every requested hit payable, so once the budget pass starts
-    dropping hits it must stop granting per-hit allowance for hits that are
-    no longer in the response. Because `rendered_count <= max_matches`, the
-    result never exceeds `search_budget_tokens(max_matches)` — the ceiling the
-    caller's `max_matches` promises.
-    """
+    """Approximate-token ceiling for a search response."""
     if max_matches < 1:
         return SEARCH_FIXED_CHROME_TOKENS
     rendered = max_matches if rendered_count is None else min(max_matches, max(rendered_count, 0))
@@ -207,34 +139,29 @@ _SNIPPET_CLOSER_OF = dict(_SNIPPET_MARKUP_PAIRS)
 _SNIPPET_OPENER_OF = {closer: opener for opener, closer in _SNIPPET_MARKUP_PAIRS}
 _SNIPPET_MARKUP_TOKEN_RE = re.compile("|".join(re.escape(t) for t in (*_SNIPPET_CLOSER_OF, *_SNIPPET_OPENER_OF)))
 
+# `{#anchor}` tokens — bookmark anchors and CC-1's `{#cc:N}` content-control
+# anchors. A snippet window or an outline truncation that lands inside one must
+# not emit the fragment (CC-1 A1.6).
+_ANCHOR_TOKEN_RE = re.compile(r"\{#[^}\n]*\}")
+
 
 def _balance_snippet_window(body: str, start: int, end: int) -> tuple[int, int]:
-    """
-    Extends a snippet window until every CriticMarkup span it overlaps is
-    whole. {>>…<<} meta bubbles are MULTI-line and a clamped window cuts spans
-    on BOTH edges, so agents could not harvest ids/pairings from search
-    results (QA round 3, finding 3.12).
-
-    Delimiters are walked IN ORDER with a depth counter per pair, never
-    counted: a window holding one stray `--}` on the left and one stray `{--`
-    on the right balances arithmetically while reading `l1--}…{--del` (QA
-    round 4, finding 1). A closer seen at depth 0 belongs to a span that
-    opened before `start`, so `start` moves back to that opener; a pair still
-    open when the scan reaches `end` pushes `end` forward to its closer. Each
-    step strictly widens the window, so the loop terminates.
-
-    The backward search for a missing opener spans the WHOLE body, not the
-    hit's own projection line: a bubble is multi-line by nature, so a hit
-    sitting after the closer on the bubble's second line has its opener on an
-    earlier line, and a line-bounded search left the stray `<<}` in the
-    snippet — the exact construct this function exists for (QA finding 2).
-    Widening past a line break is safe: the snippet renderer quotes each line
-    it spans, and the response budget drops trailing entries if the wider
-    window costs too much.
-    """
+    """Extends a snippet window until every CriticMarkup span and anchor token it overlaps is whole."""
     while True:
         depth = dict.fromkeys(_SNIPPET_CLOSER_OF, 0)
         widened = False
+
+        for tok in _ANCHOR_TOKEN_RE.finditer(body):
+            if tok.start() < start < tok.end():
+                start = tok.start()
+                widened = True
+            if tok.start() < end < tok.end():
+                end = tok.end()
+                widened = True
+            if tok.start() >= end:
+                break
+        if widened:
+            continue
 
         for tok in _SNIPPET_MARKUP_TOKEN_RE.finditer(body, start, end):
             token = tok.group(0)
@@ -348,6 +275,7 @@ def render_outline_tree(
     verbose: bool = False,
     is_cli: bool = False,
     file_path: str = "document.docx",
+    no_chrome: bool = False,
 ) -> str:
     """
     Renders a flat list of OutlineNode objects as a Markdown tree.
@@ -368,6 +296,10 @@ def render_outline_tree(
     visible = [n for n in nodes if n.level <= max_level]
 
     if not visible:
+        if no_chrome:
+            return (
+                f"# (No headings at level <= {max_level})\n\nDocument has {len(nodes)} headings, all at deeper levels."
+            )
         if is_cli:
             hint = f"Run `adeu extract {file_path} --mode outline --outline-max-level N` (up to 6) to see them."
         else:
@@ -397,7 +329,22 @@ def render_outline_tree(
     return "\n".join(lines)
 
 
-def build_full_document_response(text: str, file_path: str) -> BuilderResult:
+def _with_path_header(file_path: str, fields_banner: str | None, ui_markdown: str) -> str:
+    """The LLM-only header block: File Path, then the fields banner.
+
+    spec-projection §7 puts the banner immediately after the File Path line, so
+    the two render as one blockquote. Both are chrome and both vanish under
+    `no_chrome`, which exists so the projection can round-trip.
+    """
+    header = f"> **File Path:** `{file_path}`"
+    if fields_banner:
+        header += f"\n{fields_banner}"
+    return f"{header}\n\n{ui_markdown}"
+
+
+def build_full_document_response(
+    text: str, file_path: str, no_chrome: bool = False, fields_banner: str | None = None
+) -> BuilderResult:
     """
     Returns the ENTIRE document body in one response, with no page banner,
     continuation footer, or appendix pointer.
@@ -409,15 +356,8 @@ def build_full_document_response(text: str, file_path: str) -> BuilderResult:
     """
     body, _appendix = split_structural_appendix(text)
     ui_markdown = body
-    llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
-    return BuilderResult(
-        content=llm_content,
-        structured_content={
-            "markdown": ui_markdown,
-            "title": Path(file_path).name,
-            "file_path": str(Path(file_path).resolve()),
-        },
-    )
+    llm_content = ui_markdown if no_chrome else _with_path_header(file_path, fields_banner, ui_markdown)
+    return _make_builder_result(llm_content, ui_markdown, file_path)
 
 
 def build_paginated_response(
@@ -426,6 +366,8 @@ def build_paginated_response(
     file_path: str,
     is_cli: bool = False,
     pagination_result: "PaginationResult | None" = None,
+    no_chrome: bool = False,
+    fields_banner: str | None = None,
 ) -> BuilderResult:
     """
     Splits projected Markdown into pages and returns the requested page.
@@ -452,23 +394,21 @@ def build_paginated_response(
 
     selected = result.pages[page - 1]
 
-    # Build the original UI markdown
-    banner = build_page_banner(selected.page, selected.total_pages, file_path, is_cli=is_cli)
-    footer = build_page_footer(selected.page, selected.total_pages, selected.has_next, file_path, is_cli=is_cli)
-    appendix_pointer = build_appendix_pointer(file_path, has_appendix, is_cli=is_cli)
-    ui_markdown = banner + selected.page_content + footer + appendix_pointer
+    if no_chrome:
+        page_marker = f"[p{selected.page}/{selected.total_pages}]\n\n" if selected.total_pages > 1 else ""
+        ui_markdown = f"{page_marker}{selected.page_content}"
+        llm_content = ui_markdown
+    else:
+        # Build the original UI markdown
+        banner = build_page_banner(selected.page, selected.total_pages, file_path, is_cli=is_cli)
+        footer = build_page_footer(selected.page, selected.total_pages, selected.has_next, file_path, is_cli=is_cli)
+        appendix_pointer = build_appendix_pointer(file_path, has_appendix, is_cli=is_cli)
+        ui_markdown = banner + selected.page_content + footer + appendix_pointer
 
-    # Prepend the path ONLY for the LLM
-    llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
+        # Prepend the path ONLY for the LLM
+        llm_content = _with_path_header(file_path, fields_banner, ui_markdown)
 
-    return BuilderResult(
-        content=llm_content,
-        structured_content={
-            "markdown": ui_markdown,
-            "title": Path(file_path).name,
-            "file_path": str(Path(file_path).resolve()),
-        },
-    )
+    return _make_builder_result(llm_content, ui_markdown, file_path)
 
 
 def build_page_range_response(
@@ -478,6 +418,7 @@ def build_page_range_response(
     file_path: str,
     is_cli: bool = False,
     pagination_result: "PaginationResult | None" = None,
+    no_chrome: bool = False,
 ) -> BuilderResult:
     """
     Returns a range of synthetic pages (from `start` to `end`, 1-indexed),
@@ -504,39 +445,36 @@ def build_page_range_response(
     page_blocks: List[str] = []
     for p_num in range(start, last + 1):
         selected = result.pages[p_num - 1]
-        banner = build_page_banner(selected.page, selected.total_pages, file_path, is_cli=is_cli)
+        if no_chrome:
+            banner = f"[p{selected.page}/{selected.total_pages}]\n\n" if selected.total_pages > 1 else ""
+        else:
+            banner = build_page_banner(selected.page, selected.total_pages, file_path, is_cli=is_cli)
         page_blocks.append(f"{banner}{selected.page_content}")
 
     ui_parts = ["\n\n".join(page_blocks)]
 
-    if last < end and last < total_pages:
-        next_start = last + 1
-        if is_cli:
-            ui_parts.append(
-                f"> **Range capped at {PAGE_RANGE_MAX_PAGES} pages.** Continue with `--page {next_start}-{end}`."
-            )
-        else:
-            ui_parts.append(
-                f'> **Range capped at {PAGE_RANGE_MAX_PAGES} pages.** Continue with `page="{next_start}-{end}"`.'
-            )
-    elif end > total_pages:
-        ui_parts.append(f"> **[range stopped at page {total_pages}: the document has {total_pages} page(s)]**")
+    if not no_chrome:
+        if last < end and last < total_pages:
+            next_start = last + 1
+            if is_cli:
+                ui_parts.append(
+                    f"> **Range capped at {PAGE_RANGE_MAX_PAGES} pages.** Continue with `--page {next_start}-{end}`."
+                )
+            else:
+                ui_parts.append(
+                    f'> **Range capped at {PAGE_RANGE_MAX_PAGES} pages.** Continue with `page="{next_start}-{end}"`.'
+                )
+        elif end > total_pages:
+            ui_parts.append(f"> **[range stopped at page {total_pages}: the document has {total_pages} page(s)]**")
 
-    appendix_pointer = build_appendix_pointer(file_path, has_appendix, is_cli=is_cli)
-    if appendix_pointer:
-        ui_parts.append(appendix_pointer.strip())
+        appendix_pointer = build_appendix_pointer(file_path, has_appendix, is_cli=is_cli)
+        if appendix_pointer:
+            ui_parts.append(appendix_pointer.strip())
 
     ui_markdown = "\n\n".join(ui_parts)
-    llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
+    llm_content = ui_markdown if no_chrome else f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
 
-    return BuilderResult(
-        content=llm_content,
-        structured_content={
-            "markdown": ui_markdown,
-            "title": Path(file_path).name,
-            "file_path": str(Path(file_path).resolve()),
-        },
-    )
+    return _make_builder_result(llm_content, ui_markdown, file_path)
 
 
 def build_outline_response(
@@ -549,6 +487,7 @@ def build_outline_response(
     is_cli: bool = False,
     pagination_result: "PaginationResult | None" = None,
     outline_nodes: "list | None" = None,
+    no_chrome: bool = False,
 ) -> BuilderResult:
     """
     Returns a structural map of headings as a Markdown tree.
@@ -596,6 +535,7 @@ def build_outline_response(
         verbose=outline_verbose,
         is_cli=is_cli,
         file_path=file_path,
+        no_chrome=no_chrome,
     )
 
     visible_count = sum(1 for n in nodes if n.level <= outline_max_level)
@@ -607,26 +547,23 @@ def build_outline_response(
     else:
         read_hint = "Call `read_docx` with `mode='full'` and `page=N` to read a section."
 
-    # Build the original UI markdown
-    header = (
-        f"> **Outline view** — showing {visible_count} of {len(nodes)} headings "
-        f"(L1-L{outline_max_level}{deeper_hint}) across "
-        f"{pagination_result.total_pages} page(s). "
-        f"{read_hint}\n\n"
-        f"---\n\n"
-    )
-    ui_markdown = header + rendered
-    # Prepend the path ONLY for the LLM
-    llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
+    if no_chrome:
+        ui_markdown = rendered
+        llm_content = ui_markdown
+    else:
+        # Build the original UI markdown
+        header = (
+            f"> **Outline view** — showing {visible_count} of {len(nodes)} headings "
+            f"(L1-L{outline_max_level}{deeper_hint}) across "
+            f"{pagination_result.total_pages} page(s). "
+            f"{read_hint}\n\n"
+            f"---\n\n"
+        )
+        ui_markdown = header + rendered
+        # Prepend the path ONLY for the LLM
+        llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
 
-    return BuilderResult(
-        content=llm_content,
-        structured_content={
-            "markdown": ui_markdown,
-            "title": Path(file_path).name,
-            "file_path": str(Path(file_path).resolve()),
-        },
-    )
+    return _make_builder_result(llm_content, ui_markdown, file_path)
 
 
 def build_budget_guard_message(
@@ -703,6 +640,7 @@ def build_search_response(
     max_matches: int = 20,
     match_offset: int = 0,
     full_paragraph: bool = False,
+    no_chrome: bool = False,
 ) -> BuilderResult:
     """
     Filters projected Markdown to exact substring or regex matches.
@@ -831,14 +769,18 @@ def build_search_response(
                 "Verify your search spelling, or try setting `search_case_sensitive` to false "
                 "or enabling `search_regex` if you used pattern wildcards."
             )
-        ui_markdown = (
-            f"> **Search Results** — No matches found for query `{search_query}` in `{Path(file_path).name}`.\n\n"
-            + retry_hint
-        )
+        if no_chrome:
+            ui_markdown = f"No matches found for query `{search_query}`."
+        else:
+            ui_markdown = (
+                f"> **Search Results** — No matches found for query `{search_query}` in `{Path(file_path).name}`.\n\n"
+                + retry_hint
+            )
         if regex_downgraded_note:
             ui_markdown = f"{regex_downgraded_note}\n\n{ui_markdown}"
+        llm_content = ui_markdown if no_chrome else f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
         return BuilderResult(
-            content=f"> **File Path:** `{file_path}`\n\n{ui_markdown}",
+            content=llm_content,
             structured_content={
                 "markdown": ui_markdown,
                 "title": f"Search: {Path(file_path).name}",
@@ -870,16 +812,23 @@ def build_search_response(
         # `page=N` valid but has no hits, query exists elsewhere.
         if not filtered:
             other_pages_str = ", ".join(str(p) for p in pages_with_hits)
-            ui_markdown = (
-                f"> **Search Results** — No matches on document page {page_filter} "
-                f"for query `{search_query}` in `{Path(file_path).name}`.\n\n"
-                f"The query DOES appear elsewhere ({total_matches} match"
-                f"{'es' if total_matches != 1 else ''} on page"
-                f"{'s' if len(pages_with_hits) != 1 else ''} {other_pages_str}). "
-                f"Omit `page` or pass `page='all'` to see them."
-            )
+            if no_chrome:
+                ui_markdown = (
+                    f"No matches on document page {page_filter} for query `{search_query}`. "
+                    f"Query appears on page(s) {other_pages_str}."
+                )
+            else:
+                ui_markdown = (
+                    f"> **Search Results** — No matches on document page {page_filter} "
+                    f"for query `{search_query}` in `{Path(file_path).name}`.\n\n"
+                    f"The query DOES appear elsewhere ({total_matches} match"
+                    f"{'es' if total_matches != 1 else ''} on page"
+                    f"{'s' if len(pages_with_hits) != 1 else ''} {other_pages_str}). "
+                    f"Omit `page` or pass `page='all'` to see them."
+                )
+            llm_content = ui_markdown if no_chrome else f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
             return BuilderResult(
-                content=f"> **File Path:** `{file_path}`\n\n{ui_markdown}",
+                content=llm_content,
                 structured_content={
                     "markdown": ui_markdown,
                     "title": f"Search: {Path(file_path).name}",
@@ -899,25 +848,27 @@ def build_search_response(
         knows the query itself matched.
         """
         ui_parts: list[str] = []
-        if page_filter is None:
-            ui_parts.append(
-                f"> **Search Results** — Found {total_matches} match"
-                f"{'es' if total_matches != 1 else ''} for query `{search_query}` "
-                f"in `{Path(file_path).name}`."
-            )
-        else:
-            ui_parts.append(
-                f"> **Search Results** — Found {total_filtered} match"
-                f"{'es' if total_filtered != 1 else ''} on document page {page_filter} "
-                f"for query `{search_query}` in `{Path(file_path).name}` "
-                f"({total_matches} total in document)."
-            )
+        if not no_chrome:
+            if page_filter is None:
+                ui_parts.append(
+                    f"> **Search Results** — Found {total_matches} match"
+                    f"{'es' if total_matches != 1 else ''} for query `{search_query}` "
+                    f"in `{Path(file_path).name}`."
+                )
+            else:
+                ui_parts.append(
+                    f"> **Search Results** — Found {total_filtered} match"
+                    f"{'es' if total_filtered != 1 else ''} on document page {page_filter} "
+                    f"for query `{search_query}` in `{Path(file_path).name}` "
+                    f"({total_matches} total in document)."
+                )
         ui_parts.append(note)
         if regex_downgraded_note:
             ui_parts.insert(0, regex_downgraded_note)
         note_markdown = "\n\n".join(part for part in ui_parts if part)
+        llm_content = note_markdown if no_chrome else f"> **File Path:** `{file_path}`\n\n{note_markdown}"
         return BuilderResult(
-            content=f"> **File Path:** `{file_path}`\n\n{note_markdown}",
+            content=llm_content,
             structured_content={
                 "markdown": note_markdown,
                 "title": f"Search: {Path(file_path).name}",
@@ -927,15 +878,23 @@ def build_search_response(
 
     if max_matches < 1:
         knob = "`--max-matches N`" if is_cli else "`max_matches=N`"
-        return window_note_response(
-            f"> **Note:** No matches shown (max_matches={max_matches}, total matches={total_filtered}). "
-            f"Pass {knob} with N >= 1 to see match snippets."
-        )
+        if no_chrome:
+            note_str = f"No matches shown (max_matches={max_matches}, total matches={total_filtered})."
+        else:
+            note_str = (
+                f"> **Note:** No matches shown (max_matches={max_matches}, total matches={total_filtered}). "
+                f"Pass {knob} with N >= 1 to see match snippets."
+            )
+        return window_note_response(note_str)
 
     if match_offset >= total_filtered:
-        return window_note_response(
-            f"> **Note:** No matches in this window (match_offset={match_offset}, total matches={total_filtered})."
-        )
+        if no_chrome:
+            note_str = f"No matches in this window (match_offset={match_offset}, total matches={total_filtered})."
+        else:
+            note_str = (
+                f"> **Note:** No matches in this window (match_offset={match_offset}, total matches={total_filtered})."
+            )
+        return window_note_response(note_str)
 
     selected_matches = filtered[match_offset : match_offset + max_matches]
 
@@ -999,46 +958,9 @@ def build_search_response(
             )
         return head
 
-    def clean_breadcrumb(raw: str) -> str:
-        # Breadcrumbs render CLEAN-view heading text: a heading carrying a
-        # pending tracked change must not leak raw CriticMarkup into the Path
-        # line (QA 2026-07-23 F22b). Deletions vanish, insertions/highlights
-        # unwrap to their text, meta bubbles drop. Because we operate on ONE
-        # line of the projection, a multi-line `{>>…<<}` bubble can be clipped
-        # by the line break — drop the unterminated tail too, then sweep any
-        # leftover delimiter fragments.
-        s = re.sub(r"\{--.*?--\}", "", raw)
-        s = re.sub(r"\{\+\+(.*?)\+\+\}", r"\1", s)
-        s = re.sub(r"\{==(.*?)==\}", r"\1", s)
-        s = re.sub(r"\{>>.*?<<\}", "", s)
-        s = re.sub(r"\{(?:>>|--).*$", "", s)  # line-clipped bubble/deletion tail
-        s = re.sub(r"\{\+\+|\{==|--\}|\+\+\}|<<\}|==\}", "", s)  # stray fragments
-        s = re.sub(r"\*\*|__|[*_]", "", s)
-        return re.sub(r"\{#[^}]+\}", "", s).strip()
-
-    def get_heading(idx, txt):
-        path: list[str] = []
-        current_level = 999
-        # Scan through the END of the line containing the match: slicing at
-        # the match offset cuts the line in half, so a hit INSIDE a heading
-        # reported a truncated path ("Master" for a match on "Services" in
-        # "# Master Services Agreement", QA 2026-07-19 F-17).
-        line_end = txt.find("\n", idx)
-        if line_end == -1:
-            line_end = len(txt)
-        for line in reversed(txt[:line_end].split("\n")):
-            m = re.match(r"^(#{1,6})\s+(.*)", line)
-            if m:
-                level = len(m.group(1))
-                if level < current_level:
-                    clean_heading = clean_breadcrumb(m.group(2))
-                    if len(clean_heading) > 80:
-                        clean_heading = clean_heading[:80] + "..."
-                    path.insert(0, clean_heading)
-                    current_level = level
-                    if level == 1:
-                        break
-        return " > ".join(path) if path else ""
+    # Hoisted to adeu.outline for CC-2 so the fields ledger renders identical
+    # breadcrumbs from the same projection rather than a second dialect.
+    get_heading = heading_path_at
 
     # Match index is preserved from the FULL match list so an LLM that sees
     # "Match 7 (p3)" knows it is the 7th match overall, not the 7th on this page.
@@ -1141,13 +1063,17 @@ def build_search_response(
         match_lines.extend([snippet_lines, occurrence_line])
         return "\n\n".join(match_lines)
 
-    content_prefix = f"> **File Path:** `{file_path}`\n\n"
+    content_prefix = "" if no_chrome else f"> **File Path:** `{file_path}`\n\n"
 
     def compose(hits: list, radius: int | None, budget_note: str) -> str:
-        parts = build_header(len(hits))
+        parts = [] if no_chrome else build_header(len(hits))
         parts.extend(render_entry(line_start, group, radius) for line_start, group in group_by_line(hits))
-        if budget_note:
+        if budget_note and not no_chrome:
             parts.append(budget_note)
+        # The downgrade note survives `no_chrome`: it reports that the query
+        # was searched with DIFFERENT semantics than asked for, so suppressing
+        # it would make the hit list read as regex matches. Query semantics are
+        # not chrome — the zero-match and window-note paths keep it too.
         if regex_downgraded_note:
             parts.insert(0, regex_downgraded_note)
         return "\n\n".join(part for part in parts if part)
@@ -1201,11 +1127,18 @@ def build_search_response(
             kept.pop()
             if not kept:
                 opt_out = "`--full-paragraph`" if is_cli else "`full_paragraph=true`"
-                return window_note_response(
-                    f"> **Note:** No matches shown in this window: not even one ±{radius}-char snippet fits "
-                    f"the response size budget (max_matches={max_matches}, total matches={total_filtered}). "
-                    f"Raise `max_matches`, or pass {opt_out} to read the matching paragraph in full."
-                )
+                if no_chrome:
+                    note_str = (
+                        f"No matches shown in this window: not even one ±{radius}-char snippet fits "
+                        f"the response size budget (max_matches={max_matches}, total matches={total_filtered})."
+                    )
+                else:
+                    note_str = (
+                        f"> **Note:** No matches shown in this window: not even one ±{radius}-char snippet fits "
+                        f"the response size budget (max_matches={max_matches}, total matches={total_filtered}). "
+                        f"Raise `max_matches`, or pass {opt_out} to read the matching paragraph in full."
+                    )
+                return window_note_response(note_str)
             ui_markdown = compose(
                 kept,
                 radius,
@@ -1223,7 +1156,13 @@ def build_search_response(
     )
 
 
-def build_appendix_response(text: str, page: int, file_path: str, is_cli: bool = False) -> BuilderResult:
+def build_appendix_response(
+    text: str,
+    page: int,
+    file_path: str,
+    is_cli: bool = False,
+    no_chrome: bool = False,
+) -> BuilderResult:
     """
     Returns the structural appendix (defined terms, anchors, diagnostics) for
     the document, paginated. The appendix is treated AS the body for pagination
@@ -1244,7 +1183,7 @@ def build_appendix_response(text: str, page: int, file_path: str, is_cli: bool =
             "This document has no structural appendix "
             "(no defined terms, named anchors, or diagnostics detected)."
         )
-        llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
+        llm_content = ui_markdown if no_chrome else f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
         return BuilderResult(
             content=llm_content,
             structured_content={
@@ -1262,36 +1201,41 @@ def build_appendix_response(text: str, page: int, file_path: str, is_cli: bool =
 
     selected = result.pages[page - 1]
 
-    # Build the appendix-specific banner. Reusing _build_page_banner would emit
-    # generic "Page N of M" wording; the agent benefits from knowing it's
-    # looking at the appendix, not body.
-    if selected.total_pages > 1:
-        banner = (
-            f"> **Appendix page {selected.page} of {selected.total_pages}** — "
-            f"structural metadata for this document.\n\n---\n\n"
-        )
-        if is_cli:
-            cmd = f"adeu extract {file_path} --mode appendix --page {selected.page + 1}"
-            footer = (
-                (
-                    f"\n\n---\n\n> **Continues on appendix page {selected.page + 1} "
-                    f"of {selected.total_pages}.** Run `{cmd}` for the next page."
-                )
-                if selected.has_next
-                else ""
-            )
-        else:
-            footer = (
-                (f"\n\n---\n\n> **Continues on appendix page {selected.page + 1} of {selected.total_pages}.**")
-                if selected.has_next
-                else ""
-            )
+    if no_chrome:
+        page_marker = f"[p{selected.page}/{selected.total_pages}]\n\n" if selected.total_pages > 1 else ""
+        ui_markdown = f"{page_marker}{selected.page_content}"
+        llm_content = ui_markdown
     else:
-        banner = "> **Appendix** — structural metadata for this document.\n\n---\n\n"
-        footer = ""
+        # Build the appendix-specific banner. Reusing _build_page_banner would emit
+        # generic "Page N of M" wording; the agent benefits from knowing it's
+        # looking at the appendix, not body.
+        if selected.total_pages > 1:
+            banner = (
+                f"> **Appendix page {selected.page} of {selected.total_pages}** — "
+                f"structural metadata for this document.\n\n---\n\n"
+            )
+            if is_cli:
+                cmd = f"adeu extract {file_path} --mode appendix --page {selected.page + 1}"
+                footer = (
+                    (
+                        f"\n\n---\n\n> **Continues on appendix page {selected.page + 1} "
+                        f"of {selected.total_pages}.** Run `{cmd}` for the next page."
+                    )
+                    if selected.has_next
+                    else ""
+                )
+            else:
+                footer = (
+                    (f"\n\n---\n\n> **Continues on appendix page {selected.page + 1} of {selected.total_pages}.**")
+                    if selected.has_next
+                    else ""
+                )
+        else:
+            banner = "> **Appendix** — structural metadata for this document.\n\n---\n\n"
+            footer = ""
 
-    ui_markdown = banner + selected.page_content + footer
-    llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
+        ui_markdown = banner + selected.page_content + footer
+        llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
 
     return BuilderResult(
         content=llm_content,
@@ -1322,6 +1266,55 @@ def _parse_com_header(slice_text: str) -> tuple[str, str, int]:
     return "", slice_text.strip(), -1
 
 
+def fields_discovery_hint(file_path: str, is_cli: bool = False) -> str:
+    """The surface-aware pointer at the fields ledger (spec-projection §7).
+
+    Surface-aware for the QA F11 reason: telling an MCP client to run a shell
+    command, or a CLI user to call a tool, is advice they cannot act on.
+    """
+    if is_cli:
+        return f" \u00b7 run `adeu extract {file_path} --mode fields` for the field ledger"
+    return ' \u00b7 read mode="fields" for the field ledger'
+
+
+def build_fields_response(
+    doc: Any,
+    text: str,
+    file_path: str,
+    offset: int = 0,
+    is_cli: bool = False,
+    pagination_result: "PaginationResult | None" = None,
+    no_chrome: bool = False,
+) -> BuilderResult:
+    """Render ``mode="fields"`` — the content-control ledger (spec §2-§4).
+
+    ``text`` must be the RAW projection: the ledger previews values by reading
+    the text between a control's anchors, so a clean view (which drops the
+    placeholder bubbles) would report a different document than the one the
+    agent edits.
+    """
+    body, _appendix = split_structural_appendix(text)
+    pag_res = pagination_result if pagination_result is not None else paginate(body, structural_appendix="")
+
+    entries = collect_fields(doc, body, pag_res.body_page_offsets)
+    protection = read_document_protection(doc)
+    ledger = render_ledger(os.path.basename(file_path) or file_path, entries, protection, offset=offset)
+
+    if no_chrome:
+        llm_content = ledger
+    else:
+        llm_content = f"> **File Path:** `{file_path}`\n\n{ledger}"
+
+    return BuilderResult(
+        content=llm_content,
+        structured_content={
+            "markdown": ledger,
+            "title": os.path.basename(file_path),
+            "file_path": file_path,
+        },
+    )
+
+
 def build_changes_response(
     text: str,
     file_path: str,
@@ -1332,6 +1325,7 @@ def build_changes_response(
     is_cli: bool = False,
     pagination_result: "PaginationResult | None" = None,
     existing_change_ids: Iterable[str] | None = None,
+    no_chrome: bool = False,
 ) -> BuilderResult:
     """
     Enumerates every tracked change and comment in a DOCX document as a concise
@@ -1726,8 +1720,17 @@ def build_changes_response(
                 f"Continue with `read_docx({args_str})`."
             )
 
-    ui_markdown = header + "\n".join(lines) + continuation
-    llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
+    if no_chrome:
+        # The ledger lines ARE the payload here, so chrome-stripping normally
+        # leaves them alone. With nothing to list (clean document, a filter
+        # matching no entry, or an offset past the last one) the counts are the
+        # only answer there is: emit them as a bare line, never an empty
+        # response (QA 2026-08-12: `--mode changes --no-chrome` returned "").
+        ui_markdown = "\n".join(lines) or f"{total_changes} change(s), {total_comments} comment(s)"
+        llm_content = ui_markdown
+    else:
+        ui_markdown = header + "\n".join(lines) + continuation
+        llm_content = f"> **File Path:** `{file_path}`\n\n{ui_markdown}"
 
     return BuilderResult(
         content=llm_content,

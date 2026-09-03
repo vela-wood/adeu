@@ -22,6 +22,16 @@ generated families:
       sanitized package, whatever characters the values contain.
   P5  trim_common_context structural invariants: the trimmed prefix/suffix
       are genuinely common, never overlap, and re-compose both strings.
+  P6  Typographic restoration is semantics-preserving: restoring the
+      document's own quote characters into a caller's new_text never changes
+      the text modulo that normalization, and is idempotent. This is what
+      makes the matcher and the writer forgive the SAME set of characters
+      (BUG_comment_threading_anchoring_and_typography.md B4).
+  P7  ST_LongHexNumber range: EVERY id Adeu mints — `w14:paraId`, `w:rsid*`,
+      `w16cid:durableId` — is greater than 0x00000000 and less than
+      0x80000000, because Word parses all of them as signed 32-bit integers
+      and silently discards anything outside that (B3, then B5 when the same
+      conclusion was applied to only one of the three).
 
 Alphabets deliberately exclude Markdown/CriticMarkup metacharacters
 (#, *, _, |, [], {}, ^) — text containing those exercises separately
@@ -48,8 +58,16 @@ from adeu.diff import (
 )
 from adeu.ingest import _extract_text_from_doc, extract_text_from_stream
 from adeu.models import BatchChanges
+from adeu.redline.comments import CommentsManager
 from adeu.redline.engine import BatchValidationError, RedlineEngine
+from adeu.redline.mapper import DocumentMapper
 from adeu.sanitize.core import sanitize_docx
+from adeu.utils.long_hex_number import is_word_readable_long_hex_number, to_long_hex_number
+from adeu.utils.text import (
+    SMART_QUOTE_MAP,
+    normalize_smart_quotes,
+    restore_document_typography,
+)
 
 # Profiles ("default": 25 examples, "hunt": 300) are registered in
 # tests/conftest.py so --hypothesis-profile resolves at configure time.
@@ -376,3 +394,101 @@ def test_p5_trim_common_context_invariants(target, new):
         assert target[:prefix_len] == new[:prefix_len], "trimmed prefix is not common"
     if suffix_len:
         assert target[-suffix_len:] == new[-suffix_len:], "trimmed suffix is not common"
+
+
+# ---------------------------------------------------------------------------
+# P6 — typographic restoration is semantics-preserving
+# ---------------------------------------------------------------------------
+
+typo_text_st = st.text(
+    alphabet="abcdef .,'\"\u2018\u2019\u201c\u201d\n0123456789",
+    min_size=0,
+    max_size=40,
+)
+
+
+@given(doc_text=typo_text_st, new_text=typo_text_st)
+@settings(max_examples=300, deadline=None)
+def test_p6_restore_document_typography_preserves_semantics(doc_text, new_text):
+    """
+    The repair may only ever swap typographic VARIANTS. Whatever it returns must
+    be indistinguishable from the caller's own new_text once quotes are folded —
+    otherwise "preserve the document's characters" would have quietly changed
+    what the caller asked to write.
+    """
+    restored = restore_document_typography(doc_text, new_text)
+
+    assert normalize_smart_quotes(restored) == normalize_smart_quotes(new_text), (
+        f"restoration changed the text beyond quote typography: {doc_text!r} + {new_text!r} -> {restored!r}"
+    )
+    assert len(restored) == len(new_text), "restoration is length-preserving by construction"
+    # Idempotent: restoring an already-restored string is a no-op.
+    assert restore_document_typography(doc_text, restored) == restored
+
+
+@given(doc_text=typo_text_st)
+@settings(max_examples=200, deadline=None)
+def test_p6_typography_only_difference_is_a_no_op(doc_text):
+    """
+    "If target and new differ only by normalised punctuation, the correct number
+    of tracked changes is zero": feeding back the straightened document text
+    must reproduce the document verbatim.
+    """
+    straightened = normalize_smart_quotes(doc_text)
+    assert restore_document_typography(doc_text, straightened) == doc_text
+
+
+def test_p6_writer_forgives_exactly_what_the_matcher_forgives():
+    """
+    Structural invariant, not a data check: the WRITER's normalization table
+    must be the SAME table the MATCHER uses. B4 was precisely this asymmetry —
+    the matcher folded curly quotes to find an occurrence and the writer then
+    wrote the caller's straight ones back. Extending one side alone silently
+    reintroduces the defect for the newly-forgiven characters.
+    """
+    probe = "".join(SMART_QUOTE_MAP) + "".join(SMART_QUOTE_MAP.values()) + "abc \u2013\u2014\u2026"
+    mapper_view = DocumentMapper._replace_smart_quotes(None, probe)  # type: ignore[arg-type]
+    assert normalize_smart_quotes(probe) == mapper_view, (
+        "DocumentMapper._replace_smart_quotes and utils.text.normalize_smart_quotes "
+        "disagree; the writer would not restore a character the matcher forgave"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P7 — every minted ST_LongHexNumber stays a positive signed int32
+# ---------------------------------------------------------------------------
+
+
+@given(
+    count=st.integers(min_value=1, max_value=64),
+    generator=st.sampled_from(["_generate_para_id", "_generate_rsid", "_generate_durable_id"]),
+)
+@settings(max_examples=25, deadline=None)
+def test_p7_minted_ids_are_positive_signed_int32(count, generator):
+    """
+    All three, not just durableId. B3 fixed the range for `durableId` alone and
+    recorded that the other two did not need it; three weeks later the same
+    defect shipped as B5 through `paraId`. There is no attribute here for
+    which the high half is safe.
+    """
+    manager = CommentsManager(Document())
+    mint = getattr(manager, generator)
+    for _ in range(count):
+        value = mint()
+        assert len(value) == 8 and is_word_readable_long_hex_number(value), (
+            f"{generator} produced {value}, which Word reads as a negative (or zero) signed "
+            "32-bit integer and discards on load: the comment loses its anchor, the reply "
+            "loses its thread, and nothing in the XML says so"
+        )
+
+
+@given(value=st.integers(min_value=0, max_value=0xFFFFFFFF))
+@settings(max_examples=200, deadline=None)
+def test_p7_folding_any_32_bit_value_yields_a_word_readable_id(value):
+    """`to_long_hex_number` is the DERIVED-id path (Node's `{#cell:paraId}`
+    FNV fallback). No input may escape the legal range — including the two
+    that map to the forbidden zero."""
+    folded = to_long_hex_number(value)
+    assert len(folded) == 8 and is_word_readable_long_hex_number(folded), (
+        f"folding {value:#010x} produced {folded}, which Word will discard"
+    )

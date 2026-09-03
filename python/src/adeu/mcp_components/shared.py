@@ -4,6 +4,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from adeu.utils.docx import suggest_sibling_docx
+
 # Centralized MCP Configuration
 MARKDOWN_UI_URI = "ui://adeu/markdown-ui"
 
@@ -11,7 +13,7 @@ MARKDOWN_UI_URI = "ui://adeu/markdown-ui"
 # must point at the MCP tool instead (QA 2026-07-23 F11). Passed to
 # RedlineEngine(id_discovery_hint=...) by every MCP-surface engine construction.
 MCP_ID_DISCOVERY_HINT = (
-    "Call `read_docx` on the document again to list the current change (Chg:) "
+    "Call `read_docx` with `mode='changes'` on the document again to list the current change (Chg:) "
     "and comment (Com:) ids — ids shift between document states."
 )
 
@@ -31,18 +33,12 @@ def _not_found_error(path: str) -> FileNotFoundError:
     sandboxes and no CLI-migration essay for a plain ENOENT
     (QA round 3, finding 3.11).
     """
-    import difflib
-
     p = Path(path)
     listing = ""
-    try:
-        siblings = sorted(f.name for f in p.parent.iterdir() if f.suffix.lower() == ".docx")
-    except OSError:
-        siblings = []
-    if siblings:
-        shown = difflib.get_close_matches(p.name, siblings, n=_NOT_FOUND_SUGGESTION_CAP, cutoff=0.0)
+    shown, total = suggest_sibling_docx(p, limit=_NOT_FOUND_SUGGESTION_CAP)
+    if shown:
         listing = f" available files: [{', '.join(shown)}]"
-        more = len(siblings) - len(shown)
+        more = total - len(shown)
         if more > 0:
             listing += f" (+{more} more in {p.parent})"
     hint = ""

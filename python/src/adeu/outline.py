@@ -1,23 +1,9 @@
 # FILE: src/adeu/outline.py
-"""
-Structural outline extractor.
-
-Walks a python-docx Document in document order, identifies headings (matching
-the same rules used by ingest.get_paragraph_prefix), and emits a flat list of
-OutlineNode records with per-heading metadata.
-
-Used by read_docx mode='outline'. The outline is computed from the live
-Document object — same source as the projected body — so heading text and
-page assignments stay consistent with what mode='full' returns.
-
-Heading ownership: a heading owns the document range from its position up to
-(but not including) the next heading of equal or higher level. has_table and
-footnote_ids are computed over that owned range.
-"""
+"""Structural outline extractor."""
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, List, Optional, Sequence
 
 from docx.document import Document as DocumentObject
 from docx.table import Table
@@ -34,6 +20,8 @@ from adeu.utils.docx import (
     iter_block_items,
     iter_document_parts,
     iter_paragraph_content,
+    iter_row_cells,
+    iter_table_rows,
 )
 
 
@@ -202,26 +190,7 @@ def _extract_outline_fast(
     body_page_offsets: List[int],
     paragraph_offsets: dict,
 ) -> List[OutlineNode]:
-    """
-    Fast outline extraction using the pre-computed paragraph offset map.
-
-    For each paragraph in the document, we already know its (start, length) in
-    projected_body. Heading text is extracted by slicing projected_body and
-    stripping markdown markers — no per-paragraph re-projection.
-
-    PERF (2026-07-24): three per-heading costs made this path scale badly on
-    heading-dense documents (7,066 headings → ~11 s):
-      - style resolution went through python-docx's `paragraph.style`, whose
-        part lookup rescans the document part's relationship list on EVERY
-        access (52M probes on a 3,547-rel document) — replaced with the
-        package-level style cache;
-      - footnote collection re-projected paragraph events over each heading's
-        owned range, and owned ranges overlap (L2 ranges nest inside L1) —
-        replaced with one lxml prefilter for reference-carrying paragraphs
-        plus a per-paragraph memo;
-      - `_is_heading`/`_heading_level` were recomputed inside the owned-range
-        scans — now computed once per item during identification.
-    """
+    """Fast outline extraction using the pre-computed paragraph offset map."""
     # Walk paragraphs and tables in projection order, but ONLY to detect
     # heading-eligible paragraphs. We do not re-project text.
     paragraphs_and_tables: list = []
@@ -236,8 +205,8 @@ def _extract_outline_fast(
                 paragraphs_and_tables.append(("p", item))
             elif isinstance(item, Table):
                 paragraphs_and_tables.append(("t", item))
-                for row in item.rows:
-                    for cell in row.cells:
+                for row in iter_table_rows(item):
+                    for cell in iter_row_cells(row):
                         cid = id(cell._tc)
                         if cid in seen_cells:
                             continue
@@ -404,31 +373,6 @@ def _heading_text_fast(
     # The projection includes the heading prefix ("# ", "## ", ...). Strip it.
     cleaned = re.sub(r"^#+\s+", "", cleaned)
     return _truncate_outline_text(cleaned.strip())
-
-
-def _collect_footnote_ids_fast(owned_items: list) -> List[str]:
-    """
-    Walks owned (kind, item) tuples, collecting footnote/endnote references
-    in document order, deduplicated, with first-seen order preserved.
-    """
-    seen: set = set()
-    ordered: List[str] = []
-
-    for kind, item in owned_items:
-        if kind != "p":
-            continue
-        for event in _iter_paragraph_events(item):
-            if event.type == "footnote":
-                fn_id = f"fn-{event.id}"
-            elif event.type == "endnote":
-                fn_id = f"en-{event.id}"
-            else:
-                continue
-            if fn_id not in seen:
-                seen.add(fn_id)
-                ordered.append(fn_id)
-
-    return ordered
 
 
 _NO_FOOTNOTE_IDS: List[str] = []
@@ -608,7 +552,9 @@ def _compute_inner_block_offset(
     cursor = table_start_offset
     rows_processed = 0
 
-    for row in table.rows:
+    rows = iter_table_rows(table)
+
+    for row in rows:
         # Skip rows that ingest would skip in clean_view; outline runs against
         # the non-clean projection, so do NOT skip clean_view-deleted rows here.
         # extract_table only skips a row when clean_view=True AND trPr/del exists.
@@ -616,10 +562,10 @@ def _compute_inner_block_offset(
 
         if rows_processed > 0:
             if rows_processed == 1:
-                first_row = table.rows[0]
+                first_row = rows[0]
                 seen_cells_first = set()
                 num_cols = 0
-                for cell in first_row.cells:
+                for cell in iter_row_cells(first_row):
                     cell_id = id(cell._tc)
                     if cell_id in seen_cells_first:
                         continue
@@ -633,7 +579,7 @@ def _compute_inner_block_offset(
         seen_cells: set = set()
         cells_in_row = 0
 
-        for cell in row.cells:
+        for cell in iter_row_cells(row):
             cell_id = id(cell._tc)
             if cell_id in seen_cells:
                 continue
@@ -744,8 +690,8 @@ def _record_table_inner_blocks_lite(
     nested headings/tables.
     """
     seen_cells: set = set()
-    for row in table.rows:
-        for cell in row.cells:
+    for row in iter_table_rows(table):
+        for cell in iter_row_cells(row):
             cell_id = id(cell._tc)
             if cell_id in seen_cells:
                 continue
@@ -950,7 +896,16 @@ _PROTECTED_UNDERSCORE_RE = re.compile(r"\{#[^}]+\}|_{3,}")
 
 def _truncate_outline_text(text: str) -> str:
     if len(text) > _OUTLINE_TEXT_MAX_CHARS:
-        return text[:_OUTLINE_TEXT_MAX_CHARS].rstrip() + "…"
+        cut = text[:_OUTLINE_TEXT_MAX_CHARS]
+        # Never ship a SPLIT anchor token. The cut can land inside `{#cc:3}` or
+        # `{#_Ref444615940}` and emit `{#cc:`, which is not obviously broken to
+        # an agent reading the outline — it is a plausible target that resolves
+        # to nothing. A1.6 allows dropping the token entirely but never
+        # splitting it, so a dangling opener is trimmed back to its `{#`.
+        # Only an UNCLOSED fragment matches: a whole token keeps its `}`.
+        if (dangling := re.search(r"\{#[^}\n]*$", cut)) is not None:
+            cut = cut[: dangling.start()]
+        return cut.rstrip() + "…"
     return text
 
 
@@ -1177,6 +1132,63 @@ def _iter_paragraph_events(paragraph: Paragraph) -> Iterator[DocxEvent]:
 # ---------------------------------------------------------------------------
 # Internal: offset → page mapping
 # ---------------------------------------------------------------------------
+
+
+def clean_breadcrumb(raw: str) -> str:
+    """Render one projection fragment as plain prose for a breadcrumb.
+
+    Breadcrumbs show CLEAN-view heading text: a heading carrying a pending
+    tracked change must not leak raw CriticMarkup into the Path line (QA
+    2026-07-23 F22b). Deletions vanish, insertions/highlights unwrap to their
+    text, meta bubbles drop. Because callers operate on ONE line of the
+    projection, a multi-line ``{>>…<<}`` bubble can be clipped by the line
+    break — drop the unterminated tail too, then sweep leftover fragments.
+
+    Hoisted from ``build_search_response`` for CC-2: the fields ledger renders
+    the same breadcrumbs from the same projection, and two copies of these
+    substitutions would be two dialects of "clean".
+    """
+    s = re.sub(r"\{--.*?--\}", "", raw)
+    s = re.sub(r"\{\+\+(.*?)\+\+\}", r"\1", s)
+    s = re.sub(r"\{==(.*?)==\}", r"\1", s)
+    s = re.sub(r"\{>>.*?<<\}", "", s)
+    s = re.sub(r"\{(?:>>|--).*$", "", s)  # line-clipped bubble/deletion tail
+    s = re.sub(r"\{\+\+|\{==|--\}|\+\+\}|<<\}|==\}", "", s)  # stray fragments
+    s = re.sub(r"\*\*|__|[*_]", "", s)
+    return re.sub(r"\{#[^}]+\}", "", s).strip()
+
+
+def heading_path_at(idx: int, txt: str) -> str:
+    """The heading breadcrumb for the position ``idx`` in projection ``txt``.
+
+    Scans through the END of the line containing ``idx``: slicing at the offset
+    itself cuts the line in half, so a hit INSIDE a heading reported a
+    truncated path ("Master" for a match on "Services" in "# Master Services
+    Agreement", QA 2026-07-19 F-17).
+    """
+    path: List[str] = []
+    current_level = 999
+    line_end = txt.find("\n", idx)
+    if line_end == -1:
+        line_end = len(txt)
+    for line in reversed(txt[:line_end].split("\n")):
+        m = re.match(r"^(#{1,6})\s+(.*)", line)
+        if m:
+            level = len(m.group(1))
+            if level < current_level:
+                clean_heading = clean_breadcrumb(m.group(2))
+                if len(clean_heading) > 80:
+                    clean_heading = clean_heading[:80] + "..."
+                path.insert(0, clean_heading)
+                current_level = level
+                if level == 1:
+                    break
+    return " > ".join(path) if path else ""
+
+
+def offset_to_page(offset: int, body_page_offsets: Optional[Sequence[int]]) -> int:
+    """Public alias of :func:`_offset_to_page` (CC-2 needs it outside outline)."""
+    return _offset_to_page(offset, list(body_page_offsets or []))
 
 
 def _offset_to_page(offset: int, body_page_offsets: List[int]) -> int:

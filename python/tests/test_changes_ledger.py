@@ -1,6 +1,4 @@
 import re
-import subprocess
-import sys
 from io import BytesIO
 from pathlib import Path
 
@@ -12,7 +10,7 @@ from adeu.mcp_components.tools.document import read_docx
 from adeu.models import ModifyText
 from adeu.redline.comments import CommentsManager
 from adeu.redline.engine import RedlineEngine
-from tests.utils import approx_tokens, get_mock_ctx, run_async
+from tests.utils import approx_tokens, get_mock_ctx, run_async, run_cli
 
 
 def make_sample_docx(tmp_path: Path) -> Path:
@@ -202,8 +200,7 @@ def test_changes_page_filter(tmp_path: Path):
 
 def test_clean_view_with_mode_changes_is_a_usage_error(tmp_path: Path):
     docx_path = make_sample_docx(tmp_path)
-    cmd = [sys.executable, "-m", "adeu.cli", "extract", str(docx_path), "--mode", "changes", "--clean-view"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = run_cli("extract", str(docx_path), "--mode", "changes", "--clean-view")
 
     assert proc.returncode == 2
     assert "clean-view" in proc.stderr.lower() or "clean-view" in proc.stdout.lower()
@@ -225,8 +222,7 @@ def test_ledger_paginates_above_300_entries(tmp_path: Path):
 
 def test_mcp_mode_changes(tmp_path: Path):
     docx_path = make_sample_docx(tmp_path)
-    cmd = [sys.executable, "-m", "adeu.cli", "extract", str(docx_path), "--mode", "changes"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    proc = run_cli("extract", str(docx_path), "--mode", "changes")
     assert proc.returncode == 0
     cli_output = proc.stdout.strip()
 
@@ -269,8 +265,7 @@ def test_cli_mode_changes_page_range(tmp_path: Path):
     assert "Chg:1" not in content
 
     docx_path = make_sample_docx(tmp_path)
-    cmd = [sys.executable, "-m", "adeu.cli", "extract", str(docx_path), "--mode", "changes", "--page", "1-2"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    proc = run_cli("extract", str(docx_path), "--mode", "changes", "--page", "1-2")
     assert proc.returncode == 0
     assert "Chg:1" in proc.stdout
 
@@ -379,7 +374,17 @@ def test_continuation_hint_mcp_empty_filepath():
     assert "file_path=" not in content
 
 
-def test_read_docx_changes_ignores_header_footer_change_ids(tmp_path: Path):
+def test_read_docx_changes_lists_header_footer_change_ids(tmp_path: Path):
+    """The changes ledger and the engine's actionable-id list must agree.
+
+    Until issue #114 the engine's revision reads were body-only, so header/
+    footer change ids were filtered OUT of the ledger — advertising them
+    would have invited accept/reject calls that failed. With revision state
+    read across every story part those ids are actionable, so the ledger
+    lists them; the invariant under test is unchanged: the ledger's Chg ids
+    equal _existing_change_ids() exactly.
+    """
+
     doc = Document()
     doc.add_paragraph("Body text with a change.")
     section = doc.sections[0]
@@ -414,7 +419,7 @@ def test_read_docx_changes_ignores_header_footer_change_ids(tmp_path: Path):
         check_engine = RedlineEngine(BytesIO(f.read()))
 
     expected_change_ids = check_engine._existing_change_ids()
-    assert "999" not in expected_change_ids
+    assert "999" in expected_change_ids  # header revisions are actionable (issue #114)
 
     tool_res = run_async(
         read_docx(

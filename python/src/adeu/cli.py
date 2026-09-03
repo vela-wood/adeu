@@ -1,6 +1,5 @@
 import argparse
 import codecs
-import getpass
 import json
 import os
 import re
@@ -15,10 +14,29 @@ from adeu.markup import apply_edits_to_markdown, apply_structural_ops_to_markdow
 from adeu.mcp_components.shared import get_build_info
 from adeu.models import DeleteTableRow, DocumentChange, InsertTableRow, ModifyText, StrictBatchChanges
 from adeu.pagination import parse_page_arg
-from adeu.payloads import BATCH_ERROR_CODES, BATCH_RECOVERY_PROTOCOL, failure_envelope, shrink_batch_stats
+from adeu.payloads import (
+    BATCH_ERROR_CODES,
+    BATCH_RECOVERY_PROTOCOL,
+    FUSED_JSON_HINT,
+    failure_envelope,
+    has_fused_json_marker,
+    shrink_batch_stats,
+)
 from adeu.redline.engine import BatchValidationError, RedlineEngine, validate_edit_strings
 from adeu.sanitize.core import SanitizeError, SanitizeResult, sanitize_docx
+from adeu.text_revision import (
+    _CRITICMARKUP_TOKENS,
+    _EXTRACT_HEADER_RE,
+    _extract_clean_text_from_doc,
+    _strip_page_chrome,
+    check_major_deletions,
+    verify_clean_text,
+)
+from adeu.text_revision import (
+    get_default_author as _default_author,
+)
 from adeu.utils.console import configure_cli_streams, dynamic_stderr
+from adeu.utils.docx import suggest_sibling_docx
 from adeu.utils.text import batch_details_header
 
 # When True (set per-invocation from a subcommand's --json flag), every fatal
@@ -31,6 +49,20 @@ _JSON_MODE = False
 def _set_json_mode(enabled: bool) -> None:
     global _JSON_MODE
     _JSON_MODE = bool(enabled)
+
+
+# _cli_error signals failure with SystemExit, whose string form is a bare exit
+# code ("1"). In-process callers — the `adeu serve` daemon, which must survive
+# the exit and answer the next request — recover the code and diagnostics from
+# here instead of stringifying the exception (QA 2026-08-12).
+_LAST_CLI_ERROR: "Dict[str, Any] | None" = None
+
+
+def take_last_cli_error() -> "Dict[str, Any] | None":
+    """Pops the failure envelope recorded by the most recent _cli_error() call."""
+    global _LAST_CLI_ERROR
+    env, _LAST_CLI_ERROR = _LAST_CLI_ERROR, None
+    return env
 
 
 def _cli_error(
@@ -61,23 +93,22 @@ def _cli_error(
         print(f"❌ {message}", file=sys.stderr)
         if hint:
             print(hint, file=sys.stderr)
+    global _LAST_CLI_ERROR
+    env = failure_envelope(code, failed or [], message, errors=errors)
+    _LAST_CLI_ERROR = env
     if _JSON_MODE:
-        env = failure_envelope(code, failed or [], message, errors=errors)
         print(json.dumps(env, ensure_ascii=False))
     sys.exit(exit_code)
 
 
 def _print_sandbox_warning_and_exit(path: Path, exit_code: int = 1):
+    siblings, _ = suggest_sibling_docx(path)
+    hint = f"Did you mean: {', '.join(siblings)}?" if siblings else None
     _cli_error(
         "file_not_found",
         f"File not found: {path}",
         exit_code=exit_code,
-        hint=(
-            "Note: If you are running in a sandboxed/containerized environment, "
-            "the host application or MCP server may not have access to your local workspace files. "
-            "You can resolve this by installing Adeu directly inside your sandboxed environment using "
-            "'uv tool install adeu' and executing the commands via the CLI."
-        ),
+        hint=hint,
     )
 
 
@@ -94,7 +125,6 @@ def _require_input_file(path: Path, exit_code: int = 1) -> None:
 
 
 def _handle_docx_error_and_exit(filename: str, exc: Exception) -> None:
-    import re
 
     err_str = str(exc)
     reason = "got bad zip signature"
@@ -232,59 +262,6 @@ def _read_docx_text(path: Path, clean_view: bool = False) -> str:
         raise AssertionError("unreachable") from None
 
 
-# The decorative header every extract response starts with (see
-# _response_builders.py). It is presentation, not document content.
-_EXTRACT_HEADER_RE = re.compile(r"^> \*\*File Path:\*\*[^\n]*\n+")
-
-# Pagination chrome emitted by extract around each page (see pagination.py's
-# build_page_banner / build_page_footer / build_appendix_pointer). Like the
-# file-path header, it is presentation — but unlike the header, a banner or
-# footer that names "page N of M" (M > 1) proves the text is only PART of the
-# document, which can never round-trip through apply/diff safely
-# (QA 2026-07-17 F1).
-_PAGE_BANNER_RE = re.compile(r"^> \*\*Page (\d+) of (\d+)\*\*[^\n]*\n+(?:---\n+)?")
-_PAGE_FOOTER_RE = re.compile(r"\n+---\n+> \*\*Continues on page (\d+) of (\d+)\.\*\*[^\n]*\s*$")
-_APPENDIX_POINTER_RE = re.compile(r"\n+---\n+> \*\*Appendix available\.\*\*[^\n]*\s*$")
-
-# CriticMarkup open tokens; their presence in a round-trip text file means the
-# text was extracted in the default markup view (apply/diff compare against
-# the CLEAN view, so markup tokens would be diffed INTO the document as prose).
-_CRITICMARKUP_TOKENS = ("{++", "{--", "{>>", "{==")
-
-# Guardrail for the text-diff path: refuse to silently delete the majority of
-# a document. 2000 chars ≈ one page of prose; above that, losing half the
-# document is almost never intentional. Short documents matter too
-# (QA 2026-07-19 v8 F-12): below the threshold the guard still arms, at a
-# higher 75% floor so that deliberately halving a small draft stays a
-# one-command workflow while near-total truncation requires the explicit flag.
-_MAJOR_DELETION_MIN_ORIGINAL_CHARS = 2000
-_MAJOR_DELETION_RATIO = 0.5
-_MAJOR_DELETION_RATIO_SMALL_DOC = 0.25
-
-
-def _strip_page_chrome(text: str) -> "tuple[str, int | None, int | None]":
-    """
-    Strips extract's page banner/footer/appendix-pointer chrome from a
-    round-trip text file. Returns (stripped_text, page, total_pages);
-    page/total_pages are None when the text carries no multi-page markers.
-    """
-    page = total = None
-    banner = _PAGE_BANNER_RE.match(text)
-    if banner:
-        page, total = int(banner.group(1)), int(banner.group(2))
-        text = text[banner.end() :]
-    # The appendix pointer trails the footer, so strip it first.
-    text = _APPENDIX_POINTER_RE.sub("", text)
-    footer = _PAGE_FOOTER_RE.search(text)
-    if footer:
-        if page is None:
-            page = int(footer.group(1)) - 1
-        if total is None:
-            total = int(footer.group(2))
-        text = text[: footer.start()]
-    return text, page, total
-
-
 def _load_roundtrip_text(path: Path, original: Path, command: str) -> str:
     """
     Loads the modified-text file for the apply/diff text paths, stripping
@@ -313,8 +290,8 @@ def _load_roundtrip_text(path: Path, original: Path, command: str) -> str:
 
     if any(tok in text for tok in _CRITICMARKUP_TOKENS):
         print(
-            f"❌ '{path.name}' contains CriticMarkup tokens ({{++..++}}, {{--..--}}, {{==..==}}, "
-            "{>>..<<}), which means it was extracted in the default markup view. "
+            f"❌ '{path.name}' contains CriticMarkup tokens ({{++..++}}, {{--..--}}, {{~~..~>..~~}}, "
+            "{==..==}, {>>..<<}), which means it was extracted in the default markup view. "
             f"`{command}` compares text against the document's CLEAN view, so markup-view text "
             "would be diffed into the document as literal prose (including reviewer names and "
             "change IDs).\n"
@@ -395,34 +372,6 @@ def _read_text_file(path: Path) -> str:
     return _EXTRACT_HEADER_RE.sub("", text, count=1)
 
 
-# OS accounts that identify a machine, not a person. Tracked changes signed
-# "root" or "Administrator" are customer-visible defects in outbound legal
-# documents (QA 2026-07-19 v8 F-11).
-_MACHINE_ACCOUNT_NAMES = {"root", "admin", "administrator", "system", "daemon", "nobody"}
-
-
-def _default_author() -> str:
-    """
-    Resolution order for the tracked-changes author when --author is omitted:
-
-      1. ADEU_AUTHOR environment variable (explicit configuration for
-         noninteractive/agent environments);
-      2. the OS username, unless it names a machine account (root,
-         Administrator, ...) rather than a person;
-      3. the neutral engine default "Adeu AI".
-    """
-    env_author = (os.environ.get("ADEU_AUTHOR") or "").strip()
-    if env_author:
-        return env_author
-    try:
-        user = getpass.getuser()
-    except Exception:
-        return "Adeu AI"
-    if not user or user.strip().lower() in _MACHINE_ACCOUNT_NAMES:
-        return "Adeu AI"
-    return user
-
-
 # One-line usage reference per change type, shown when a batch fails schema
 # validation. These are otherwise only discoverable via the MCP schema.
 _CHANGE_TYPE_REFERENCE = (
@@ -434,7 +383,9 @@ _CHANGE_TYPE_REFERENCE = (
     '  reply      — {"type": "reply", "target_id": "Com:N", "text": "..."}\n'
     '  insert_row — {"type": "insert_row", "target_text": "...", "cells": ["...", "..."]}'
     ' (optional: position "above"/"below")\n'
-    '  delete_row — {"type": "delete_row", "target_text": "..."}'
+    '  delete_row — {"type": "delete_row", "target_text": "..."}\n'
+    '  set_field  — {"type": "set_field", "field": "CC:4"|tag|alias, "value": "..."}'
+    " (optional: match_mode, comment; run `adeu extract --mode fields` to list fields)"
 )
 
 
@@ -455,7 +406,9 @@ def _extract_schema_failures(exc: "ValidationError") -> tuple[list[tuple[int, st
         elif err_type == "union_tag_invalid":
             tag = err.get("ctx", {}).get("tag", "unknown")
             reason = f"has an unknown type: '{tag}'."
-            msg = f"{item_no} has an unknown type: '{tag}'."
+            if has_fused_json_marker(str(tag)):
+                reason = f"has an unknown type: '{tag}'. {FUSED_JSON_HINT}"
+            msg = f"{item_no} {reason}"
         elif err_type == "missing":
             variant = f" (type '{loc[1]}')" if len(loc) >= 2 else ""
             field = loc[-1] if len(loc) >= 3 else "a required field"
@@ -479,16 +432,6 @@ def _extract_schema_failures(exc: "ValidationError") -> tuple[list[tuple[int, st
     failed: list[tuple[int, str]] = [(idx, "; ".join(reasons)) for idx, reasons in reasons_by_idx.items()]
     prose = "The changes file is not a valid edit batch:\n" + "\n".join(lines) + "\n\n" + _CHANGE_TYPE_REFERENCE
     return failed, prose
-
-
-def _format_batch_validation_error(exc: "ValidationError") -> str:
-    """
-    Renders a Pydantic ValidationError on the changes batch as a plain-language
-    message. The raw dump leaks discriminated-union internals and a pydantic.dev
-    URL without ever naming the valid 'type' values (QA M5).
-    """
-    _, prose = _extract_schema_failures(exc)
-    return prose
 
 
 def _load_batch_from_json(path: Path) -> List[DocumentChange]:
@@ -580,6 +523,46 @@ def _warn_ignored_extract_flags(args) -> None:
             print(f"⚠️  --changes-author is ignored with --mode {args.mode} (changes mode only).", file=sys.stderr)
         if getattr(args, "changes_offset", 0) != 0:
             print(f"⚠️  --changes-offset is ignored with --mode {args.mode} (changes mode only).", file=sys.stderr)
+    if args.mode != "fields":
+        if getattr(args, "fields_offset", 0) != 0:
+            print(f"⚠️  --fields-offset is ignored with --mode {args.mode} (fields mode only).", file=sys.stderr)
+    elif args.page is not None:
+        # spec-fields-ledger §1: `page` does not apply to the ledger, which
+        # paginates by entry count via --fields-offset instead.
+        print(
+            "⚠️  --page is ignored with --mode fields (use --fields-offset to paginate the ledger).",
+            file=sys.stderr,
+        )
+
+
+def _fields_banner_for(doc, args, no_chrome: bool) -> "str | None":
+    """The A1.9 banner for a CLI full-view read, or None.
+
+    Returns None when there is nothing to say (no controls, no protection) so a
+    plain document gains zero noise, and under `no_chrome`, which exists so the
+    projection can round-trip.
+
+    Counts come from `field_summary`, which walks the DOM only — this runs on
+    the hot read path and must not pay for value previews nothing renders.
+    """
+    if no_chrome:
+        return None
+    try:
+        from adeu.fields import banner_for_document, banner_for_path
+
+        live = getattr(args, "live", False)
+        target = "Active Document" if live else str(args.input)
+        hint = f" \u00b7 run `adeu extract {target} --mode fields` for the field ledger"
+        if doc is not None:
+            return banner_for_document(doc, hint=hint)
+        if live or not getattr(args, "input", None):
+            return None
+        # Not loaded on this path: go through the stat-keyed memo rather than
+        # re-opening the package on every read.
+        return banner_for_path(str(args.input), hint=hint)
+    except Exception:
+        # Advisory chrome. A malformed settings part must not fail the read.
+        return None
 
 
 def handle_extract(args):
@@ -596,25 +579,100 @@ def handle_extract(args):
         # that aliases the input DOCX.
         protected = [(args.input, "input DOCX")] if args.input else []
         _guard_text_output_path(args.output, protected)
-    doc = _load_docx_or_exit(args.input)
 
-    # Perform extraction
-    needs_appendix = args.mode == "appendix"
-    needs_offsets = args.mode == "outline"
+    text: str = ""
+    paragraph_offsets: Any = None
+    cached_outline_nodes: Any = None
+    cached_comments_data: Any = None
+    cached_existing_change_ids: Any = None
+    doc: Any = None
+    use_cache = not args.live and not getattr(args, "debug", False)
 
-    from adeu.ingest import _extract_text_from_doc
+    if args.live:
+        if sys.platform != "win32":
+            _cli_error("unsupported", "--live is only supported on Windows.")
+        from adeu.mcp_components.tools.live_word import _read_active_word_document_core
 
-    extract_result = _extract_text_from_doc(
-        doc,
-        clean_view=args.clean_view,
-        include_appendix=needs_appendix,
-        return_paragraph_offsets=needs_offsets,
-    )
-    if needs_offsets:
-        text, paragraph_offsets = extract_result
+        text, doc, paragraph_offsets = _read_active_word_document_core(clean_view=args.clean_view)
     else:
-        text = extract_result
-        paragraph_offsets = None
+        if not args.input:
+            _cli_error("invalid_input", "Must provide input file", exit_code=2)
+
+        input_path = Path(args.input)
+        _require_input_file(input_path)
+
+        needs_appendix = args.mode == "appendix"
+        needs_offsets = args.mode == "outline"
+        needs_changes = args.mode == "changes"
+
+        from adeu.disk_cache import disk_projection_cache
+
+        cached_view = disk_projection_cache.get(input_path, clean_view=args.clean_view) if use_cache else None
+
+        # A cached view serves a read only when it carries EVERY field that mode
+        # renders. A partial entry falls through to a cold read, which merges the
+        # missing fields into the same view (disk_cache.put merges per view).
+        required: tuple[str, ...]
+        if needs_appendix:
+            required = ("text_with_appendix",)
+        elif needs_offsets:
+            required = ("base_text", "outline_nodes")
+        elif needs_changes:
+            required = ("base_text", "comments_data", "existing_change_ids")
+        else:
+            required = ("base_text",)
+
+        hit = cached_view is not None and all(cached_view.get(field) is not None for field in required)
+
+        if hit and cached_view is not None:
+            text = str(cached_view["text_with_appendix" if needs_appendix else "base_text"])
+            cached_outline_nodes = cached_view.get("outline_nodes")
+            cached_comments_data = cached_view.get("comments_data")
+            cached_existing_change_ids = cached_view.get("existing_change_ids")
+        else:
+            doc = _load_docx_or_exit(input_path)
+
+            from adeu.ingest import _extract_text_from_doc
+
+            extract_result = _extract_text_from_doc(
+                doc,
+                clean_view=args.clean_view,
+                include_appendix=needs_appendix,
+                return_paragraph_offsets=needs_offsets,
+            )
+            if needs_offsets:
+                assert isinstance(extract_result, tuple)
+                text = str(extract_result[0])
+                paragraph_offsets = extract_result[1]
+            else:
+                assert isinstance(extract_result, str)
+                text = extract_result
+
+            # The cold path stays as lazy as the uncached CLI was: each mode pays
+            # only for the fields it renders. Populating outline, comments and the
+            # redline engine for every read cost uncached reads 25-69% (QA).
+            view_data: Dict[str, Any] = {}
+            if needs_appendix:
+                view_data["text_with_appendix"] = text
+            else:
+                view_data["base_text"] = text
+            if needs_offsets:
+                cached_outline_nodes = _extract_outline_nodes(doc, text, paragraph_offsets)
+                view_data["outline_nodes"] = cached_outline_nodes
+            if needs_changes:
+                from adeu.redline.comments import CommentsManager
+
+                cached_comments_data = CommentsManager(doc).extract_comments_data()
+                view_data["comments_data"] = cached_comments_data
+                try:
+                    engine = _open_redline_engine_or_exit(input_path)
+                    cached_existing_change_ids = sorted(engine._existing_change_ids())
+                    view_data["existing_change_ids"] = cached_existing_change_ids
+                except Exception:
+                    pass
+
+            if use_cache:
+                disk_projection_cache.put(input_path, args.clean_view, view_data)
 
     from adeu.mcp_components._response_builders import (
         build_appendix_response,
@@ -674,6 +732,8 @@ def handle_extract(args):
                 assert isinstance(page_val, int)
                 page_num = page_val
 
+        no_chrome = getattr(args, "no_chrome", False)
+
         if getattr(args, "search_query", None):
             if args.page is not None:
                 try:
@@ -692,35 +752,55 @@ def handle_extract(args):
                 getattr(args, "search_regex", False),
                 not getattr(args, "search_case_insensitive", False),
                 args.page,
-                str(args.input),
+                "Active Document" if args.live else str(args.input),
                 is_cli=True,
                 max_matches=getattr(args, "max_matches", 20),
                 match_offset=getattr(args, "match_offset", 0),
                 full_paragraph=getattr(args, "full_paragraph", False),
+                no_chrome=no_chrome,
             )
         elif args.mode == "outline":
             res = build_outline_response(
                 doc,
                 text,
-                str(args.input),
+                "Active Document" if args.live else str(args.input),
                 outline_max_level=args.outline_max_level,
                 outline_verbose=args.outline_verbose,
                 paragraph_offsets=paragraph_offsets,
                 is_cli=True,
+                outline_nodes=cached_outline_nodes,
+                no_chrome=no_chrome,
             )
+        elif args.mode == "fields":
+            from adeu.mcp_components._response_builders import build_fields_response
+
+            if doc is None:
+                doc = _load_docx_or_exit(input_path)
+            res = build_fields_response(
+                doc,
+                text,
+                str(input_path),
+                offset=args.fields_offset,
+                is_cli=True,
+            )
+
         elif args.mode == "changes":
             from adeu.mcp_components._response_builders import build_changes_response
             from adeu.redline.comments import CommentsManager
 
-            comments_data = CommentsManager(doc).extract_comments_data() if doc is not None else None
-            existing_change_ids = None
-            if not getattr(args, "live", False) and getattr(args, "input", None):
+            comments_data = (
+                cached_comments_data
+                if cached_comments_data is not None
+                else (CommentsManager(doc).extract_comments_data() if doc is not None else None)
+            )
+            existing_change_ids = set(cached_existing_change_ids) if cached_existing_change_ids is not None else None
+            if existing_change_ids is None and doc is not None and getattr(args, "input", None):
                 try:
                     engine = _open_redline_engine_or_exit(Path(args.input))
                     existing_change_ids = set(engine._existing_change_ids())
                 except Exception:
                     pass
-            elif getattr(args, "live", False) and doc is not None:
+            elif existing_change_ids is None and getattr(args, "live", False) and doc is not None:
                 try:
                     from io import BytesIO
 
@@ -734,13 +814,14 @@ def handle_extract(args):
 
             res = build_changes_response(
                 text,
-                str(args.input),
+                "Active Document" if args.live else str(args.input),
                 comments_data=comments_data,
                 author_filter=getattr(args, "changes_author", None),
                 page=args.page,
                 offset=getattr(args, "changes_offset", 0),
                 is_cli=True,
                 existing_change_ids=existing_change_ids,
+                no_chrome=no_chrome,
             )
         elif is_page_range:
             from adeu.mcp_components._response_builders import build_page_range_response
@@ -749,15 +830,17 @@ def handle_extract(args):
                 text,
                 range_start,
                 range_end,
-                str(args.input),
+                "Active Document" if args.live else str(args.input),
                 is_cli=True,
+                no_chrome=no_chrome,
             )
         elif args.mode == "appendix":
             res = build_appendix_response(
                 text,
                 page_num,
-                str(args.input),
+                "Active Document" if args.live else str(args.input),
                 is_cli=True,
+                no_chrome=no_chrome,
             )
         elif want_all_pages:
             from adeu.payloads import response_budget_limit
@@ -772,12 +855,28 @@ def handle_extract(args):
             ):
                 from adeu.mcp_components._response_builders import build_budget_guard_message
 
+                # The refusal carries an L1 heading map. This is the only place a
+                # non-outline mode needs it, so it is computed here — on a warm
+                # read the nodes come from the cache instead of a second parse.
+                guard_outline_nodes = cached_outline_nodes
+                if guard_outline_nodes is None and not args.live:
+                    if doc is None:
+                        doc = _load_docx_or_exit(Path(args.input))
+                    guard_outline_nodes = _extract_outline_nodes(doc, text, paragraph_offsets)
+                    if use_cache:
+                        from adeu.disk_cache import disk_projection_cache
+
+                        disk_projection_cache.put(
+                            Path(args.input), args.clean_view, {"outline_nodes": guard_outline_nodes}
+                        )
+
                 _cli_error(
                     "response_budget_exceeded",
                     build_budget_guard_message(
                         text,
-                        str(args.input),
+                        "Active Document" if args.live else str(args.input),
                         doc=doc,
+                        outline_nodes=guard_outline_nodes,
                         paragraph_offsets=paragraph_offsets,
                         is_cli=True,
                     ),
@@ -788,14 +887,18 @@ def handle_extract(args):
 
             res = build_full_document_response(
                 text,
-                str(args.input),
+                "Active Document" if args.live else str(args.input),
+                no_chrome=no_chrome,
+                fields_banner=_fields_banner_for(doc, args, no_chrome),
             )
         else:
             res = build_paginated_response(
                 text,
                 page_num,
-                str(args.input),
+                "Active Document" if args.live else str(args.input),
                 is_cli=True,
+                no_chrome=no_chrome,
+                fields_banner=_fields_banner_for(doc, args, no_chrome),
             )
 
         if isinstance(res.content, list):
@@ -813,7 +916,7 @@ def handle_extract(args):
         _cli_error("invalid_input", f"Error: {e}", exit_code=2 if isinstance(e, BuilderError) else 1)
         raise AssertionError("unreachable") from None
 
-    json_output = json.dumps(res.structured_content or {}) if args.json else None
+    json_output = json.dumps(res.structured_content or {}, ensure_ascii=False) if args.json else None
 
     if args.output:
         # -o redirects the PRIMARY payload: the JSON object under --json, the
@@ -825,6 +928,28 @@ def handle_extract(args):
         print(json_output)
     else:
         print(output_text)
+
+
+def _extract_outline_nodes(doc, projected_text: str, paragraph_offsets=None):
+    """
+    Computes the heading map for `projected_text` — the cacheable outline nodes.
+
+    Shared by outline mode and the budget guard refusal so both cache (and read
+    back) exactly the same nodes; the fast and legacy extract_outline paths are
+    pinned as equivalent by tests/test_outline_fast_equivalence.py.
+    """
+    from adeu.mcp_components._response_builders import paginate, split_structural_appendix
+    from adeu.outline import extract_outline
+
+    body, _appendix = split_structural_appendix(projected_text)
+    pagination = paginate(body, "")
+    return extract_outline(
+        doc,
+        body,
+        pagination.body_pages,
+        pagination.body_page_offsets,
+        paragraph_offsets=paragraph_offsets,
+    )
 
 
 def _load_docx_or_exit(path: Path):
@@ -853,7 +978,7 @@ def _load_docx_or_exit(path: Path):
         from adeu.utils.docx import strip_bom_from_docx_bytes
 
         sanitized_bytes = strip_bom_from_docx_bytes(stream.getvalue())
-        from docx import Document as load_document
+        from adeu.utils.opc import load_document
 
         return load_document(BytesIO(sanitized_bytes))
     except Exception as e:
@@ -867,17 +992,23 @@ def _load_docx_or_exit(path: Path):
         raise
 
 
-def _open_redline_engine_or_exit(path: Path, author: "str | None" = None) -> RedlineEngine:
+def _open_redline_engine_or_exit(
+    path: Path,
+    author: "str | None" = None,
+    terse_errors: bool = False,
+    gate_overrides: "dict | None" = None,
+) -> RedlineEngine:
     """Opens a RedlineEngine on `path` through the single shared error path."""
     _require_input_file(path)
     import zipfile
 
+    gates = gate_overrides or {}
     try:
         with open(path, "rb") as f:
             stream = BytesIO(f.read())
         if author is not None:
-            return RedlineEngine(stream, author=author)
-        return RedlineEngine(stream)
+            return RedlineEngine(stream, author=author, terse_errors=terse_errors, **gates)
+        return RedlineEngine(stream, terse_errors=terse_errors, **gates)
     except SystemExit:
         raise
     except Exception as e:
@@ -960,8 +1091,13 @@ def handle_diff(args):
         edits = make_edits_self_contained(text_edits, text_orig)
 
     if args.json:
-        output_data = [edit.model_dump(exclude={"_match_start_index"}) for edit in edits]
-        json_output = json.dumps(output_data, indent=2)
+        output_data = []
+        for edit in edits:
+            d = edit.model_dump(exclude_defaults=True)
+            if "comment" in d and isinstance(d["comment"], str) and d["comment"].startswith("Diff:"):
+                del d["comment"]
+            output_data.append({"type": edit.type, **d})
+        json_output = json.dumps(output_data, separators=(",", ":"), ensure_ascii=False)
         if getattr(args, "output", None):
             _write_output_or_exit(args.output, json_output)
             print(f"Diff JSON saved to {args.output}", file=sys.stderr)
@@ -999,12 +1135,31 @@ def handle_diff(args):
                 print(line)
 
 
-def _normalize_virtual_projection_text(text: str) -> str:
-    """
-    Normalizes virtual Markdown projection chrome (such as heading prefixes)
-    so post-apply verification evaluates pure text equivalence.
-    """
-    return re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)
+def _print_detailed_edit_reports(stats: Dict[str, Any]) -> None:
+    if stats.get("edits"):
+        print("\nDetailed Edit Reports:", file=sys.stderr)
+        for i, report in enumerate(stats["edits"]):
+            status_indicator = "✅ [applied]" if report["status"] == "applied" else "❌ [failed]"
+            print(f"Edit {i + 1} {status_indicator}:", file=sys.stderr)
+            if "target_text" in report:
+                print(f"  Target: '{report['target_text']}'", file=sys.stderr)
+            edit_type = report.get("type", "modify")
+            if edit_type == "delete_row":
+                print("  Deleted row", file=sys.stderr)
+            elif "new_text" in report:
+                label = "Inserted row" if edit_type == "insert_row" else "New text"
+                print(f"  {label}: '{report['new_text']}'", file=sys.stderr)
+            if report.get("warning"):
+                print(f"  Warning: {report['warning']}", file=sys.stderr)
+            if report.get("error"):
+                print(f"  Error: {report['error']}", file=sys.stderr)
+            if report.get("critic_markup"):
+                print(
+                    f"  Preview (CriticMarkup): {report['critic_markup']}",
+                    file=sys.stderr,
+                )
+            if report.get("clean_text"):
+                print(f"  Clean text preview: {report['clean_text']}", file=sys.stderr)
 
 
 def handle_apply(args):
@@ -1020,6 +1175,21 @@ def handle_apply(args):
             f"--author contains control character(s) ({author_ctrl}) that cannot be "
             "stored in a DOCX. Remove them and re-run.",
         )
+
+    if args.live:
+        # Live Word applies each edit through COM with no partial-batch
+        # bookkeeping, so --partial cannot be honoured here. Refuse it up
+        # front instead of silently ignoring the flag, mirroring how
+        # text-file input rejects it below.
+        if getattr(args, "partial", False):
+            _cli_error("invalid_input", "--partial is not supported for live Word mode", exit_code=2)
+        if args.changes is None and args.original is not None:
+            # Shift positional arguments if only one is provided
+            args.changes = args.original
+            args.original = None
+
+    if not args.changes:
+        _cli_error("invalid_input", "Must provide changes file.", exit_code=2)
 
     _require_docx_output(args.output)
 
@@ -1039,49 +1209,85 @@ def handle_apply(args):
                 file=sys.stderr,
             )
     else:
+        if getattr(args, "partial", False):
+            _cli_error(
+                "invalid_input", "--partial is only supported with JSON batch input, not text files.", exit_code=2
+            )
         if not args.json:
             print(f"Calculating diff from text file {args.changes}...", file=sys.stderr)
-        doc = _load_docx_or_exit(args.original)
+        if args.live:
+            if sys.platform != "win32":
+                _cli_error("unsupported", "--live is only supported on Windows.")
+            from adeu.mcp_components.tools.live_word import (
+                _read_active_word_document_core,
+            )
 
-        from adeu.ingest import _extract_text_from_doc
+            text_orig, _, _ = _read_active_word_document_core(clean_view=False)
+        else:
+            if not args.original:
+                _cli_error("invalid_input", "Must provide original file", exit_code=2)
+            doc = _load_docx_or_exit(args.original)
 
-        # Canonical baseline for text-file input: the CLEAN (accepted)
-        # view. Extract with --clean-view (and --page all on multi-page
-        # documents) to produce a file this path can round-trip.
-        text_orig = _extract_text_from_doc(doc, clean_view=True, include_appendix=False)
+            # Canonical baseline for text-file input: the CLEAN (accepted)
+            # view. Extract with --clean-view (and --page all on multi-page
+            # documents) to produce a file this path can round-trip.
+            text_orig = _extract_clean_text_from_doc(doc)
 
-        text_mod = _load_roundtrip_text(args.changes, args.original, "apply")
+            text_mod = _load_roundtrip_text(args.changes, args.original, "apply")
 
-        guard_ratio = (
-            _MAJOR_DELETION_RATIO
-            if len(text_orig) >= _MAJOR_DELETION_MIN_ORIGINAL_CHARS
-            else _MAJOR_DELETION_RATIO_SMALL_DOC
-        )
-        if not args.allow_major_deletions and len(text_orig) > 0 and len(text_mod) < guard_ratio * len(text_orig):
-            pct = 100 - int(100 * len(text_mod) / len(text_orig))
+            try:
+                check_major_deletions(
+                    text_orig,
+                    text_mod,
+                    allow_major_deletions=args.allow_major_deletions,
+                    source_name=args.changes.name,
+                )
+            except ValueError as e:
+                print(f"❌ {e}", file=sys.stderr)
+                sys.exit(1)
+
+            from adeu.diff import generate_edits_via_paragraph_alignment
+
+            changes.extend(generate_edits_via_paragraph_alignment(text_orig, text_mod))
+            verify_against = text_mod
+
+    if args.live:
+        if sys.platform != "win32":
+            _cli_error("unsupported", "--live is only supported on Windows.")
+        from adeu.mcp_components.tools.live_word import _process_active_word_batch_core
+
+        if not args.json:
+            print(f"Applying {len(changes)} changes to live Word document...", file=sys.stderr)
+        stats = _process_active_word_batch_core(changes, args.author)
+        if args.json:
+            print(json.dumps(stats, ensure_ascii=False))
+        else:
             print(
-                f"❌ '{args.changes.name}' is ~{pct}% shorter than the document's clean text "
-                f"({len(text_mod):,} vs {len(text_orig):,} characters). Applying it would "
-                "delete the majority of the document as tracked deletions.\n"
-                "   If the file is a partial extract, re-extract the ENTIRE document with "
-                "`--page all --clean-view` and edit that.\n"
-                "   If the mass deletion is intentional, re-run with --allow-major-deletions.",
+                f"✅ Live Word Batch complete. Applied: {stats['applied']}, Failed: {stats['failed']}",
                 file=sys.stderr,
             )
+        if stats["failed"] > 0:
             sys.exit(1)
+        return
 
-        from adeu.diff import generate_edits_via_paragraph_alignment
-
-        changes.extend(generate_edits_via_paragraph_alignment(text_orig, text_mod))
-        verify_against = text_mod
-
+    if not args.original:
+        _cli_error("invalid_input", "Must provide original file", exit_code=2)
     _require_input_file(args.original)
 
     if not args.json:
         print(f"Applying {len(changes)} changes to {args.original.name}...", file=sys.stderr)
-    engine = _open_redline_engine_or_exit(args.original, author=args.author)
+    engine = _open_redline_engine_or_exit(
+        args.original,
+        author=args.author,
+        terse_errors=getattr(args, "terse_errors", False),
+        gate_overrides={
+            "ignore_control_locks": getattr(args, "ignore_control_locks", False),
+            "ignore_document_protection": getattr(args, "ignore_document_protection", False),
+            "allow_untracked_writes": getattr(args, "allow_untracked_writes", False),
+        },
+    )
     try:
-        stats = engine.process_batch(changes)
+        stats = engine.process_batch(changes, partial=getattr(args, "partial", False))
     except BatchValidationError as e:
         if args.json:
             env = failure_envelope(
@@ -1099,14 +1305,17 @@ def handle_apply(args):
             print(BATCH_RECOVERY_PROTOCOL, file=sys.stderr)
         sys.exit(1)
 
-    # A batch with ANY skipped action/edit is a failed batch: writing an
-    # output anyway (and calling it "Batch complete") made pipelines treat an
-    # unmodified copy as success (QA 2026-07-18 M2). Validation failures are
-    # already transactional (BatchValidationError above); this covers
-    # apply-stage skips (overlaps, unresolvable anchors).
-    batch_failed = stats["actions_skipped"] > 0 or stats["edits_skipped"] > 0
+    is_partial = (stats.get("status") == "partial" or bool(stats.get("failed"))) and getattr(args, "partial", False)
+    applied_count = stats.get("edits_applied", 0) + stats.get("actions_applied", 0)
 
-    output_path = None
+    if is_partial and applied_count > 0:
+        batch_failed = False
+    elif getattr(args, "partial", False) and applied_count == 0 and len(changes) > 0:
+        batch_failed = True
+    else:
+        batch_failed = stats["actions_skipped"] > 0 or stats["edits_skipped"] > 0
+
+    output_path: "Path | None" = None
     if not batch_failed:
         output_path = args.output
         if not output_path:
@@ -1127,29 +1336,13 @@ def handle_apply(args):
     verification_error = None
     unverified_path = None
     if verify_against is not None and not batch_failed:
-        from adeu.ingest import _extract_text_from_doc
+        verified, divergence = verify_clean_text(engine.doc, verify_against)
 
-        final_clean = _extract_text_from_doc(engine.doc, clean_view=True, include_appendix=False)
-        expected = verify_against.strip()
-        actual = final_clean.strip()
-
-        actual_norm = _normalize_virtual_projection_text(actual)
-        expected_norm = _normalize_virtual_projection_text(expected)
-
-        if actual_norm != expected_norm:
-            div = next(
-                (k for k, (a, b) in enumerate(zip(actual_norm, expected_norm, strict=False)) if a != b),
-                min(len(actual_norm), len(expected_norm)),
-            )
+        if not verified:
             assert output_path is not None
             unverified_path = output_path.with_name(f"{output_path.stem}.unverified.docx")
             verification_error = (
-                "Post-apply verification failed: the applied document's clean text does not match "
-                f"the supplied text (first divergence at character {div}: "
-                f"applied reads {actual_norm[div : div + 40]!r}, supplied text reads "
-                f"{expected_norm[div : div + 40]!r}). The document structure could not fully realize "
-                "the requested text (e.g. headings or table cells cannot be deleted via text "
-                f"replacement). Nothing was written to '{output_path}'; a diagnostic copy was "
+                f"{divergence} Nothing was written to '{output_path}'; a diagnostic copy was "
                 f"kept at '{unverified_path}' — it is NOT the requested document."
             )
             stats["verified"] = False
@@ -1189,7 +1382,7 @@ def handle_apply(args):
         stats = shrink_batch_stats(stats)
 
     if args.json:
-        print(json.dumps(stats))
+        print(json.dumps(stats, ensure_ascii=False))
     else:
         if batch_failed:
             print(
@@ -1204,7 +1397,27 @@ def handle_apply(args):
                 file=sys.stderr,
             )
         else:
+            if is_partial:
+                failed_items = stats.get("failed", [])
+                total_c = len(changes)
+                failed_cnt = (
+                    len(failed_items)
+                    if failed_items
+                    else (stats.get("edits_skipped", 0) + stats.get("actions_skipped", 0))
+                )
+                print(
+                    f"PARTIAL: applied {applied_count} of {total_c} changes. {failed_cnt} failed:",
+                    file=sys.stderr,
+                )
+                for item in failed_items:
+                    print(f"  - Change #{item['index'] + 1} Failed: {item['reason']}", file=sys.stderr)
             print(f"Batch complete. Saved to: {output_path}", file=sys.stderr)
+            if stats.get("overrides_note"):
+                # spec-gates §5. stderr, like the impersonation warning: it is
+                # a note about how the batch ran, not part of the result.
+                print(f"⚠️  {stats['overrides_note']}", file=sys.stderr)
+            if stats.get("author_impersonation_warning"):
+                print(f"⚠️  {stats['author_impersonation_warning']}", file=sys.stderr)
 
         occurrences = stats.get("occurrences_modified", 0)
         occ_text = f" ({occurrences} occurrences)" if occurrences > stats["edits_applied"] else ""
@@ -1216,33 +1429,7 @@ def handle_apply(args):
             file=sys.stderr,
         )
 
-        if stats.get("edits"):
-            print("\nDetailed Edit Reports:", file=sys.stderr)
-            for i, report in enumerate(stats["edits"]):
-                status_indicator = "✅ [applied]" if report["status"] == "applied" else "❌ [failed]"
-                print(f"Edit {i + 1} {status_indicator}:", file=sys.stderr)
-                if "target_text" in report:
-                    print(f"  Target: '{report['target_text']}'", file=sys.stderr)
-                edit_type = report.get("type", "modify")
-                if edit_type == "delete_row":
-                    print("  Deleted row", file=sys.stderr)
-                elif "new_text" in report:
-                    # Key presence, not truthiness: new_text '' is a legitimate
-                    # deletion and must still be shown. A minimal report omits
-                    # the key entirely (it echoes the caller's own input).
-                    label = "Inserted row" if edit_type == "insert_row" else "New text"
-                    print(f"  {label}: '{report['new_text']}'", file=sys.stderr)
-                if report.get("warning"):
-                    print(f"  Warning: {report['warning']}", file=sys.stderr)
-                if report.get("error"):
-                    print(f"  Error: {report['error']}", file=sys.stderr)
-                if report.get("critic_markup"):
-                    print(
-                        f"  Preview (CriticMarkup): {report['critic_markup']}",
-                        file=sys.stderr,
-                    )
-                if report.get("clean_text"):
-                    print(f"  Clean text preview: {report['clean_text']}", file=sys.stderr)
+        _print_detailed_edit_reports(stats)
 
         if stats.get("skipped_details"):
             print("\n" + batch_details_header(stats["skipped_details"]), file=sys.stderr)
@@ -1254,20 +1441,33 @@ def handle_apply(args):
             print(f"\n❌ {verification_error}", file=sys.stderr)
         sys.exit(1)
 
-    if stats["actions_skipped"] > 0 or stats["edits_skipped"] > 0:
+    if (stats["actions_skipped"] > 0 or stats["edits_skipped"] > 0) and not (is_partial and applied_count > 0):
         sys.exit(1)
 
 
 def handle_accept_all(args: argparse.Namespace):
     """
-    Accepts all tracked changes and removes all comments, producing a
-    finalized clean document. Mirrors the `accept_all_changes` MCP tool.
+    Accepts all tracked changes and (by default) removes all comments,
+    producing a finalized clean document. Mirrors the `accept_all_changes` MCP
+    tool — including its default.
+
+    The default DELIBERATELY differs from the library API
+    (`accept_all_revisions(remove_comments=False)`): this command produces a
+    distributable artifact, and shipping a counterparty a file that still
+    carries internal review notes is the more expensive failure
+    (QA_ISSUES_DISCOVERED #10). What
+    BUG_comment_threading_anchoring_and_typography.md B2 correctly objected to
+    was that the inversion was SILENT and unavoidable — `--no-remove-comments`
+    now exists, `--help` states the default, and every deleted comment is
+    reported by id and author.
     """
     _set_json_mode(args.json)
     _require_docx_output(args.output)
     engine = _open_redline_engine_or_exit(args.input)
 
-    stats = engine.accept_all_revisions(remove_comments=True)
+    remove_comments = getattr(args, "remove_comments", True)
+    stats = engine.accept_all_revisions(remove_comments=remove_comments)
+    removed_comment_notes = list(engine.removed_comment_notes)
 
     output_path = args.output
     if not output_path:
@@ -1284,10 +1484,17 @@ def handle_accept_all(args: argparse.Namespace):
             "accepted_deletions": stats.get("accepted_deletions", 0),
             "accepted_formatting": stats.get("accepted_formatting", 0),
             "removed_comments": stats.get("removed_comments", 0),
+            "removed_comment_details": removed_comment_notes,
         }
-        print(json.dumps(result))
+        print(json.dumps(result, ensure_ascii=False))
     else:
         print(f"✅ Accepted all changes. Saved to: {output_path}", file=sys.stderr)
+        if removed_comment_notes:
+            # Deleting somebody else's review note is never a footnote.
+            print(
+                "⚠️  Comments deleted: " + ", ".join(removed_comment_notes),
+                file=sys.stderr,
+            )
 
 
 def handle_markup(args):
@@ -1422,7 +1629,7 @@ def handle_markup(args):
         }
         if to_stdout:
             json_result["content"] = result
-        print(json.dumps(json_result))
+        print(json.dumps(json_result, ensure_ascii=False))
         # --json promises machine-clean streams: no decorative success/stats
         # lines on stderr (QA 2026-07-19 v8 F-08).
         return
@@ -1732,7 +1939,7 @@ def _main_impl():
     subparsers = parser.add_subparsers(dest="command", required=True, help="Subcommands")
 
     p_extract = subparsers.add_parser("extract", help="Extract raw text from a DOCX file")
-    p_extract.add_argument("input", type=Path, help="Input DOCX file")
+    p_extract.add_argument("input", type=Path, nargs="?", help="Input DOCX file")
     p_extract.add_argument("-o", "--output", type=Path, help="Output file ('-' or omitted: stdout)")
     p_extract.add_argument(
         "--force",
@@ -1747,11 +1954,12 @@ def _main_impl():
     p_extract.add_argument(
         "--mode",
         type=str,
-        choices=["full", "outline", "appendix", "changes"],
+        choices=["full", "outline", "appendix", "changes", "fields"],
         default="full",
         help=(
             "Extraction mode: 'full' for body text, 'outline' for headings, "
-            "'appendix' for defined terms, 'changes' for tracked change ledger."
+            "'appendix' for defined terms, 'changes' for tracked change ledger, "
+            "'fields' for the content-control ledger."
         ),
     )
     p_extract.add_argument(
@@ -1765,6 +1973,12 @@ def _main_impl():
         type=int,
         default=0,
         help="For mode='changes' only: entry offset for paginating tracked changes ledger.",
+    )
+    p_extract.add_argument(
+        "--fields-offset",
+        type=int,
+        default=0,
+        help="For mode='fields' only: entry offset for paginating the content-control ledger.",
     )
     p_extract.add_argument(
         "--page",
@@ -1830,7 +2044,14 @@ def _main_impl():
         action="store_true",
         help="Emit the extraction result as a machine-readable JSON object on stdout.",
     )
+    p_extract.add_argument(
+        "--no-chrome",
+        action="store_true",
+        help="Strip navigation prose, banners, footers, and appendix pointers from extract output.",
+    )
     p_extract.set_defaults(func=handle_extract)
+    # Live-Word mode is excluded from this fork: never registered, never reachable.
+    p_extract.set_defaults(live=False)
 
     p_diff = subparsers.add_parser("diff", help="Compare two files (DOCX vs DOCX/Text)")
     p_diff.add_argument("original", type=Path, help="Original DOCX")
@@ -1866,8 +2087,8 @@ def _main_impl():
             "    comment    — attach a Word comment to the change\n"
         ),
     )
-    p_apply.add_argument("original", type=Path, help="Original DOCX")
-    p_apply.add_argument("changes", type=Path, help="JSON edits file OR Modified Text file")
+    p_apply.add_argument("original", type=Path, nargs="?", help="Original DOCX")
+    p_apply.add_argument("changes", type=Path, nargs="?", help="JSON edits file OR Modified Text file")
     p_apply.add_argument("-o", "--output", type=Path, help="Output DOCX path")
     p_apply.add_argument(
         "--author",
@@ -1898,12 +2119,50 @@ def _main_impl():
         default="standard",
         help="Report detail level for batch output (default: standard).",
     )
+    salvage_group = p_apply.add_mutually_exclusive_group()
+    salvage_group.add_argument(
+        "--partial",
+        action="store_true",
+        help="Apply valid edits even if some fail (salvage partial batch).",
+    )
+    salvage_group.add_argument(
+        "--atomic",
+        action="store_true",
+        help="Reject whole batch if any edit fails (default).",
+    )
+    p_apply.add_argument(
+        "--terse-errors",
+        action="store_true",
+        help="Reduce ambiguity examples (2 max, ±25 chars context) and listed stale IDs (8 max) in error payloads.",
+    )
+    # CC-4 write-gate overrides (spec-gates.md §1). Three separate flags, not
+    # one --force: they license different things, and a single flag would make
+    # a caller who wanted one silently accept all three.
+    p_apply.add_argument(
+        "--ignore-control-locks",
+        action="store_true",
+        help="Apply edits even inside content-locked or grouped content controls (Word refuses these).",
+    )
+    p_apply.add_argument(
+        "--ignore-document-protection",
+        action="store_true",
+        help="Apply changes even when the document carries enforced editing protection.",
+    )
+    p_apply.add_argument(
+        "--allow-untracked-writes",
+        action="store_true",
+        help=(
+            "Permit writes Word records WITHOUT tracked changes (fill-in-forms-protected documents only). "
+            "Concedes Adeu's always-tracked guarantee; every such write is flagged in the report."
+        ),
+    )
     p_apply.add_argument(
         "--json",
         action="store_true",
         help="Emit the batch result stats as machine-readable JSON on stdout, suppressing human-readable logs.",
     )
     p_apply.set_defaults(func=handle_apply)
+    p_apply.set_defaults(live=False)
 
     p_accept = subparsers.add_parser(
         "accept-all",
@@ -1915,6 +2174,19 @@ def _main_impl():
         "--output",
         type=Path,
         help="Output DOCX path (default: <input>_clean.docx)",
+    )
+    p_accept.add_argument(
+        "--remove-comments",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Also delete every comment (DEFAULT: enabled). This command produces a "
+            "distributable clean document, and comments are internal review notes that must "
+            "not travel to a counterparty. Use --no-remove-comments to accept the tracked "
+            "changes while KEEPING the comments. Either way, a comment whose anchored text an "
+            "accepted deletion consumes is removed (Word does the same) and every deleted "
+            "comment is reported by id and author."
+        ),
     )
     p_accept.add_argument(
         "--json",
@@ -2013,6 +2285,15 @@ def _main_impl():
         help="Write report to file",
     )
     p_sanitize.set_defaults(func=handle_sanitize)
+
+    p_serve = subparsers.add_parser("serve", help="Run JSON-lines daemon for persistent document caching")
+
+    def handle_serve(serve_args: argparse.Namespace):
+        from adeu.serve import run_serve
+
+        sys.exit(run_serve())
+
+    p_serve.set_defaults(func=handle_serve)
 
     # `adeu help` / `adeu help <command>` — the shell convention alongside
     # -h/--help (QA 2026-07-19 v8 F-13).

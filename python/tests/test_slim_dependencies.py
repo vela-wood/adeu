@@ -2,7 +2,6 @@ import importlib.metadata as metadata
 import importlib.util
 import sys
 
-
 FORBIDDEN_DISTRIBUTIONS = ("fastmcp", "fastmcp-slim", "langchain", "langchain-core")
 
 

@@ -36,6 +36,7 @@ from adeu.models import (
 )
 from adeu.redline.engine import RedlineEngine
 from adeu.utils.xml_debug import get_abstracted_xml_snapshot
+from tests.utils import assert_word_readable_ids
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -74,7 +75,12 @@ def _xmllint_check(xml_bytes: bytes, label: str, tmp_path: Path) -> None:
         )
     out = tmp_path / label
     out.write_bytes(xml_bytes)
-    result = subprocess.run(["xmllint", "--noout", str(out)], capture_output=True, text=True)
+    # encoding= is mandatory: text=True alone decodes with the host ANSI code
+    # page and a mis-decode silently yields None instead of raising. See
+    # BUG_cli_test_encoding_and_n8n_lint_toolchain.md.
+    result = subprocess.run(
+        ["xmllint", "--noout", str(out)], capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     assert result.returncode == 0, f"xmllint validation failed for {label}:\n{result.stderr}"
 
 
@@ -175,6 +181,14 @@ def test_corpus_scenario(test_dir: Path, tmp_path: Path):
         engine = RedlineEngine(io.BytesIO(docx_bytes), author=author)
         engine.process_batch(changes)
         output_bytes = engine.save_to_stream().getvalue()
+
+        # --- ST_LongHexNumber ranges (unconditional, and in BOTH twins) ---
+        # consistency.test.ts asserts the same thing on the same corpus: this
+        # is where the two engines are held to the same id ranges, and where a
+        # scenario added later gets the check for free. Word discards
+        # out-of-range paraIds / durableIds / rsids on load and renumbers the
+        # whole part with them (BUG_paraId_signed_int32_thread_collapse.md).
+        assert_word_readable_ids(output_bytes, context=f"[{test_dir.name}] ")
 
     # --- Namespace validation (custom check, not covered by abstract golden) ---
     if validate_ns and not is_read_only:

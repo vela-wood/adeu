@@ -18,8 +18,11 @@ import {
 
 import {
   type BinarySource,
+  docOpDisplayOptions,
   getDocxBufferFromSource,
 } from "../GenericFunctions";
+
+const displayOptions = docOpDisplayOptions("generateDiff");
 
 export const generateDiffDescription: INodeProperties[] = [
   // --- Original document source ---
@@ -34,12 +37,7 @@ export const generateDiffDescription: INodeProperties[] = [
       { name: "From Connected Input", value: "fromInput" },
       { name: "From Another Node", value: "fromNode" },
     ],
-    displayOptions: {
-      show: {
-        resource: ["document"],
-        operation: ["generateDiff"],
-      },
-    },
+    displayOptions,
   },
   {
     displayName: "Original Source Node Name",
@@ -67,12 +65,7 @@ export const generateDiffDescription: INodeProperties[] = [
     placeholder: "e.g. data",
     description:
       "Name of the binary property holding the original (baseline) .docx file (string, e.g. 'data'). In 'From Connected Input' mode this reads from the current item; in 'From Another Node' mode this specifies which property on the source node's output to read.",
-    displayOptions: {
-      show: {
-        resource: ["document"],
-        operation: ["generateDiff"],
-      },
-    },
+    displayOptions,
   },
   // --- Modified document source ---
   {
@@ -86,12 +79,7 @@ export const generateDiffDescription: INodeProperties[] = [
       { name: "From Connected Input", value: "fromInput" },
       { name: "From Another Node", value: "fromNode" },
     ],
-    displayOptions: {
-      show: {
-        resource: ["document"],
-        operation: ["generateDiff"],
-      },
-    },
+    displayOptions,
   },
   {
     displayName: "Modified Source Node Name",
@@ -119,12 +107,7 @@ export const generateDiffDescription: INodeProperties[] = [
     placeholder: "e.g. data2",
     description:
       "Name of the binary property holding the modified (compared-to) .docx file (string, e.g. 'data2'). In 'From Connected Input' mode this reads from the current item and must be different from the original property; in 'From Another Node' mode this specifies which property on the source node's output to read.",
-    displayOptions: {
-      show: {
-        resource: ["document"],
-        operation: ["generateDiff"],
-      },
-    },
+    displayOptions,
   },
   {
     displayName: "Clean View",
@@ -311,6 +294,19 @@ export async function executeGenerateDiff(
           originalName,
           modifiedName,
         );
+
+  // An empty result must never be indistinguishable from "the diff engine
+  // produced nothing": both formats collapse to header-only/empty output when
+  // the documents match. Mirrors the MCP surface (QA 2026-07-23 F14).
+  const hasHunks =
+    diffFormat === "unified"
+      ? diff.trim() !== ""
+      : diff.includes("@@ Word Patch @@");
+  if (!hasHunks) {
+    diff =
+      `--- ${originalName}\n+++ ${modifiedName}\n\n` +
+      "No textual differences found between the documents.";
+  }
 
   // A text diff cannot see image bytes: when embedded media differ, an empty
   // diff must never read as "the documents are identical" (QA 2026-07-19 F-04).

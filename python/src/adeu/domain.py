@@ -18,14 +18,7 @@ def levenshtein_distance(s1: str, s2: str) -> int:
 
 
 _TERM_BODY = r"[A-Z][A-Za-z0-9\s\-&\'’]{1,60}"
-# Definition typography, matched repeatedly within a paragraph (QA 2026-07-18
-# M7 — a paragraph defining Alpha, Beta AND Gamma must yield all three):
-#   1. paragraph-leading quoted term (optionally after a numbering token)
-#   2. sentence-leading quoted term (after . ; : ! ?)
-#   3. parenthesized inline definition — (the "Term")
 _LEADING_TERM_RE = re.compile(rf"^(?:[\d\.\-\(\)a-zA-Z]+\s*)?[\"“]({_TERM_BODY})[\"”]")
-# Like the leading pattern, a sentence-start definition may carry a numbering
-# token ('… the product. 2.2 "Beta" means …').
 _SENTENCE_TERM_RE = re.compile(rf"(?<=[\.\;\:\!\?])\s+(?:[\d\.\-\(\)a-zA-Z]+\s+)?[\"“]({_TERM_BODY})[\"”]")
 _INLINE_TERM_RE = re.compile(rf'\([^)]*?["“]({_TERM_BODY})["”][^)]*?\)')
 
@@ -318,6 +311,36 @@ def extract_all_domain_metadata(
     return definitions, diagnostics, raw_anchors
 
 
+def _content_controls_appendix_section(doc, base_text: str) -> List[str]:
+    """The appendix's ``## Content Controls`` block, or [] when unwarranted.
+
+    Imported lazily: ``adeu.fields`` pulls in the ordinal pre-pass, and the
+    appendix is built during ingest for every read, including documents with no
+    controls at all.
+    """
+    try:
+        from adeu.fields import (
+            field_summary,
+            read_document_protection,
+            render_appendix_section,
+        )
+
+        # Counts only. The appendix renders four numbers, and computing the
+        # full ledger to get them added 115ms of unrendered value previews and
+        # breadcrumbs to every read of a control-heavy document.
+        counts = field_summary(doc)
+        protection = read_document_protection(doc)
+    except Exception:
+        # The appendix is advisory. A malformed settings part or an exotic
+        # control must not take down every read of the document.
+        return []
+    return render_appendix_section(
+        counts,
+        protection,
+        hint='Read with mode="fields" for the full field ledger.',
+    )
+
+
 def build_structural_appendix(doc, base_text: str) -> str:
     """
     Compiles the Read-Only Structural Appendix block for the agent.
@@ -344,6 +367,15 @@ def build_structural_appendix(doc, base_text: str) -> str:
         lines.append("\n## Document Settings")
         for warning in settings_warnings:
             lines.append(f"- {warning}")
+
+    # Spec-fields-ledger §5: the HEADER LINES ONLY. The full ledger never
+    # renders here — FedRAMP rev4 has 5,007 controls and the appendix is
+    # bounded, so a ledger would swallow every other section.
+    cc_lines = _content_controls_appendix_section(doc, base_text)
+    if cc_lines:
+        has_content = True
+        lines.append("")
+        lines.extend(cc_lines)
 
     if defs:
         has_content = True

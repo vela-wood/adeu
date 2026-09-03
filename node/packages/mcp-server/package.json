@@ -1,6 +1,6 @@
 {
   "name": "@adeu/mcp-server",
-  "version": "2.1.0",
+  "version": "3.0.2",
   "description": "",
   "mcpName": "ai.adeu/adeu",
   "main": "./dist/index.js",
@@ -8,12 +8,14 @@
   "bin": {
     "adeu-mcp-server": "./dist/index.js"
   },
-  "devDependencies": {},
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  },
   "scripts": {
     "build": "tsup && tsc --emitDeclarationOnly",
     "postbuild": "npm run build:verify",
     "build:verify": "node scripts/verify-bundle.js",
-    "test": "vitest run",
+    "test": "vitest run --fileParallelism=false",
     "start": "node ./dist/index.js"
   },
   "repository": {
@@ -31,7 +33,7 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "@adeu/core": "^2.1.0",
+    "@adeu/core": "^3.0.2",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@modelcontextprotocol/ext-apps": "^1.7.4",
     "zod": "4.4.3"

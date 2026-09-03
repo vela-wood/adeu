@@ -53,9 +53,8 @@ _MIN_BUBBLE_BODY = 8
 # report.
 _MIN_WARNING_CHARS = 26
 
-# Stands in for document context dropped from a preview. ASCII on purpose:
-# json.dumps escapes a "…" to "\u2026", six characters of budget for one
-# character of meaning.
+# Stands in for document context dropped from a preview. Three dots ASCII
+# indicator for dropped context in elisions.
 _ELISION = "..."
 
 
@@ -70,6 +69,17 @@ BATCH_RECOVERY_PROTOCOL = (
     "(2) fix the failing edit(s) in a separate small batch. "
     "Copy target_text verbatim from a fresh read of the CURRENT file, not from another tool's view of it."
 )
+
+# Hint appended when model serializes JSON object/array markers into the 'type' field (Item B7).
+FUSED_JSON_HINT = "This looks like two edits fused during generation — resubmit this edit alone, correctly formed."
+
+
+def has_fused_json_marker(text: str) -> bool:
+    """Whether an invalid type string contains markers indicating fused JSON ({, }, or \":\")."""
+    if not isinstance(text, str):
+        return False
+    return any(marker in text for marker in ("{", "}", '":'))
+
 
 # The only failures the recovery protocol can help with: a rejected BATCH. A
 # missing file, an unreadable DOCX or a failed write has no failing edit to
@@ -195,16 +205,15 @@ def _within_budget(edit: Dict[str, Any]) -> bool:
     serialized edit, ignoring the fields exempt from the budget.
     """
     budgeted = {k: v for k, v in edit.items() if k not in _UNBUDGETED_FIELDS}
-    return len(json.dumps(budgeted)) // 4 <= MINIMAL_EDIT_TOKEN_BUDGET
+    return len(json.dumps(budgeted, ensure_ascii=False)) // 4 <= MINIMAL_EDIT_TOKEN_BUDGET
 
 
 def _shrink_prose(edit: Dict[str, Any], key: str, value: str, floor: int) -> None:
     """
     Clamps one free-prose field of an edit toward `floor` characters, stopping
     the moment the edit fits. Each step re-clamps the ORIGINAL value at a
-    smaller cap and re-measures the real serialized JSON, so escaping (a single
-    "—" costs six characters of budget as "\\u2014") is accounted for rather
-    than predicted.
+    smaller cap and re-measures the real serialized JSON (with `ensure_ascii=False`),
+    so actual serialized JSON size is accounted for rather than predicted.
     """
     cap = len(value)
     while cap > floor and not _within_budget(edit):
@@ -213,27 +222,7 @@ def _shrink_prose(edit: Dict[str, Any], key: str, value: str, floor: int) -> Non
 
 
 def _fit_to_budget(edit: Dict[str, Any]) -> None:
-    """
-    Spends the per-edit budget in priority order, in place.
-
-    The engine's verification evidence outranks the locator: `pages` already
-    says where the edit landed, so the preview's context and then the heading
-    path are surrendered before a CriticMarkup bubble is touched. An engine
-    `warning` is clamped next: it is prose about a change the preview shows as
-    markup (a surviving "$1" appears verbatim in the {++…++} bubble), and at
-    ~260 chars the surviving-$N advisory alone is six times the whole budget.
-    It is clamped, never dropped — an edit the caller must re-check may not go
-    unflagged. Only then are the bubble bodies clamped, in place so the markup
-    stays valid, and then `pages`: a fan-out across a dozen pages is a page list
-    no preview shrink can pay for.
-
-    The last resort is the preview itself. A warned fan-out cannot hold bounded
-    bubbles, a span count, counters AND an advisory in 40 approx-tokens, and of
-    those the preview is the one the agent can re-derive (read the document
-    again); an advisory it never saw is gone for good. Dropping it whole also
-    keeps the promise the shrink makes about markup: what ships is either valid
-    CriticMarkup or nothing.
-    """
+    """Spends the per-edit budget in priority order, in place."""
     markup = edit.get("critic_markup")
     if markup:
         span = _changed_span(markup)

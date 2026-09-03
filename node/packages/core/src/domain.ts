@@ -3,6 +3,11 @@ import { Paragraph, Run } from "./docx/primitives.js";
 import { iter_block_items, get_run_text } from "./utils/docx.js";
 import { findAllDescendants } from "./docx/dom.js";
 import { findDescendantsByLocalName } from "./sanitize/transforms.js";
+import {
+  fieldSummary,
+  readDocumentProtection,
+  renderAppendixSection,
+} from "./fields.js";
 
 function boundedLevenshtein(a: string, b: string, maxDist: number = 2): number {
   if (a === b) return 0;
@@ -106,12 +111,18 @@ export function extract_all_domain_metadata(
   string[],
   Record<string, { anchored_to: string; referenced_from: string[] }>,
 ] {
-  const definitions: Record<string, { count: number }> = {};
+  // Null-prototype throughout: these dictionaries are keyed on strings taken
+  // from the document (defined terms, w:bookmarkStart/@w:name), so a name like
+  // "toString" or "constructor" must be an ordinary entry. On a `{}` literal
+  // the presence checks below read Object.prototype instead: the anchor is
+  // never registered, and the REF back-fill at the bottom of this function then
+  // dies in `raw_anchors[target].referenced_from.push(...)`.
+  const definitions: Record<string, { count: number }> = Object.create(null);
   const duplicates = new Set<string>();
   const raw_anchors: Record<
     string,
     { anchored_to: string; referenced_from: string[] }
-  > = {};
+  > = Object.create(null);
   const raw_references: [string, string][] = [];
 
   for (const item of iter_block_items(doc)) {
@@ -235,7 +246,7 @@ export function extract_all_domain_metadata(
     terms_by_first_letter[fl].push(term);
   }
 
-  const candidates_by_term: Record<string, string[]> = {};
+  const candidates_by_term: Record<string, string[]> = Object.create(null);
 
   for (const raw_candidate of all_caps) {
     let candidate = raw_candidate.trim();
@@ -356,6 +367,32 @@ export function extract_document_settings_warnings(
   return warnings;
 }
 
+/**
+ * The appendix's `## Content Controls` block, or [] when unwarranted.
+ *
+ * Defensive: the appendix is advisory, so a malformed settings part or an
+ * exotic control must not take down every read of the document.
+ */
+function content_controls_appendix_section(
+  doc: DocumentObject,
+  base_text: string,
+): string[] {
+  try {
+    // Counts only. The appendix renders four numbers, and computing the full
+    // ledger to get them added 115ms of unrendered value previews and
+    // breadcrumbs to every read of a control-heavy document.
+    const counts = fieldSummary(doc);
+    const protection = readDocumentProtection(doc);
+    return renderAppendixSection(
+      counts,
+      protection,
+      'Read with mode="fields" for the full field ledger.',
+    );
+  } catch {
+    return [];
+  }
+}
+
 export function build_structural_appendix(
   doc: DocumentObject,
   base_text: string,
@@ -382,6 +419,16 @@ export function build_structural_appendix(
     for (const warning of settings_warnings) {
       lines.push(`- ${warning}`);
     }
+  }
+
+  // Spec-fields-ledger §5: the HEADER LINES ONLY. The full ledger never
+  // renders here — FedRAMP rev4 has 5,007 controls and the appendix is
+  // bounded, so a ledger would swallow every other section.
+  const cc_lines = content_controls_appendix_section(doc, base_text);
+  if (cc_lines.length > 0) {
+    has_content = true;
+    lines.push("");
+    lines.push(...cc_lines);
   }
 
   if (Object.keys(defs).length > 0) {

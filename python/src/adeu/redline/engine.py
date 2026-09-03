@@ -3,11 +3,10 @@ import re
 from collections import defaultdict
 from copy import deepcopy
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import lxml.etree as etree
 import structlog
-from docx import Document
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsmap, qn
 from docx.text.paragraph import Paragraph
@@ -24,18 +23,49 @@ from adeu.models import (
     ModifyText,
     RejectChange,
     ReplyComment,
+    SetField,
 )
 from adeu.pagination import paginate, split_structural_appendix
-from adeu.redline.comments import CommentsManager
+from adeu.redline.comments import CommentsManager, CommentThreadingError
+from adeu.redline.gates import (
+    GateOverrides,
+    check_block_merge_across_control,
+    check_bound_control,
+    check_checkbox_edit,
+    check_content_lock,
+    check_delete_lock,
+    check_group_region,
+    check_placeholder_target,
+    check_protection_blocks_edit,
+    check_protection_blocks_review,
+    check_untracked_write,
+    crossed_control_walls,
+    describe_control,
+    overrides_note,
+    segmentation_note,
+)
 from adeu.redline.mapper import DocumentMapper, TextSpan
 from adeu.utils.docx import create_attribute, create_element, strip_bom_from_docx_bytes
+from adeu.utils.opc import load_document as Document
+from adeu.utils.protection import read_document_protection
 from adeu.utils.safe_regex import RegexTimeoutError
-from adeu.utils.text import PREVIEW_TEXT_CAP, REPORT_ECHO_CAP, truncate_middle
+from adeu.utils.text import (
+    PREVIEW_TEXT_CAP,
+    REPORT_ECHO_CAP,
+    clamp_text,
+    has_smart_quotes,
+    restore_document_typography,
+    truncate_middle,
+)
 
 logger = structlog.get_logger(__name__)
 
 # Width of the surrounding-document window shown in redline previews.
 PREVIEW_CONTEXT_CHARS = 30
+
+# Character ceiling for the multi-author guard refusal, i.e. the ~70-token
+# budget at the 4-chars-per-token estimate the message budget tests use.
+GUARD_MESSAGE_CAP = 70 * 4
 
 # Register w16du namespace for dateUtc
 w16du_ns = "http://schemas.microsoft.com/office/word/2023/wordml/word16du"
@@ -72,6 +102,28 @@ def _extract_failed_indices(errors: List[str]) -> List[Tuple[int, str]]:
     return failed
 
 
+def _trim_shared_trailing_paragraph_mark(target: str, new: str) -> Tuple[str, str]:
+    """
+    Drop paragraph marks that BOTH sides of a replacement end with (CC-14).
+
+    A "\\n\\n" the target and the replacement share is structural context, not
+    text to rewrite, and must never reach the apply layer: that layer
+    track-deletes a trailing mark inside a target -- a genuine paragraph merge,
+    "A.\\n\\n" -> "Z.", depends on it -- but does not re-create the one the
+    replacement asks for. The break silently disappears while the batch still
+    reports the edit applied.
+
+    Trims from the END only, so a caller-pinned start index stays valid. The
+    real merge shape (target ends with a mark, replacement does not) is left
+    alone, as is a shared LEADING mark, which the apply layer handles
+    correctly today.
+    """
+    while target.endswith("\n\n") and new.endswith("\n\n"):
+        target = target[:-2]
+        new = new[:-2]
+    return target, new
+
+
 class BatchValidationError(Exception):
     """Raised when text edits fail location validation."""
 
@@ -88,6 +140,15 @@ class BatchValidationError(Exception):
 # as a raw "All strings must be XML compatible" traceback from deep inside
 # lxml instead of a clean per-edit error (QA 2026-07-17 F11).
 XML_ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+# CC-1e: content-control anchors, open or close, with or without flag words.
+_CC_ANCHOR_SCAN_RE = re.compile(r"\{#(/?)cc:(\d+)(?: [^}]*)?\}")
+_CC_ANCHOR_RE = re.compile(r"\{#/?cc:\d+[^}]*\}")
+
+# The sanctioned empty-pair fill target (spec-projection.md §3): an open and
+# close anchor for the SAME ordinal with nothing between them but an optional
+# placeholder bubble.
+_CC_EMPTY_PAIR_RE = re.compile(r"^\{#cc:(\d+)[^}]*\}(?:\{>>placeholder:[^<]*<<\})?\{#/cc:\1\}$")
 
 # Children of a properties container that the corresponding tracked-change
 # record cannot store, and which must therefore survive rejecting it.
@@ -162,7 +223,15 @@ def validate_review_action_batch(
                 )
             seen_replies.add(reply_key)
         elif act_type in ("accept", "reject"):
-            prior = seen_resolutions.get(target_id)
+            # Ids are numbered per OPC part (issue #114): the same target_id
+            # with different explicit `part` selectors names two unrelated
+            # changes, so duplicates/conflicts are tracked per (part, id).
+            # Bare ids keep one shared bucket — two bare actions on one id
+            # are the same target today as before.
+            part_attr = getattr(act, "part", None)
+            part_key = part_attr.lstrip("/") if isinstance(part_attr, str) else ""
+            resolution_key = (part_key, target_id)
+            prior = seen_resolutions.get(resolution_key)
             if prior is not None:
                 first_pos, first_type = prior
                 first_batch_idx = indices[first_pos] if indices else first_pos
@@ -179,12 +248,12 @@ def validate_review_action_batch(
                         f"'{act_type}'. Decide the outcome and keep exactly one of them."
                     )
             else:
-                seen_resolutions[target_id] = (i, act_type)
+                seen_resolutions[resolution_key] = (i, act_type)
     return errors
 
 
 def validate_edit_strings(
-    edits: List[Union["ModifyText", "InsertTableRow", "DeleteTableRow"]],
+    edits: List[Union["ModifyText", "InsertTableRow", "DeleteTableRow", "SetField"]],
     index_offset: int = 0,
 ) -> List[str]:
     """
@@ -221,8 +290,17 @@ def validate_edit_strings(
     errors: List[str] = []
 
     for i, edit in enumerate(edits, start=index_offset):
-        t_text = edit.target_text or ""
-        n_text = getattr(edit, "new_text", "") or ""
+        # `set_field` has no target_text - it addresses a control by id rather
+        # than by content - but its `value` is written into the document and
+        # must clear exactly the same bar as any other inserted string. A
+        # value containing `{#cc:3}` or raw CriticMarkup would fabricate
+        # anchors and reviewer names as prose (CC-1e), and routing it here is
+        # what stops `set_field` becoming a hole in that check.
+        t_text = getattr(edit, "target_text", None) or ""
+        n_text = getattr(edit, "new_text", None)
+        if n_text is None:
+            n_text = getattr(edit, "value", None)
+        n_text = n_text or ""
 
         # VAL-CRIT-8: XML-illegal control characters. These can never be
         # written into a DOCX (lxml refuses), so reject them here with a clean
@@ -352,6 +430,38 @@ def validate_edit_strings(
                     )
                     break
 
+        # CC-1e / A1.7: content-control anchors are structural in BOTH
+        # directions. VAL-OBS-9 above only counts anchors that GAINED copies,
+        # so it catches fabrication and rewriting but not deletion: a target
+        # covering `{#/cc:3}` whose new_text omits it passed cleanly and
+        # silently unbalanced the pair in the projection.
+        #
+        # Scoped to `cc` anchors rather than made symmetric for every `{#...}`
+        # token, because two anchor classes are deliberate TARGETING surfaces
+        # that a symmetric rule would break: `{#cell:paraId}` empty-cell writes
+        # (engine.py `^\{#cell:[^}]+\}$`) and the empty pair below.
+        if "{#" in t_text and "cc:" in t_text or "cc:" in n_text:
+            t_cc = _CC_ANCHOR_RE.findall(t_text)
+            n_cc = _CC_ANCHOR_RE.findall(n_text)
+            # Sanctioned edit surface #1 (spec-projection.md §3): the empty
+            # pair is deliberately matchable and is the text-first fill. The
+            # anchors are not being deleted there — the wrapper survives and
+            # only the control's CONTENT changes — so the fill must stay legal
+            # for CC-4/CC-5 to route through set_field semantics.
+            fills_empty_pair = _CC_EMPTY_PAIR_RE.match(t_text.strip()) is not None
+            # ORDERED comparison, unlike the footnote/image checks above, which
+            # compare multisets. A multiset lets `{#cc:3}A{#/cc:3}` become
+            # `{#/cc:3}A{#cc:3}` — same tokens, inverted pair. Text replacement
+            # cannot move an sdt wrapper anyway, so reordering controls is never
+            # a legitimate edit and order is the honest invariant.
+            if t_cc != n_cc and not fills_empty_pair:
+                errors.append(
+                    f"- Edit {i + 1} Failed: Cannot insert, alter, or remove content-control "
+                    "anchor markers (`{#cc:N}` / `{#/cc:N}`). They are read-only projections "
+                    "of the control's structure, not text. Edit the content BETWEEN the "
+                    "anchors, keeping both tokens in `new_text` exactly as they appear."
+                )
+
         # Heading level > 6 (only meaningful for ModifyText with new_text)
         if isinstance(edit, ModifyText) and edit.new_text:
             for line in edit.new_text.splitlines():
@@ -383,7 +493,24 @@ class RedlineEngine:
         doc_stream: BytesIO,
         author: str = "Adeu AI",
         id_discovery_hint: Optional[str] = None,
+        terse_errors: bool = False,
+        ignore_control_locks: bool = False,
+        ignore_document_protection: bool = False,
+        allow_untracked_writes: bool = False,
     ):
+        self.terse_errors = terse_errors
+        # CC-4 write-gate overrides. Engine kwargs rather than process_batch
+        # arguments because the gates run in three places — validate_edits,
+        # the resolver and the apply-path backstop — and only the first takes
+        # batch arguments today. Same route terse_errors takes.
+        self.gate_overrides = GateOverrides(
+            ignore_control_locks=ignore_control_locks,
+            ignore_document_protection=ignore_document_protection,
+            allow_untracked_writes=allow_untracked_writes,
+        )
+        # Controls whose locks an override actually bypassed, for the report
+        # disclosure (spec-gates §5). Reset per batch.
+        self._overridden_controls: List[Any] = []
         # Surface-aware advice for "how do I list the current Chg:/Com: ids":
         # the CLI default points at CLI commands; the MCP layer passes a
         # read_docx-based hint because MCP callers cannot run the CLI
@@ -398,7 +525,19 @@ class RedlineEngine:
         # change; __init__ (also the rollback path) resets it.
         self._pristine_bytes = sanitized_bytes
         self._mutated_since_load = False
+        # Whether the LAST batch that was rejected provably left the document
+        # as it was (see _verify_rollback). A caller that reuses this engine —
+        # or its document — after a rejection MUST check it: False means the
+        # in-memory state no longer matches the file it was loaded from, and
+        # reusing it compounds the damage (BUG 2026-08-12: one comment
+        # collected three identical replies that way).
+        self.rollback_verified = True
         self.doc = Document(BytesIO(sanitized_bytes))
+        # Read once at load (spec-gates §3), not per gate: it lives in
+        # word/settings.xml, which nothing else in a batch touches, and the
+        # gates, the projection banner and the fields ledger must all report
+        # the same state.
+        self.protection = read_document_protection(self.doc)
 
         # No part is stamped with the w16du namespace up front. Tracked-change
         # writes (w16du:dateUtc attributes) self-declare the prefix locally on
@@ -421,11 +560,22 @@ class RedlineEngine:
         )
         self.current_id = self._scan_existing_ids()
         self.mapper = DocumentMapper(self.doc)
+        # Offsets into mapper.full_text; rebuilt whenever the mapper is.
+        self._cc_anchor_pairs: "list[tuple[int, int, int]] | None" = None
+        # (projection text, ledger rows) - see _field_entries.
+        self._field_entries_cache: Optional[Tuple[str, List[Any]]] = None
         self.comments_manager = CommentsManager(self.doc)
         self.clean_mapper: Optional[DocumentMapper] = None
         self.original_mapper: Optional[DocumentMapper] = None
         self.skipped_details: List[str] = []
         self._bullet_num_id: Optional[str] = None
+        # Set by _reply_to_comment when a reply's parent could not be threaded,
+        # so apply_review_actions reports the real reason instead of the
+        # misleading "no comment with that id exists" (B1).
+        self._reply_threading_error: Optional[str] = None
+        # Comment removals accept_all_revisions actually performed, attributed
+        # to their authors (B2).
+        self.removed_comment_notes: List[str] = []
 
     def _check_punctuation_warning(self, target_text: str) -> Optional[str]:
         """Return a hint when a short, single-token anchor contains punctuation
@@ -747,22 +897,6 @@ class RedlineEngine:
 
         return critic_markup, clean_text
 
-    def _first_live_match(self, target_text: str, is_regex: bool = False) -> Tuple[int, int]:
-        all_matches = self.mapper.find_all_match_indices(target_text, is_regex=is_regex)
-        if len(all_matches) <= 1:
-            return self.mapper.find_match_index(target_text, is_regex=is_regex)
-        for start, length in all_matches:
-            real_spans = [
-                s for s in self.mapper.spans if s.run is not None and s.end > start and s.start < start + length
-            ]
-            if not real_spans:
-                # Virtual-only range (meta bubble, marker): not document text
-                # (ADEU-QA-002 C) — never a live match.
-                continue
-            if any(not s.del_id for s in real_spans):
-                return start, length
-        return self.mapper.find_match_index(target_text, is_regex=is_regex)
-
     _PAIR_WALK_SKIP_TAGS = (
         "w:commentRangeStart",
         "w:commentRangeEnd",
@@ -881,21 +1015,123 @@ class RedlineEngine:
 
         return list(pairs)
 
+    # Content types of the parts revisions can be authored in and targeted
+    # from — the story parts the mapper projects. Deliberately narrower than
+    # the accept_all/reject_all traversal: a w:ins inside e.g. a comment's
+    # body is resolved by the bulk paths but is not an addressable document
+    # revision (issue #114).
+    _STORY_PART_CONTENT_TYPES = (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+    )
+
+    @staticmethod
+    def _part_revision_element(part):
+        """Root element of a non-main part, parsing and caching from the blob
+        when python-docx does not model the part (footnotes/endnotes)."""
+        if hasattr(part, "_element"):
+            return part._element
+        if not hasattr(part, "_adeu_element"):
+            part._adeu_element = parse_xml(part.blob)
+        return part._adeu_element
+
+    def _revision_roots(self) -> list:
+        """
+        Every root a bulk revision pass must traverse: the main document
+        element plus every other wordprocessingml XML part (headers, footers,
+        notes, comments, ...). Shared by accept_all_revisions /
+        reject_all_revisions / _scan_existing_ids (issue #114 — the id scan
+        used to read the main part only, so a fresh engine minted duplicates
+        of ids already present in a header).
+        """
+        roots = [self.doc.element]
+        for part in self.doc.part.package.parts:
+            if part == self.doc.part:
+                continue
+            if "wordprocessingml" in part.content_type and part.content_type.endswith("+xml"):
+                roots.append(self._part_revision_element(part))
+        return roots
+
+    def _story_roots(self) -> List[tuple]:
+        """
+        [(element, part path)] for every part a targeted accept/reject can
+        address: the main document plus the story parts the mapper projects.
+        This is where revision ids live per part (issue #114); part paths are
+        normalized without the leading "/" python-docx partnames carry.
+        """
+        roots: List[tuple] = [(self.doc.element, str(self.doc.part.partname).lstrip("/"))]
+        for part in self.doc.part.package.parts:
+            if part == self.doc.part:
+                continue
+            if part.content_type in self._STORY_PART_CONTENT_TYPES:
+                roots.append((self._part_revision_element(part), str(part.partname).lstrip("/")))
+        return roots
+
+    def _story_findall(self, tag: str, part: Optional[str] = None) -> list:
+        """Elements of `tag` (a "w:..." name) across every story part, scoped
+        to one normalized part path when given (issue #114)."""
+        out: list = []
+        for root, name in self._story_roots():
+            if part is not None and name != part:
+                continue
+            out.extend(root.findall(f".//{qn(tag)}"))
+        return out
+
+    def _parts_holding_id(self, target_id: str) -> List[str]:
+        """
+        Distinct normalized part paths holding a revision element (w:ins/w:del
+        or a format-change record) with `target_id`, in story-root order. More
+        than one entry means the bare id is ambiguous (issue #114): ids are
+        numbered per part.
+        """
+        parts: List[str] = []
+        for root, name in self._story_roots():
+            for tag in ("w:ins", "w:del") + self._FORMAT_CHANGE_TAGS:
+                if any(n.get(qn("w:id")) == target_id for n in root.findall(f".//{qn(tag)}")):
+                    parts.append(name)
+                    break
+        return parts
+
+    def _action_part_filter(self, act) -> Tuple[Optional[str], Optional[str]]:
+        """
+        (normalized story-part path, error) for an action's optional `part`
+        selector; the error is set when the selector names no part a targeted
+        action can address. Part None = no restriction (bare id).
+        """
+        raw = getattr(act, "part", None)
+        if raw is None or raw == "":
+            return None, None
+        story_parts = [name for _, name in self._story_roots()]
+        if not isinstance(raw, str):
+            return None, (f"`part` must be a string naming a package part (one of: {', '.join(story_parts)}).")
+        wanted = raw.lstrip("/")
+        if wanted not in story_parts:
+            return None, (
+                f"part '{raw}' is not a package part that can carry tracked changes. "
+                f"Parts addressable by accept/reject: {', '.join(story_parts)}."
+            )
+        return wanted, None
+
     def _scan_existing_ids(self) -> int:
         """
-        Scans the document body for existing w:id attributes in w:ins and w:del
-        to ensure new IDs do not collide.
+        Scans existing w:id attributes in w:ins and w:del to ensure new IDs do
+        not collide. The scan spans every wordprocessingml part: ids are
+        numbered per part, but this engine mints one ascending sequence for
+        the whole package, so the seed must clear the maximum ANYWHERE or a
+        header edit reuses a header's own id (issue #114 F4).
         """
         max_id = 0
-        for tag in ["w:ins", "w:del"]:
-            elements = self.doc.element.xpath(f"//{tag}")
-            for el in elements:
-                try:
-                    val = int(el.get(qn("w:id")))
-                    if val > max_id:
-                        max_id = val
-                except (ValueError, TypeError):
-                    pass
+        for root in self._revision_roots():
+            for tag in ["w:ins", "w:del"]:
+                for el in root.findall(f".//{qn(tag)}"):
+                    try:
+                        val = int(el.get(qn("w:id")))
+                        if val > max_id:
+                            max_id = val
+                    except (ValueError, TypeError):
+                        pass
         return max_id
 
     def _get_next_id(self):
@@ -1020,6 +1256,50 @@ class RedlineEngine:
 
         return results
 
+    def _is_native_heading_paragraph(self, paragraph) -> bool:
+        """
+        Does `paragraph` render with "#" markers in the text projection?
+
+        Style NAMES are not enough: real templates declare their heading-ness
+        as <w:outlineLvl> inside styles.xml under a house name ("LegalNum2L1"),
+        which Word honours and a startswith("Heading") test does not.
+        is_native_heading resolves the style chain, and is the very function
+        the mapper projects with, so the scrub below cannot drift away from
+        what the agent reads.
+        """
+        try:
+            from adeu.utils.docx import _get_style_cache, is_native_heading
+
+            part = getattr(paragraph, "part", None) or getattr(self.doc, "part", None)
+            style_cache, default_pstyle = _get_style_cache(part)
+            return is_native_heading(paragraph, style_cache, default_pstyle)
+        except Exception:
+            return False
+
+    def _clone_pPr_scrubbing_headings(self, source_paragraph):
+        """
+        Deep-copies `source_paragraph`'s <w:pPr> for a paragraph that CONTINUES
+        it, dropping the heading-ness: an inserted body paragraph must not
+        inherit the heading style (nor, with it, the section's automatic
+        numbering) of the heading it follows.
+        """
+        pPr_clone = deepcopy(source_paragraph.pPr)
+        pStyle_el = pPr_clone.find(qn("w:pStyle"))
+        if pStyle_el is not None:
+            style_val = pStyle_el.get(qn("w:val"))
+            is_heading = style_val and (
+                style_val.startswith("Heading")
+                or style_val == "Title"
+                or style_val.replace(" ", "").startswith("Heading")
+                or self._is_native_heading_paragraph(source_paragraph)
+            )
+            if is_heading:
+                pPr_clone.remove(pStyle_el)
+        outlineLvl_el = pPr_clone.find(qn("w:outlineLvl"))
+        if outlineLvl_el is not None:
+            pPr_clone.remove(outlineLvl_el)
+        return pPr_clone
+
     def track_insert(
         self,
         text: str,
@@ -1067,7 +1347,19 @@ class RedlineEngine:
         # 0. Check if FIRST line implies a block element (Header)
         first_clean, first_style = self._parse_markdown_style(lines[0])
 
-        if first_style:
+        # Block conversion additionally requires a REAL line break in the source
+        # text. Without one the text is by construction a fragment spliced into
+        # an existing paragraph, and a leading "- "/"* "/"# " is literal
+        # content, not a block marker. Word-diffing makes this routine: modify
+        # "Product" -> "Product - Draft" trims the common prefix and hands us
+        # the fragment " - Draft", which _parse_markdown_style reads as a
+        # bullet. Left ungated, that silently split the paragraph, minted a
+        # numbered ListParagraph, ate the "- " as a fabricated marker, and still
+        # reported status "applied". Note the em-dash spelling was never
+        # affected, so the corruption tracked the punctuation an author chose.
+        has_line_break = re.search(r"[\r\n]", text) is not None
+
+        if first_style and has_line_break:
             if current_p is None:
                 return None, None
 
@@ -1091,20 +1383,7 @@ class RedlineEngine:
                 if s_name:
                     self._set_paragraph_style(new_p, s_name)
                 elif current_p.pPr is not None:
-                    pPr_clone = deepcopy(current_p.pPr)
-                    pStyle_el = pPr_clone.find(qn("w:pStyle"))
-                    if pStyle_el is not None:
-                        style_val = pStyle_el.get(qn("w:val"))
-                        is_heading = (
-                            style_val.startswith("Heading")
-                            or style_val == "Title"
-                            or style_val.replace(" ", "").startswith("Heading")
-                        )
-                        if style_val and is_heading:
-                            pPr_clone.remove(pStyle_el)
-                    outlineLvl_el = pPr_clone.find(qn("w:outlineLvl"))
-                    if outlineLvl_el is not None:
-                        pPr_clone.remove(outlineLvl_el)
+                    pPr_clone = self._clone_pPr_scrubbing_headings(current_p)
                     new_p.append(pPr_clone)
 
                 # Track the paragraph break itself as an insertion
@@ -1313,20 +1592,7 @@ class RedlineEngine:
                 if style_name:
                     self._set_paragraph_style(new_p, style_name)
                 elif current_p.pPr is not None:
-                    pPr_clone = deepcopy(current_p.pPr)
-                    pStyle_el = pPr_clone.find(qn("w:pStyle"))
-                    if pStyle_el is not None:
-                        style_val = pStyle_el.get(qn("w:val"))
-                        is_heading = (
-                            style_val.startswith("Heading")
-                            or style_val == "Title"
-                            or style_val.replace(" ", "").startswith("Heading")
-                        )
-                        if style_val and is_heading:
-                            pPr_clone.remove(pStyle_el)
-                    outlineLvl_el = pPr_clone.find(qn("w:outlineLvl"))
-                    if outlineLvl_el is not None:
-                        pPr_clone.remove(outlineLvl_el)
+                    pPr_clone = self._clone_pPr_scrubbing_headings(current_p)
                     if list_level is not None:
                         numPr = pPr_clone.find(qn("w:numPr"))
                         if numPr is not None:
@@ -1975,9 +2241,324 @@ class RedlineEngine:
         except ValueError:
             pass
 
+    def _control_gate_context(self, mapper: Any, start: int, length: int):
+        """(intersecting, at_start, at_end) control stacks for a changed range."""
+        intersecting = mapper.controls_intersecting(start, length) if hasattr(mapper, "controls_intersecting") else []
+        at_start = mapper.controls_at(start) if hasattr(mapper, "controls_at") else []
+        at_end = mapper.controls_at(max(start + length - 1, start)) if hasattr(mapper, "controls_at") else []
+        return intersecting, at_start, at_end
+
+    def _deletes_entire_control(self, mapper: Any, info: Any, start: int, length: int, final_new: str) -> bool:
+        """Would this edit dissolve ``info``'s wrapper rather than empty it?
+
+        G2 protects a control's EXISTENCE, not its text: emptying a
+        delete-locked control is allowed and leaves the wrapper with an empty
+        pair (A3.3). Only a deletion that also consumes text outside the
+        control would have to hoist the wrapper away, so the test is "covers
+        all of the content AND reaches past it".
+        """
+        if final_new.strip():
+            return False
+        rng = next((r for r in getattr(mapper, "control_ranges", []) if r[2] is info), None)
+        if rng is None:
+            return False
+        c_start, c_end, _ = rng
+        covers_all = start <= c_start and start + length >= c_end
+        reaches_outside = start < c_start or start + length > c_end
+        return covers_all and reaches_outside
+
+    def _apply_gate_refusal(self, mapper: Any, start: int, length: int, edit: Any = None) -> Optional[str]:
+        """The apply-path subset of the gate matrix; a reason string, or None.
+
+        Only the document-property gates run here — content locks, group
+        regions, data binding and protection. Deliberately not the whole
+        matrix: G8 and G11 depend on the target STRING, and G14/G15 on the
+        edit's shape, none of which a positionally-pinned edit has resolved
+        in a form this layer can trust. Those stay validate-only, exactly as
+        the paragraph-merge refusal does.
+        """
+        overrides = self.gate_overrides
+        if self.protection.active and not overrides.ignore_document_protection and self.protection.edit == "readOnly":
+            return "document is read-only protected"
+        controls = mapper.controls_intersecting(start, length) if hasattr(mapper, "controls_intersecting") else []
+        if not controls:
+            return None
+        # G13 refuses TEXT edits to bound content and points the caller at
+        # set_field. A fill desugars into pinned ModifyText sub-edits, so
+        # without this exemption the backstop would refuse the very operation
+        # the error recommends — and the recommendation would be a dead end.
+        # set_field is safe here precisely because it dual-writes the store,
+        # which is the whole reason the text path is not.
+        from_set_field = isinstance(getattr(edit, "_parent_edit_ref", None), SetField)
+        info = next((i for i in controls if getattr(i, "bound", False)), None)
+        if info is not None and not from_set_field:
+            return f"{describe_control(info)} is data-bound"
+        if overrides.ignore_control_locks:
+            return None
+        info = next((i for i in controls if getattr(i, "content_locked", False)), None)
+        if info is not None:
+            return f"{describe_control(info)} is content-locked"
+        return None
+
+    def _check_control_gates(
+        self,
+        edit_number: int,
+        edit: Any,
+        mapper: Any,
+        start: int,
+        length: int,
+        *,
+        final_target: str = "",
+        final_new: str = "",
+        known_controls: Optional[List[Any]] = None,
+        from_set_field: bool = False,
+    ) -> Optional[str]:
+        """Run the CC-4 gate matrix over one resolved edit; first failure wins.
+
+        Order is deliberate, most-fundamental first: document protection binds
+        regardless of where the edit lands, so it is checked before anything
+        about the control; then the two category errors that no override can
+        reasonably bypass (bound content, placeholder ghosts), because telling
+        the caller "this text is not what you think it is" is more useful than
+        telling them a lock stopped them; then the lock gates; then structure.
+        """
+        overrides = self.gate_overrides
+        infos = list(getattr(mapper, "_sdt_infos", {}).values())
+        intersecting, at_start, at_end = self._control_gate_context(mapper, start, length)
+        if known_controls is not None:
+            # A `set_field` names its target; it does not infer it from a
+            # range. That matters for an EMPTY control, whose content span is
+            # zero-length, so nothing intersects it - and G5 would then refuse
+            # the fill as "body text outside a content control", which is the
+            # single most common legitimate operation under forms protection.
+            intersecting = known_controls
+
+        is_comment_only = bool(getattr(edit, "comment", None)) and (edit.new_text or "") == (edit.target_text or "")
+
+        err = check_protection_blocks_edit(
+            edit_number,
+            self.protection,
+            controls=intersecting,
+            is_comment_only=is_comment_only,
+            overrides=overrides,
+        )
+        if err:
+            return err
+        # Comment-only edits mutate no text, so the tracking guarantee that
+        # G5's untracked-write gate defends is not at stake for them.
+        if not is_comment_only:
+            err = check_untracked_write(edit_number, self.protection, overrides)
+            if err:
+                return err
+
+        # G8 works off the target string, not the range: an empty control has
+        # no content spans to intersect (see gates.check_placeholder_target).
+        err = check_placeholder_target(edit_number, edit.target_text or "", infos)
+        if err:
+            return err
+
+        if not intersecting:
+            return None
+
+        # G13 refuses TEXT edits to bound content and recommends set_field.
+        # Running it against a set_field would refuse the recommendation
+        # (674c8c0 fixed the same contradiction at the apply layer).
+        if not from_set_field:
+            err = check_bound_control(edit_number, intersecting)
+            if err:
+                return err
+        err = check_checkbox_edit(edit_number, intersecting, edit.target_text or "", edit.new_text or "")
+        if err:
+            return err
+        err = check_content_lock(edit_number, intersecting, overrides)
+        if err:
+            return err
+        err = check_group_region(edit_number, intersecting, overrides)
+        if err:
+            return err
+        for info in intersecting:
+            if self._deletes_entire_control(mapper, info, start, length, final_new):
+                err = check_delete_lock(
+                    edit_number,
+                    [info],
+                    deletes_entire_control=True,
+                    overrides=overrides,
+                )
+                if err:
+                    return err
+
+        # G15: a merge is what makes a wall crossing structural rather than
+        # segmentable. Without a paragraph break being consumed, a crossing is
+        # G14's business (auto-segment), not a refusal.
+        if "\n\n" in final_target and "\n\n" not in final_new:
+            crossed = crossed_control_walls(intersecting, at_start, at_end)
+            err = check_block_merge_across_control(edit_number, crossed)
+            if err:
+                return err
+
+        # G14: the edit is valid on both sides of a wall it crosses, so it
+        # applies — the word-level sub-edit splitter already lands each half
+        # on its own side. What was missing is the disclosure: an agent that
+        # asked to change text "in CC:3" and silently got a change half
+        # outside it has been told something untrue by omission.
+        crossed = crossed_control_walls(intersecting, at_start, at_end)
+        if crossed:
+            try:
+                edit._warning = segmentation_note(crossed)
+            except (AttributeError, ValueError):
+                # Report notes are advisory; never fail an otherwise-valid
+                # edit because a model object would not take the attribute.
+                pass
+
+        # Record what an override let through, for the report disclosure.
+        if overrides.ignore_control_locks:
+            for info in intersecting:
+                if getattr(info, "content_locked", False) or getattr(info, "cls", None) == "group":
+                    if not any(x is info for x in self._overridden_controls):
+                        self._overridden_controls.append(info)
+        return None
+
+    def _resolve_structural_table_edit(
+        self, edit: Union[InsertTableRow, DeleteTableRow]
+    ) -> Tuple[List[Tuple[Union[InsertTableRow, DeleteTableRow], Optional[str]]], Optional[str]]:
+        matches = self.mapper.drop_virtual_only_matches(self.mapper.find_all_match_indices(edit.target_text))
+        resolved_mapper = self.mapper
+        if not matches:
+            if not self.clean_mapper:
+                self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
+            matches = self.clean_mapper.drop_virtual_only_matches(
+                self.clean_mapper.find_all_match_indices(edit.target_text)
+            )
+            resolved_mapper = self.clean_mapper
+
+        if not matches:
+            target_snippet = edit.target_text.strip()[:40]
+            return [], f"- Failed to apply structural edit targeting: '{target_snippet}...'"
+
+        match_mode = getattr(edit, "match_mode", "strict")
+        unique_matches = []
+        seen_trs = set()
+
+        for m_start, m_len in matches:
+            anchor_run, anchor_paragraph = resolved_mapper.get_insertion_anchor(m_start, rebuild_map=False)
+            target_element = (
+                anchor_run._element if anchor_run else (anchor_paragraph._element if anchor_paragraph else None)
+            )
+            tr = None
+            curr = target_element
+            while curr is not None:
+                if curr.tag == qn("w:tr"):
+                    tr = curr
+                    break
+                curr = curr.getparent()
+
+            if tr is not None and tr not in seen_trs:
+                seen_trs.add(tr)
+                unique_matches.append((m_start, m_len))
+
+        if not unique_matches:
+            target_snippet = edit.target_text.strip()[:40]
+            return [], f"- Failed to locate row target: '{target_snippet}...'"
+
+        matches_to_apply = unique_matches
+        if match_mode in ("strict", "first"):
+            matches_to_apply = unique_matches[:1]
+
+        res: List[Tuple[Union[InsertTableRow, DeleteTableRow], Optional[str]]] = []
+        if match_mode == "all" or len(matches_to_apply) > 1:
+            for m_start, _m_len in matches_to_apply:
+                sub_edit = deepcopy(edit)
+                sub_edit._resolved_start_idx = m_start
+                sub_edit._active_mapper_ref = resolved_mapper
+                sub_edit._parent_edit_ref = edit
+                res.append((sub_edit, None))
+        else:
+            edit._resolved_start_idx = matches_to_apply[0][0]
+            edit._active_mapper_ref = resolved_mapper
+            res.append((edit, None))
+
+        return res, None
+
+    def _validate_set_field_edit(self, edit: SetField, edit_idx: int) -> List[str]:
+        from adeu.fields import FieldResolutionError
+        from adeu.redline.gates import CHECKBOX_STATES
+        from adeu.utils.field_write import parse_checkbox_value, refuse_class, refuse_value
+
+        errors: List[str] = []
+        try:
+            hits = self._resolve_set_field_targets(edit)
+        except FieldResolutionError as fe:
+            return [f"- Edit {edit_idx} Failed: {fe}"]
+
+        refusal = None
+        for entry in hits:
+            info = self._sdt_info_for_ordinal(entry.ordinal)
+            cls = info.cls if info is not None else entry.cls_word
+            refusal = refuse_class(cls, entry.ordinal)
+            if refusal is None and info is not None:
+                refusal = refuse_value(info, entry.ordinal, edit.value)
+            if refusal is not None:
+                return [f"- Edit {edit_idx} Failed: {refusal}"]
+
+        for entry in hits:
+            span = self._cc_content_range(entry.ordinal)
+            info = self._sdt_info_for_ordinal(entry.ordinal)
+            if span is None:
+                if info is None or info.cls != "checkbox":
+                    continue
+                wanted = parse_checkbox_value(edit.value)
+                current = CHECKBOX_STATES[1] if info.checked else CHECKBOX_STATES[0]
+                new_token = CHECKBOX_STATES[1] if wanted else CHECKBOX_STATES[0]
+                gate_err = self._check_control_gates(
+                    edit_idx,
+                    ModifyText(
+                        type="modify",
+                        target_text=current,
+                        new_text=new_token,
+                        comment=edit.comment,
+                    ),
+                    self.mapper,
+                    0,
+                    0,
+                    final_target=current,
+                    final_new=new_token,
+                    known_controls=[info],
+                    from_set_field=True,
+                )
+                if gate_err:
+                    errors.append(gate_err)
+                    break
+                continue
+
+            start, end = span
+            current = self.mapper.full_text[start:end]
+            probe = ModifyText(
+                type="modify",
+                target_text=current,
+                new_text=edit.value,
+                comment=edit.comment,
+            )
+            probe._parent_edit_ref = edit
+            gate_err = self._check_control_gates(
+                edit_idx,
+                probe,
+                self.mapper,
+                start,
+                end - start,
+                final_target=current,
+                final_new=edit.value,
+                known_controls=[info] if info is not None else None,
+                from_set_field=True,
+            )
+            if gate_err:
+                errors.append(gate_err)
+                break
+
+        return errors
+
     def validate_edits(
         self,
-        edits: List[Union[ModifyText, InsertTableRow, DeleteTableRow]],
+        edits: List[Union[ModifyText, InsertTableRow, DeleteTableRow, SetField]],
         index_offset: int = 0,
     ) -> List[str]:
         """
@@ -2007,6 +2588,9 @@ class RedlineEngine:
             # are meaningless for them and false-positive whenever the target
             # coincidentally matches unrelated text (a comment timestamp, an
             # earlier redline). The string-shape checks above still apply.
+            if isinstance(edit, SetField):
+                errors.extend(self._validate_set_field_edit(edit, i + 1))
+                continue
             if (
                 getattr(edit, "_match_start_index", None) is not None
                 or getattr(edit, "_resolved_start_idx", None) is not None
@@ -2136,6 +2720,7 @@ class RedlineEngine:
                         target_text=edit.target_text,
                         haystack=active_text,
                         match_positions=positions,
+                        terse=self.terse_errors,
                     )
                 )
 
@@ -2182,6 +2767,29 @@ class RedlineEngine:
                 # the shared context are fine.
                 eff_start = start + prefix_len
                 eff_end = start + length - suffix_len
+
+                # CC-4 content-control gates (spec-gates §2). Same shape as
+                # the part-boundary refusal above, for the same reason: a
+                # control wall is a place where an edit that looks fine in the
+                # flattened projection cannot be applied to the XML.
+                #
+                # The CHANGED range (eff_*), not the raw match, so shared
+                # context reaching into a locked control does not by itself
+                # refuse the edit — the caller is not modifying it. This is
+                # the image-marker gate's rule, not the part gate's: the part
+                # gate uses the raw range because the insertion ANCHOR is
+                # ambiguous at a part gap, which has no analogue here.
+                gate_error = self._check_control_gates(
+                    i + 1,
+                    edit,
+                    target_mapper,
+                    eff_start,
+                    max(eff_end - eff_start, 0),
+                    final_target=final_target,
+                    final_new=final_new,
+                )
+                if gate_error:
+                    errors.append(gate_error)
                 if eff_end > eff_start:
                     overlapping = [
                         s
@@ -2297,15 +2905,43 @@ class RedlineEngine:
                     # overlaps that straddle the insertion boundary.
                     fully_within_foreign_ins = not has_non_foreign_real_text
                     if not (match_mode in ("strict", "first") and fully_within_foreign_ins):
-                        author_hints = []
-                        for auth in sorted(ins_authors_to_ids.keys()):
-                            sorted_ids = sorted(ins_authors_to_ids[auth], key=lambda x: int(x) if x.isdigit() else 0)
-                            id_hints = ", ".join(f"Chg:{cid}" for cid in sorted_ids)
-                            author_hints.append(f"{auth} (e.g. {id_hints})" if id_hints else auth)
-                        errors.append(
-                            f"- Edit {i + 1} Failed: Modification targets an active insertion from another author "
-                            f"({', '.join(author_hints)}). Accept that change first or scope your edit outside of it."
+                        # Keep the hint bounded: naming every author and every id
+                        # makes the refusal grow without limit, blowing the message
+                        # token budget. One author with up to two ids is enough to
+                        # act on; the rest are summarised as a count.
+                        sorted_authors = sorted(ins_authors_to_ids.keys())
+                        named_author = sorted_authors[0]
+                        sorted_ids = sorted(
+                            ins_authors_to_ids[named_author], key=lambda x: int(x) if x.isdigit() else 0
                         )
+                        first_target_id = f"Chg:{sorted_ids[0]}" if sorted_ids else None
+                        id_hints = ", ".join(f"Chg:{cid}" for cid in sorted_ids[:2])
+                        hint_suffix = f" (e.g. {id_hints})" if id_hints else ""
+                        if len(sorted_authors) > 1:
+                            hint_suffix += f" (+{len(sorted_authors) - 1} more)"
+                        accept_json = (
+                            f'{{"type": "accept", "target_id": "{first_target_id}"}}' if first_target_id else ""
+                        )
+                        # Narrowing to one occurrence only helps when the target
+                        # sits wholly inside the insertion: on a straddle,
+                        # strict/first are refused here too, so offering them
+                        # would send the caller round the same loop.
+                        if match_mode == "all" and fully_within_foreign_ins:
+                            advice = 'or use match_mode="strict" or "first", or scope your edit outside of it.'
+                        else:
+                            advice = "or scope your edit outside of it."
+                        head = f"- Edit {i + 1} Failed: Modification targets an active insertion from another author ("
+                        tail = f"{hint_suffix}). Accept first with {accept_json} {advice}"
+                        # Author names are arbitrary strings (firm and department
+                        # names, not just people), so the name only gets what is
+                        # left of the refusal budget. That keeps the message
+                        # bounded whatever the document says.
+                        author_budget = GUARD_MESSAGE_CAP - len(head) - len(tail)
+                        msg = head + clamp_text(named_author, author_budget) + tail
+                        # w:id values are document-supplied too, and a long one
+                        # blows the budget through head+tail alone (leaving no
+                        # author budget to give back), so clamp the whole message.
+                        errors.append(clamp_text(msg, GUARD_MESSAGE_CAP))
                         continue
 
                 # Foreign comment ranges do NOT block deliberate single-occurrence
@@ -2404,19 +3040,79 @@ class RedlineEngine:
         engine, which re-creates its mapper after each applied edit.
         """
         self.mapper = DocumentMapper(self.doc)
+        # Offsets into mapper.full_text; rebuilt whenever the mapper is.
+        self._cc_anchor_pairs = None
         self.clean_mapper = None
         self.original_mapper = None
 
     def _restore_from_snapshot(self, snapshot: Optional[BytesIO]) -> None:
         """
         Rolls the engine back to a pre-batch snapshot (as produced by
-        save_to_stream). Used for transactional rejection: when any edit in a
-        sequential batch fails validation, every edit the batch already
+        save_to_stream). Used for transactional rejection: when anything in a
+        batch fails, every edit AND every review action the batch already
         applied is undone before the BatchValidationError propagates.
         """
         if snapshot is None:
             return
-        self.__init__(snapshot, author=self.author, id_discovery_hint=self.id_discovery_hint)  # type: ignore[misc]
+        self.__init__(  # type: ignore[misc]
+            snapshot,
+            author=self.author,
+            id_discovery_hint=self.id_discovery_hint,
+            terse_errors=self.terse_errors,
+        )
+
+    def _batch_fingerprint(self) -> str:
+        """
+        Everything a batch can change, cheaply. Compared before the batch and
+        after a rollback to VERIFY the rollback rather than assume it (see
+        `rollback_verified`).
+
+        Every way a batch mutates a document lands here: an applied edit mints
+        new w:ins/w:del ids, accept/reject retires them, reply (and an edit's
+        `comment`) adds a comment id. Count AND ids, because a document may
+        reuse one w:id across several elements.
+
+        Read from the TREE, never from the mapper: the mapper is rebuilt by the
+        rollback but not by every operation that precedes a batch (accept_all
+        leaves it stale by design), so a mapper-derived value would compare a
+        stale "before" against a fresh "after" and report a clean rollback as a
+        leak.
+        """
+        revisions = [
+            n
+            for tag in ("w:ins", "w:del") + self._FORMAT_CHANGE_TAGS
+            # Story parts included: targeted accept/reject reach headers/
+            # footers/notes too (issue #114), so a leak there must fail the
+            # rollback verification exactly like one in the body.
+            for n in self._story_findall(tag)
+        ]
+        return "|".join(
+            (
+                str(len(revisions)),
+                ",".join(self._existing_change_ids()),
+                ",".join(self._existing_comment_ids()),
+            )
+        )
+
+    def _verify_rollback(self, pre_batch_fingerprint: Optional[str]) -> None:
+        """
+        Did the rollback actually roll back? A rejected batch is a promise that
+        the document is untouched; this is the check that the promise held, and
+        the ONLY thing a caching caller can safely key document reuse off.
+
+        Runs AFTER `_restore_from_snapshot`, which re-runs `__init__` and so
+        resets the flag along with everything else.
+
+        None = not fingerprinted (an edit-only batch): the edit rollback path
+        is unchanged and separately pinned, and fingerprinting every batch
+        would put a whole-document revision walk on the hot path for it.
+        """
+        if pre_batch_fingerprint is None:
+            return
+        try:
+            self.rollback_verified = self._batch_fingerprint() == pre_batch_fingerprint
+        except Exception:
+            self.rollback_verified = False
 
     @staticmethod
     def _report_new_text(edit: Any) -> str:
@@ -2490,15 +3186,67 @@ class RedlineEngine:
             "clean_text": clean_text,
             "pages": getattr(edit, "_pages", []),
             "heading_path": getattr(edit, "_heading_path", ""),
+            "field": getattr(edit, "_field", ""),
             "occurrences_modified": getattr(edit, "_occurrences_modified", 0),
             "match_mode": getattr(edit, "match_mode", "strict"),
         }
 
-    def process_batch(self, changes: List[DocumentChange], original_indices: Optional[List[int]] = None) -> dict:
+    def process_batch(
+        self,
+        changes: List[DocumentChange],
+        original_indices: Optional[List[int]] = None,
+        partial: bool = False,
+    ) -> dict:
         """
         Processes a unified batch of actions and edits safely.
         """
-        return self._process_batch_internal(changes, original_indices=original_indices)
+        return self._process_batch_internal(changes, original_indices=original_indices, partial=partial)
+
+    def _field_label_at(self, offset: int) -> str:
+        """``CC:<N> "<alias>" (tag: <tag>)`` for the control containing ``offset``.
+
+        Audit-trail symmetry with ``heading_path`` (spec-fields-ledger §6): a
+        reviewer reading the report needs to know an edit landed inside a
+        content control, because that is what decides whether Word will let a
+        human keep it.
+
+        Resolves the INNERMOST containing control — an edit inside CC:9 reports
+        CC:9, not the group CC:8 that wraps it, which is the more specific and
+        more actionable answer.
+        """
+        pairs = self._cc_anchor_pairs
+        if pairs is None:
+            pairs = []
+            text = self.mapper.full_text
+            opens: dict[int, tuple[int, int]] = {}
+            for m in _CC_ANCHOR_SCAN_RE.finditer(text):
+                ordinal = int(m.group(2))
+                if m.group(1):
+                    if ordinal in opens:
+                        _open_start, open_end = opens.pop(ordinal)
+                        pairs.append((open_end, m.start(), ordinal))
+                else:
+                    opens[ordinal] = (m.start(), m.end())
+            self._cc_anchor_pairs = pairs
+
+        best: tuple[int, int, int] | None = None
+        for start, end, ordinal in pairs:
+            if start <= offset <= end and (best is None or (end - start) < (best[1] - best[0])):
+                best = (start, end, ordinal)
+        if best is None:
+            return ""
+
+        ordinal = best[2]
+        info = next(
+            (i for i in getattr(self.mapper, "_sdt_infos", {}).values() if i.ordinal == ordinal),
+            None,
+        )
+        label = f"CC:{ordinal}"
+        if info is not None and info.alias:
+            label += f' "{info.alias}"'
+        if info is not None and info.tag:
+            label += f" (tag: {info.tag})"
+        return label
 
     def _get_heading_path_and_page(self, start_idx: int, text: str, page_offsets: List[int]) -> Tuple[str, int]:
         page = 1
@@ -2526,13 +3274,94 @@ class RedlineEngine:
                         break
         return " > ".join(path) if path else "", page
 
+    def get_pending_revision_authors(self) -> set[str]:
+        """Collects author names from all pending revisions and comments.
+
+        The ``w:author`` attribute *is* the signal: every tracked-change and
+        comment marker carries it (``w:ins``, ``w:del``, ``w:moveTo``,
+        ``w:pPrChange``, ``w:tblPrChange``, ``w:cellIns``, ``w:cellDel``,
+        ``w:comment``, ...). Matching on a list of tag names instead silently
+        drops the table/row/cell revision markers, so we collect the attribute
+        wherever it appears — in the live body and in every other XML part.
+
+        The walk uses ``iter()`` rather than an XPath predicate on purpose:
+        roots of parts without a registered oxml element class (``w:footnotes``,
+        ``w:endnotes``, ...) are plain lxml elements that bind no ``w`` prefix,
+        so ``//*[@w:author]`` raises ``XPathEvalError`` on them, while
+        ``BaseOxmlElement.xpath()`` accepts no ``namespaces`` argument.
+
+        Word's persona registry is skipped: its ``w15:person`` entries survive
+        accepting every revision, so its ``w:author`` attributes are metadata
+        rather than pending revisions. It is matched on the
+        ``application/vnd.ms-word.people+xml`` content type, because its part
+        name is not fixed (``word/people.xml``, ``word/people1.xml``, ...).
+        """
+        authors: set[str] = set()
+        author_attr = qn("w:author")
+
+        def collect(root: Any) -> None:
+            for el in root.iter(etree.Element):
+                author = el.get(author_attr)
+                if author:
+                    authors.add(author)
+
+        collect(self.doc.element)
+
+        try:
+            comments_data = self.comments_manager.extract_comments_data()
+            for c_info in comments_data.values():
+                c_author = c_info.get("author")
+                if c_author and c_author != "Unknown":
+                    authors.add(c_author)
+        except Exception:
+            pass
+
+        try:
+            package = getattr(self.doc.part, "package", None)
+            parts = list(getattr(package, "parts", None) or ())
+        except Exception:
+            parts = []
+
+        for part in parts:
+            # The main part is already covered by the live body scan above,
+            # which also sees edits not yet serialized to its blob.
+            if part is self.doc.part or not str(part.content_type).endswith("+xml"):
+                continue
+            # Persona registry: identified by its content type, since Word does
+            # not fix its part name (`people.xml`, `people1.xml`, ...).
+            partname = str(part.partname).lower()
+            if str(part.content_type) == "application/vnd.ms-word.people+xml" or "people" in partname:
+                continue
+            try:
+                root = parse_xml(part.blob)
+            except Exception:
+                # Unparsable payload: nothing to scan. Scanning itself is left
+                # outside the guard so real scan failures are never swallowed.
+                continue
+            collect(root)
+
+        return authors
+
     def _process_batch_internal(
-        self, changes: List[DocumentChange], original_indices: Optional[List[int]] = None
+        self,
+        changes: List[DocumentChange],
+        original_indices: Optional[List[int]] = None,
+        partial: bool = False,
     ) -> dict:
         """
         Internal execution engine for batches of edits and actions.
         """
+        pending_authors = self.get_pending_revision_authors()
+        author_impersonation_warning = None
+        if self.author and self.author in pending_authors:
+            author_impersonation_warning = (
+                f"[!] Warning: acting author '{self.author}' matches an author with pending revisions in this document."
+            )
+
         self.skipped_details = []
+        self._overridden_controls = []
+        failed_list: List[Tuple[int, str]] = []
+
         actions_with_idx = [
             (original_indices[i] if original_indices else i, c)
             for i, c in enumerate(changes)
@@ -2541,28 +3370,96 @@ class RedlineEngine:
         edits_with_idx = [
             (original_indices[i] if original_indices else i, c)
             for i, c in enumerate(changes)
-            if isinstance(c, (ModifyText, InsertTableRow, DeleteTableRow))
+            if isinstance(c, (ModifyText, InsertTableRow, DeleteTableRow, SetField))
         ]
 
         actions = [c for _, c in actions_with_idx]
         action_indices = [i for i, _ in actions_with_idx]
 
         applied_actions, skipped_actions, already_resolved_actions = 0, 0, 0
+
+        # ONE transaction for the WHOLE batch. The snapshot has to predate the
+        # review actions, not just the edits: they mutate the document too, and
+        # a rejection promises the caller that "it was rolled back and nothing
+        # was saved". Taken after apply_review_actions, the snapshot CONTAINED
+        # every accept/reject/reply of a batch a later edit went on to reject,
+        # so the rollback could not undo them; a reused engine (or, on the Node
+        # twin, a cached DOM) then carried each rejected attempt's reply into
+        # the next one (BUG 2026-08-12).
+        #
+        # LAZY SNAPSHOT (docs/Performance.md §5.2): the snapshot must equal the
+        # engine's CURRENT state. Until something mutates the tree — a previous
+        # batch on this engine instance — the pristine load-time bytes ARE that
+        # state and the full save_to_stream serialize+re-zip is skipped.
+        # Hoisting the capture above the actions makes that fast path MORE
+        # reachable, since the actions no longer dirty the tree first. What it
+        # does cost is a snapshot for an ACTION-ONLY batch, which used to take
+        # none — on a fresh engine that is a BytesIO over bytes already held.
+        # `partial` is the explicit opt-out of transactional rejection, so it
+        # keeps nothing to roll back to.
+        pre_batch_snapshot: Optional[BytesIO] = None
+        pre_batch_fingerprint: Optional[str] = None
+        # Revision-id watermark: every id above this was minted by THIS batch,
+        # which is how the stranded-anchor advisory tells the deletions it
+        # caused from the ones the document arrived with.
+        pre_batch_revision_id = self.current_id
+        self.rollback_verified = True
+        if not partial and (actions or edits_with_idx):
+            if self._mutated_since_load:
+                pre_batch_snapshot = self.save_to_stream()
+            else:
+                pre_batch_snapshot = BytesIO(self._pristine_bytes)
+            if actions:
+                pre_batch_fingerprint = self._batch_fingerprint()
+
         if actions:
+            # G7/G4 (spec-gates §2): protection gates review actions BEFORE
+            # the id-existence check, because "that id does not exist" would
+            # be a misleading answer to "why did my Accept fail" in a document
+            # where no Accept can succeed at all.
+            protection_errors = [
+                err
+                for err in (
+                    check_protection_blocks_review(
+                        idx + 1,
+                        getattr(act, "type", ""),
+                        self.protection,
+                        self.gate_overrides,
+                    )
+                    for idx, act in zip(action_indices, actions, strict=True)
+                )
+                if err
+            ]
+            if protection_errors:
+                failed_list.extend(_extract_failed_indices(protection_errors))
+                raise BatchValidationError(protection_errors, failed=failed_list)
             action_shape_errors = validate_review_action_batch(actions, indices=action_indices)
             if action_shape_errors:
-                raise BatchValidationError(action_shape_errors)
+                failed_list.extend(_extract_failed_indices(action_shape_errors))
+                raise BatchValidationError(action_shape_errors, failed=failed_list)
             # Document-aware pairing check BEFORE any action mutates the DOM:
             # accept + reject across one replacement's del+ins pair is a
             # contradiction, not two independent operations (ADEU-QA-004).
             pairing_errors = self.validate_action_pairing(actions, indices=action_indices)
             if pairing_errors:
-                raise BatchValidationError(pairing_errors)
+                failed_list.extend(_extract_failed_indices(pairing_errors))
+                raise BatchValidationError(pairing_errors, failed=failed_list)
             applied_actions, skipped_actions, already_resolved_actions = self.apply_review_actions(
                 actions, indices=action_indices
             )
             if skipped_actions > 0:
-                raise BatchValidationError(self.skipped_details)
+                skipped_fails = _extract_failed_indices(self.skipped_details)
+                failed_list.extend(skipped_fails)
+                if not partial:
+                    # An action can fail at APPLY time (a reply whose parent
+                    # cannot be threaded, a w:id shared across authors) — after
+                    # validation passed and after earlier actions in the batch
+                    # already applied. Capture the details first: the restore
+                    # re-initializes the engine, which clears skipped_details.
+                    details = list(self.skipped_details)
+                    self._restore_from_snapshot(pre_batch_snapshot)
+                    self._verify_rollback(pre_batch_fingerprint)
+                    raise BatchValidationError(details, failed=failed_list)
             if edits_with_idx:
                 self.clean_mapper = None
                 self.original_mapper = None
@@ -2579,21 +3476,9 @@ class RedlineEngine:
             # against the document state produced by the edits before it, so a
             # later edit may target text an earlier edit introduced (chaining).
             # Validation failures keep the batch transactional: the run
-            # restores the pre-batch snapshot and rejects everything, with the
+            # restores the pre-batch snapshot — taken above, BEFORE this
+            # batch's actions applied — and rejects everything, with the
             # per-edit reports carried inside the BatchValidationError details.
-            #
-            # LAZY SNAPSHOT (docs/Performance.md §5.2 ported): the snapshot
-            # must equal the engine's CURRENT state. Until something mutates
-            # the tree — actions applied earlier in THIS batch, or a previous
-            # batch on this engine instance — the pristine load-time bytes
-            # are that state, and the full save_to_stream serialize+re-zip is
-            # skipped. Rollback re-initializes from whichever bytes were
-            # chosen, so the restore path is unchanged.
-            if self._mutated_since_load:
-                pre_batch_snapshot = self.save_to_stream()
-            else:
-                pre_batch_snapshot = BytesIO(self._pristine_bytes)
-
             cloned_edits = [(orig_idx, deepcopy(e)) for orig_idx, e in edits_with_idx]
 
             def _pinned_idx(e: Any) -> Optional[int]:
@@ -2624,6 +3509,8 @@ class RedlineEngine:
                 if shape_errors:
                     validation_errors.extend(shape_errors)
                     skipped_edits += 1
+                    err_msg = "\n".join(shape_errors)
+                    failed_list.append((orig_idx, err_msg))
                     reports_by_input[k] = {
                         "status": "failed",
                         "type": getattr(e, "type", "modify"),
@@ -2631,7 +3518,7 @@ class RedlineEngine:
                         "new_text": truncate_middle(self._report_new_text(e), REPORT_ECHO_CAP),
                         "comment": getattr(e, "comment", None),
                         "warning": None,
-                        "error": "\n".join(shape_errors),
+                        "error": err_msg,
                         "critic_markup": None,
                         "clean_text": None,
                     }
@@ -2646,8 +3533,11 @@ class RedlineEngine:
                 # slice the actual post-apply document state (F6).
                 if p_applied > 0:
                     self._refresh_after_sequential_edit()
-                for k, _, e in pinned_ok:
-                    reports_by_input[k] = self._build_edit_report(e)
+                for k, orig_idx, e in pinned_ok:
+                    rep = self._build_edit_report(e)
+                    reports_by_input[k] = rep
+                    if rep.get("status") == "failed":
+                        failed_list.append((orig_idx, rep.get("error") or "Failed to apply edit"))
 
             for k, orig_idx, edit in unpinned:
                 try:
@@ -2657,7 +3547,9 @@ class RedlineEngine:
                     # validation error, never a hang or traceback (QA F5).
                     single_errors = [f"- Edit {orig_idx + 1} Failed: {e}"]
                 if single_errors:
-                    if applied_edits > 0:
+                    err_text = "\n".join(single_errors)
+                    failed_list.append((orig_idx, err_text))
+                    if applied_edits > 0 and not partial:
                         hint = (
                             f"\n  Note: {applied_edits} earlier edit(s) in this batch validated "
                             "against the intermediate document state; because this batch failed, it "
@@ -2692,19 +3584,41 @@ class RedlineEngine:
                 # preview slices the actual post-apply document state (F6).
                 if e_applied > 0:
                     self._refresh_after_sequential_edit()
-                reports_by_input[k] = self._build_edit_report(edit)
+                rep = self._build_edit_report(edit)
+                reports_by_input[k] = rep
+                if rep.get("status") == "failed":
+                    failed_list.append((orig_idx, rep.get("error") or "Failed to apply edit"))
 
-            if validation_errors:
-                # Transactional rejection: undo every edit this batch
-                # already applied before raising.
+            if not partial and validation_errors:
+                # Transactional rejection: undo everything this batch already
+                # applied — its edits AND its review actions — before raising.
                 self._restore_from_snapshot(pre_batch_snapshot)
-                raise BatchValidationError(validation_errors)
+                self._verify_rollback(pre_batch_fingerprint)
+                raise BatchValidationError(
+                    validation_errors,
+                    failed=failed_list,
+                )
 
             edits_reports = [r for r in reports_by_input if r is not None]
 
+        # Cross-edit advisory: individually legal deletions can still add up to
+        # a sentence that reads as gibberish once accepted. Runs only after the
+        # batch has committed, and only ever appends to skipped_details.
+        if applied_edits > 0:
+            try:
+                self._warn_stranded_comment_anchors(pre_batch_revision_id)
+            except Exception:
+                # An advisory must never be able to fail a committed batch.
+                logger.debug("stranded_comment_anchor_check_failed", exc_info=True)
+
         from adeu import __version__
 
+        failed_objs = [{"index": idx, "reason": reason, "error": reason} for idx, reason in failed_list]
+        status_str = "partial" if (partial and failed_list) else "ok"
+
         return {
+            "status": status_str,
+            "failed": failed_objs,
             "actions_applied": applied_actions,
             "actions_skipped": skipped_actions,
             # Actions whose target was already resolved by an earlier action
@@ -2721,6 +3635,11 @@ class RedlineEngine:
             "occurrences_modified": sum((r.get("occurrences_modified") or 0) for r in edits_reports),
             "skipped_details": self.skipped_details,
             "edits": edits_reports,
+            "author_impersonation_warning": author_impersonation_warning,
+            # spec-gates §5: an override that was actually exercised is
+            # disclosed in the report header. Silence here would let a batch
+            # bypass a safety rail with no trace for the human reviewing it.
+            "overrides_note": overrides_note(self.gate_overrides, self._overridden_controls),
             "engine": "python",
             "version": __version__,
         }
@@ -2787,9 +3706,410 @@ class RedlineEngine:
                 edit._reserved_ins_id = self._get_next_id()
             # COMMENT_ONLY / URL_RETARGET consume no revision ids.
 
+    # ------------------------------------------------------------------
+    # set_field (CC-5, spec-set-field.md)
+    # ------------------------------------------------------------------
+
+    def _field_entries(self) -> List[Any]:
+        """The ledger rows for the CURRENT document state.
+
+        Deliberately re-collected whenever the projection has been rebuilt: a
+        `set_field` earlier in the batch may have filled, cleared or unwrapped
+        a control, and resolving a later one against a stale ledger would
+        target an offset that no longer means what it did.
+        """
+        from adeu.fields import collect_fields
+
+        cached: Optional[Tuple[str, List[Any]]] = self._field_entries_cache
+        if cached is not None and cached[0] is self.mapper.full_text:
+            return cached[1]
+        entries = collect_fields(self.doc, self.mapper.full_text, None)
+        self._field_entries_cache = (self.mapper.full_text, entries)
+        return entries
+
+    def _resolve_set_field_targets(self, edit: "SetField") -> List[Any]:
+        """The controls this `set_field` names, or a FieldResolutionError."""
+        from adeu.fields import resolve_field
+
+        return resolve_field(self._field_entries(), edit.field, edit.match_mode)
+
+    def _sdt_info_for_ordinal(self, ordinal: int) -> Any:
+        return next(
+            (i for i in getattr(self.mapper, "_sdt_infos", {}).values() if i.ordinal == ordinal),
+            None,
+        )
+
+    def _cc_content_range(self, ordinal: int) -> Optional[Tuple[int, int]]:
+        """The projection offsets BETWEEN this control's anchor pair.
+
+        `None` when the control does not anchor (spec §1 leaves groups,
+        repeating sections and nested-rich-text ledger-only), which is the
+        signal that it has no single editable content span.
+        """
+        self._field_label_at(0)  # builds _cc_anchor_pairs if cold
+        for start, end, ord_ in self._cc_anchor_pairs or []:
+            if ord_ == ordinal:
+                return (start, end)
+        return None
+
+    def _resolve_set_field(
+        self,
+        edit: "SetField",
+        resolved_edits: List[Tuple[Union[ModifyText, InsertTableRow, DeleteTableRow], Any]],
+    ) -> None:
+        """Desugar one `set_field` into pinned `ModifyText` sub-edits.
+
+        This is the whole design of CC-5 in one method. `set_field` writes
+        nothing itself: it performs the untracked teardown Word performs
+        (placeholder state, §4.1-4.2), then hands the actual content change to
+        the ordinary edit pipeline as a position-pinned `ModifyText`. That is
+        what makes A4.12 true by construction — the gates, atomicity, author
+        resolution and reporting all see a normal edit, so `set_field` cannot
+        acquire a special pass through any of them by accident.
+        """
+        from adeu.fields import FieldResolutionError
+        from adeu.utils.field_write import (
+            clear_placeholder,
+            find_bound_store,
+            option_is_listed,
+            parse_iso_date,
+            refuse_class,
+            refuse_value,
+            render_date,
+            resolve_option,
+            sdt_content,
+            set_dropdown_last_value,
+            set_full_date,
+            write_bound_value,
+        )
+
+        try:
+            hits = self._resolve_set_field_targets(edit)
+        except FieldResolutionError as fe:
+            edit._applied_status = False
+            edit._error_msg = str(fe)
+            self.skipped_details.append(f"- {fe}")
+            return
+
+        # Phase 0: refuse before touching anything. Class first (A4.11), then
+        # the structure rules (A4.7). Both are checked for EVERY target before
+        # any is written, so a match_mode="all" fan-out cannot half-apply and
+        # leave the document in a state no single call could have produced.
+        for entry in hits:
+            info = self._sdt_info_for_ordinal(entry.ordinal)
+            cls = info.cls if info is not None else entry.cls_word
+            msg = refuse_class(cls, entry.ordinal)
+            if msg is None and info is not None:
+                msg = refuse_value(info, entry.ordinal, edit.value)
+            if msg is not None:
+                edit._applied_status = False
+                edit._error_msg = msg
+                self.skipped_details.append(f"- {msg}")
+                return
+
+        # Phase 1: the untracked teardown, for every target, before any
+        # offsets are read. Clearing a placeholder deletes the ghost text from
+        # the projection, so ranges computed before it would be stale by
+        # exactly the length of the prompt.
+        touched = False
+        for entry in hits:
+            info = self._sdt_info_for_ordinal(entry.ordinal)
+            if info is not None and info.showing_placeholder:
+                if clear_placeholder(info):
+                    touched = True
+        if touched:
+            self._mutated_since_load = True
+            self._invalidate_projection_caches()
+
+        # Phase 1b: per-class value translation. The caller's string is not
+        # always what gets written: a dropdown's `w:value` resolves to its
+        # display text, and a date renders through the control's own format.
+        # Computed per target because two controls sharing a tag may declare
+        # different formats or option lists.
+        effective: dict = {}
+        notes: dict = {}
+        for entry in hits:
+            info = self._sdt_info_for_ordinal(entry.ordinal)
+            if info is None:
+                continue
+            if info.cls in ("dropdown", "combobox"):
+                display, err = resolve_option(info, edit.value)
+                if err is not None:
+                    msg = f"CC:{entry.ordinal}: {err}"
+                    edit._applied_status = False
+                    edit._error_msg = msg
+                    self.skipped_details.append(f"- {msg}")
+                    return
+                effective[entry.ordinal] = display
+                if info.cls == "combobox" and not option_is_listed(info, display):
+                    notes[entry.ordinal] = f"'{display}' is not in the option list"
+            elif info.cls == "date":
+                parts = parse_iso_date(edit.value)
+                if parts is None:
+                    msg = (
+                        f"CC:{entry.ordinal} is a date control; '{edit.value}' is not a date. "
+                        "Use the canonical YYYY-MM-DD form (e.g. 2026-03-01)."
+                    )
+                    edit._applied_status = False
+                    edit._error_msg = msg
+                    self.skipped_details.append(f"- {msg}")
+                    return
+                text, unsupported = render_date(parts, info.date_format)
+                effective[entry.ordinal] = text
+                if unsupported:
+                    notes[entry.ordinal] = (
+                        f"the control's date format '{info.date_format}' is not supported in v1; "
+                        f"wrote the canonical {text}"
+                    )
+
+        # Phase 2: checkboxes are written directly; everything else desugars.
+        def _cls_of(e: Any) -> str:
+            info = self._sdt_info_for_ordinal(e.ordinal)
+            return info.cls if info is not None else e.cls_word
+
+        direct = [e for e in hits if _cls_of(e) == "checkbox"]
+        if direct:
+            ok = True
+            for entry in direct:
+                info = self._sdt_info_for_ordinal(entry.ordinal)
+                if info is None or not self._apply_checkbox_set_field(edit, entry, info):
+                    ok = False
+            if ok:
+                self._invalidate_projection_caches()
+            return
+
+        # Phase 2b: one pinned sub-edit per target.
+        for entry in hits:
+            span = self._cc_content_range(entry.ordinal)
+            if span is None:
+                msg = (
+                    f"CC:{entry.ordinal} is a {entry.cls_word} and is not a value-bearing field. "
+                    "set_field fills text, rich-text, dropdown, combobox, date and checkbox controls."
+                )
+                edit._applied_status = False
+                edit._error_msg = msg
+                self.skipped_details.append(f"- {msg}")
+                return
+
+            start, end = span
+            current = self.mapper.full_text[start:end]
+            value = effective.get(entry.ordinal, edit.value)
+            sub = ModifyText(
+                type="modify",
+                target_text=current,
+                new_text=value,
+                comment=edit.comment,
+            )
+            # Always atomic, comment or not (spec §3): a fill is one logical
+            # act, and word-splitting it would scatter a single field update
+            # across several review entries.
+            sub._internal_op = (
+                EditOperationType.INSERTION
+                if not current
+                else (EditOperationType.DELETION if not edit.value else EditOperationType.MODIFICATION)
+            )
+            sub._resolved_start_idx = start
+            sub._active_mapper_ref = self.mapper
+            sub._parent_edit_ref = edit
+            if not current:
+                # Nothing left inside the control to anchor to; name the host.
+                info = self._sdt_info_for_ordinal(entry.ordinal)
+                if info is not None:
+                    sub._insert_host_el = sdt_content(info.element)
+            if edit._resolved_start_idx is None:
+                edit._resolved_start_idx = start
+                edit._resolved_proxy_edit = sub
+            # The attribute syncs ride along with the content change and take
+            # no revision of their own (spec §5, the URL_RETARGET class): the
+            # visible text carries the redline, and a second revision for the
+            # attribute would show a reviewer two changes for one act.
+            info = self._sdt_info_for_ordinal(entry.ordinal)
+            if info is not None:
+                if info.cls in ("dropdown", "combobox"):
+                    set_dropdown_last_value(info, value)
+                elif info.cls == "date":
+                    parts = parse_iso_date(edit.value)
+                    if parts is not None:
+                        set_full_date(info, parts)
+            # A bound control dual-writes: the tracked content change above,
+            # and the CustomXML node it mirrors. The store WINS ON OPEN
+            # (CC-6(e)), so content-only writing to a bound control is data
+            # loss with extra steps - Word silently rewrites the content back
+            # from the store, discarding the edit with no revision to show
+            # for it. A store that cannot be resolved downgrades to
+            # content-only plus a warning, because dangling bindings exist in
+            # the wild and refusing the edit would be worse than disclosing.
+            if info is not None and info.bound:
+                store = find_bound_store(self.doc, info.store_item_id)
+                wrote = store is not None and write_bound_value(store, info.binding_xpath, value, info.prefix_mappings)
+                if wrote:
+                    notes[entry.ordinal] = f"bound store {info.binding_xpath} updated to match" + (
+                        f"; {notes[entry.ordinal]}" if entry.ordinal in notes else ""
+                    )
+                else:
+                    notes[entry.ordinal] = (
+                        f"WARNING: this field is bound to {info.binding_xpath} but the data store "
+                        "could not be resolved, so only the visible text was updated. If the store "
+                        "is restored later, Word will overwrite this edit from it."
+                        + (f"; {notes[entry.ordinal]}" if entry.ordinal in notes else "")
+                    )
+
+            note = notes.get(entry.ordinal)
+            if note:
+                existing = edit._warning
+                edit._warning = f"{existing}; {note}" if existing else note
+            # A `w:temporary` control does not survive being edited: Word
+            # unwraps it on ANY content change, tracked or not (CC-6(c)). The
+            # unwrap is one-way - the revision outlives the wrapper, so
+            # rejecting the fill restores the old text but not the control -
+            # and matching Word here is what keeps a round trip stable.
+            if info is not None and info.temporary:
+                sub._unwrap_sdt_after = info.element
+                existing_note = notes.get(entry.ordinal)
+                unwrap_note = "this control was temporary and has been unwrapped, as Word does on any edit"
+                notes[entry.ordinal] = f"{existing_note}; {unwrap_note}" if existing_note else unwrap_note
+                note = notes.get(entry.ordinal)
+                if note:
+                    edit._warning = note
+
+            resolved_edits.append((sub, value))
+
+    def _apply_checkbox_set_field(self, edit: "SetField", entry: Any, info: Any) -> bool:
+        """The checkbox fill (A4.6), which cannot desugar into a ModifyText.
+
+        A checkbox has no anchor pair and no editable content span - it
+        projects as virtual `[x]` text - so there is no offset for a pinned
+        edit to target. It is written directly instead: the state attribute
+        flips silently, and the glyph swap carries the redline.
+
+        `w:ins` goes BEFORE `w:del`, which is Word's own order (CC-6(b)) and
+        is visible rather than cosmetic: the projection reads document order,
+        so the reverse would render `{--Y--}{++N++}` where Word renders
+        `{++N++}{--Y--}`.
+        """
+        from copy import deepcopy
+
+        from adeu.utils.field_write import (
+            checkbox_glyph,
+            glyph_run,
+            parse_checkbox_value,
+            set_checkbox_checked,
+        )
+
+        checked = parse_checkbox_value(edit.value)
+        if checked is None:
+            msg = (
+                f"CC:{entry.ordinal} is a checkbox; '{edit.value}' is neither checked nor unchecked. "
+                "Use true/false (also accepted: x, [x], 1, 0, yes, no)."
+            )
+            edit._applied_status = False
+            edit._error_msg = msg
+            self.skipped_details.append(f"- {msg}")
+            return False
+
+        old_run = glyph_run(info)
+        char, font = checkbox_glyph(info, checked)
+
+        new_run = deepcopy(old_run) if old_run is not None else create_element("w:r")
+        assert new_run is not None
+        for t in new_run.findall(qn("w:t")):
+            new_run.remove(t)
+        t_el = create_element("w:t")
+        t_el.text = char
+        new_run.append(t_el)
+        if font:
+            rpr = new_run.find(qn("w:rPr"))
+            if rpr is None:
+                rpr = create_element("w:rPr")
+                new_run.insert(0, rpr)
+            for existing in rpr.findall(qn("w:rFonts")):
+                rpr.remove(existing)
+            fonts = create_element("w:rFonts")
+            for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+                fonts.set(qn(attr), font)
+            rpr.insert(0, fonts)
+
+        ins = self._create_track_change_tag("w:ins", reuse_id=self._get_next_id())
+        ins.append(new_run)
+
+        parent = old_run.getparent() if old_run is not None else None
+        if parent is None:
+            from adeu.utils.field_write import sdt_content
+
+            parent = sdt_content(info.element)
+            if parent is None:
+                return False
+            parent.append(ins)
+        else:
+            # `parent` is non-None only when old_run is, so the old glyph is
+            # always available to wrap as the deletion half of the pair.
+            assert old_run is not None
+            index = list(parent).index(old_run)
+            parent.insert(index, ins)
+            del_tag = self._create_track_change_tag("w:del", reuse_id=self._get_next_id())
+            del_run = deepcopy(old_run)
+            for t in del_run.findall(qn("w:t")):
+                t.tag = qn("w:delText")
+            del_tag.append(del_run)
+            parent.replace(old_run, del_tag)
+
+        set_checkbox_checked(info, checked)
+        self._mutated_since_load = True
+        edit._applied_status = True
+        edit._occurrences_modified = (edit._occurrences_modified or 0) + 1
+        return True
+
+    def _empty_control_fill_host(self, mapper: Any, offset: int) -> Optional[Any]:
+        """`w:sdtContent` when `offset` is the content position of an EMPTY control.
+
+        This is the "empty-pair insertion" surface (A4.10): the sanctioned way
+        to fill a field with a text-first edit is to type between its anchors,
+        which produces an insertion at the exact offset where the pair's open
+        and close tokens meet. Offsets alone cannot express "inside" there -
+        the control contains no run to anchor to - so without this the value
+        lands NEXT TO the field, and the document reads
+        `Acme Ltd.{#cc:2}{#/cc:2}` with the control still empty.
+
+        Shared with `set_field` deliberately: A4.10 requires the two routes to
+        produce identical XML, and the only way to guarantee that is for them
+        to run the same code rather than to agree by inspection.
+        """
+        from adeu.utils.field_write import clear_placeholder, sdt_content
+
+        text = getattr(mapper, "full_text", "") or ""
+        if not text:
+            return None
+        opens: dict = {}
+        for m in _CC_ANCHOR_SCAN_RE.finditer(text):
+            ordinal = int(m.group(2))
+            if m.group(1):
+                if ordinal in opens:
+                    _s, open_end = opens.pop(ordinal)
+                    if open_end == m.start() == offset:
+                        info = self._sdt_info_for_ordinal(ordinal)
+                        if info is None:
+                            return None
+                        # Same untracked teardown Word performs, so a
+                        # text-first fill of a placeholder control does not
+                        # leave the ghost styling behind (CC-6(a)).
+                        if info.showing_placeholder and clear_placeholder(info):
+                            self._mutated_since_load = True
+                            self._cc_anchor_pairs = None
+                            self._field_entries_cache = None
+                        return sdt_content(info.element)
+            else:
+                opens[ordinal] = (m.start(), m.end())
+        return None
+
+    def _invalidate_projection_caches(self) -> None:
+        """Drop everything keyed on the projection after an untracked write."""
+        self.mapper._build_map()
+        self._cc_anchor_pairs = None
+        self._field_entries_cache = None
+
     def apply_edits(
         self,
-        edits: List[Union[ModifyText, InsertTableRow, DeleteTableRow]],
+        edits: List[Union[ModifyText, InsertTableRow, DeleteTableRow, SetField]],
         page_offsets: Optional[List[int]] = None,
         index_offset: int = 0,
     ) -> tuple[int, int]:
@@ -2814,14 +4134,44 @@ class RedlineEngine:
             edit._error_msg = None
             edit._any_sub_failure = False
 
-        resolved_edits = []
+        # SetField is absent from this union on purpose: it resolves INTO
+        # pinned ModifyText sub-edits and never reaches the apply layer
+        # itself, which is what lets the gates and the reporting treat a fill
+        # as the ordinary edit it becomes.
+        resolved_edits: List[Tuple[Union[ModifyText, InsertTableRow, DeleteTableRow], Any]] = []
 
         # Pre-resolve phase: locate all edits against initial clean state
         for idx, edit in enumerate(edits):
             edit_idx = index_offset + idx
-            if edit._resolved_start_idx is not None or edit._match_start_index is not None:
+            if isinstance(edit, SetField):
+                # Before the pinned branch: `set_field` addresses its target
+                # by id, so a caller-supplied offset would be meaningless -
+                # and taking the pinned path would hand the apply layer a
+                # change with no target_text at all.
+                self._resolve_set_field(edit, resolved_edits)
+                if edit._error_msg:
+                    skipped += 1
+            elif edit._resolved_start_idx is not None or edit._match_start_index is not None:
                 if edit._resolved_start_idx is None:
                     edit._resolved_start_idx = edit._match_start_index
+                # CC-14: caller-pinned edits skip resolution entirely and go
+                # straight to the apply layer, so the shared-trailing-mark
+                # normalisation the resolution path performs has to happen here
+                # too. make_edits_self_contained widens a target to make it
+                # unique and routinely produces this shape WITH a pinned index
+                # (129 of 4,000 randomised paragraph edits); such a batch
+                # applied in-process — no JSON round trip to drop the index —
+                # silently lost a paragraph break. Structural ops carry an
+                # explicit _internal_op and are left alone.
+                if (
+                    isinstance(edit, ModifyText)
+                    and getattr(edit, "_internal_op", None) is None
+                    and edit.target_text
+                    and edit.new_text
+                ):
+                    edit.target_text, edit.new_text = _trim_shared_trailing_paragraph_mark(
+                        edit.target_text, edit.new_text
+                    )
                 # Caller-pinned indices (diff output) are CLEAN-view character
                 # offsets; the raw-view mapper fallback would mis-anchor them
                 # on documents whose views differ (AP-05).
@@ -2829,73 +4179,27 @@ class RedlineEngine:
                     if not self.clean_mapper:
                         self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
                     edit._active_mapper_ref = self.clean_mapper
+                # A pure insertion landing exactly between an empty control's
+                # anchors is a field fill expressed as text (A4.10).
+                if (
+                    isinstance(edit, ModifyText)
+                    and not edit.target_text
+                    and edit.new_text
+                    and edit._insert_host_el is None
+                ):
+                    host = self._empty_control_fill_host(edit._active_mapper_ref, edit._resolved_start_idx or 0)
+                    if host is not None:
+                        edit._insert_host_el = host
                 resolved_edits.append((edit, getattr(edit, "new_text", None)))
             elif isinstance(edit, (InsertTableRow, DeleteTableRow)):
-                # Simplified resolution for structural edits
-                matches = self.mapper.drop_virtual_only_matches(self.mapper.find_all_match_indices(edit.target_text))
-                resolved_mapper = self.mapper
-                if not matches:
-                    # Try clean view
-                    if not self.clean_mapper:
-                        self.clean_mapper = DocumentMapper(self.doc, clean_view=True)
-                    matches = self.clean_mapper.drop_virtual_only_matches(
-                        self.clean_mapper.find_all_match_indices(edit.target_text)
-                    )
-                    resolved_mapper = self.clean_mapper
-
-                if matches:
-                    match_mode = getattr(edit, "match_mode", "strict")
-
-                    unique_matches = []
-                    seen_trs = set()
-
-                    for m_start, m_len in matches:
-                        anchor_run, anchor_paragraph = resolved_mapper.get_insertion_anchor(m_start, rebuild_map=False)
-                        target_element = None
-                        if anchor_run:
-                            target_element = anchor_run._element
-                        elif anchor_paragraph:
-                            target_element = anchor_paragraph._element
-
-                        tr = None
-                        curr = target_element
-                        while curr is not None:
-                            if curr.tag == qn("w:tr"):
-                                tr = curr
-                                break
-                            curr = curr.getparent()
-
-                        if tr is not None and tr not in seen_trs:
-                            seen_trs.add(tr)
-                            unique_matches.append((m_start, m_len))
-
-                    if unique_matches:
-                        matches_to_apply = unique_matches
-                        if match_mode in ("strict", "first"):
-                            matches_to_apply = unique_matches[:1]
-
-                        if match_mode == "all" or len(matches_to_apply) > 1:
-                            for m_start, _m_len in matches_to_apply:
-                                sub_edit = deepcopy(edit)
-                                sub_edit._resolved_start_idx = m_start
-                                sub_edit._active_mapper_ref = resolved_mapper
-                                sub_edit._parent_edit_ref = edit
-                                resolved_edits.append((sub_edit, None))
-                        else:
-                            edit._resolved_start_idx = matches_to_apply[0][0]
-                            edit._active_mapper_ref = resolved_mapper
-                            resolved_edits.append((edit, None))
-                    else:
-                        skipped += 1
-                        edit._applied_status = False
-                        target_snippet = edit.target_text.strip()[:40]
-                        msg = f"- Failed to locate row target: '{target_snippet}...'"
-                        self.skipped_details.append(msg)
-                        edit._error_msg = msg
-                else:
+                sub_edits, err_msg = self._resolve_structural_table_edit(edit)
+                if err_msg:
                     skipped += 1
-                    target_snippet = edit.target_text.strip()[:40]
-                    self.skipped_details.append(f"- Failed to apply structural edit targeting: '{target_snippet}...'")
+                    edit._applied_status = False
+                    self.skipped_details.append(err_msg)
+                    edit._error_msg = err_msg
+                else:
+                    resolved_edits.extend(sub_edits)
             else:
                 try:
                     resolved = self._pre_resolve_heuristic_edit(edit, index_offset=edit_idx)
@@ -3023,6 +4327,15 @@ class RedlineEngine:
                 # 500 matches took 78s instead of ~2s (QA 2026-07-19 F-06).
                 success = self._apply_single_edit_indexed(edit, original_new_text=orig_new, rebuild_map=False)
 
+            if success and edit._unwrap_sdt_after is not None:
+                # After the content change, never before: the edit resolves
+                # against offsets inside the control, and dissolving the
+                # wrapper first would move them.
+                from adeu.utils.content_controls import SdtInfo as _SdtInfo
+                from adeu.utils.field_write import unwrap_sdt
+
+                unwrap_sdt(_SdtInfo(element=edit._unwrap_sdt_after, cls="text"))
+
             if success:
                 # A balanced multi-paragraph split fans one logical edit into
                 # several paragraph sub-edits sharing a _split_group_id; count it
@@ -3046,6 +4359,7 @@ class RedlineEngine:
                         pages.insert(0, page)
                     parent._pages = pages
                     parent._heading_path = path
+                    parent._field = self._field_label_at(start)
                 else:
                     if first_in_group:
                         edit._occurrences_modified = getattr(edit, "_occurrences_modified", 0) + 1
@@ -3055,6 +4369,7 @@ class RedlineEngine:
                         pages.insert(0, page)
                     edit._pages = pages
                     edit._heading_path = path
+                    edit._field = self._field_label_at(start)
             else:
                 skipped += 1
 
@@ -3317,12 +4632,22 @@ class RedlineEngine:
         # We only consider spans that are tagged with a paragraph (real or
         # virtual prefix), and we require coverage by both endpoints.
 
+        # Per paragraph: [lo, hi] over every span, plus real_lo over spans
+        # backed by an actual run. They differ when the projection prepends a
+        # virtual marker — a Heading 1 paragraph "2. Confidentiality" projects
+        # as "# 2. Confidentiality", so an edit targeting the BARE heading text
+        # starts at real_lo, not lo. That is still a whole-paragraph edit.
+        # Requiring lo alone rejected it, and the edit fell through to the
+        # inline path, which wrote the replacement marker into the document as
+        # literal text ("{++## ++}2. Confidentiality", style left untouched).
+        # The TypeScript engine accepted it, so this was also a parity gap.
         bounds: Dict[Any, List[Optional[int]]] = defaultdict(_empty_bounds)
+        real_lows: Dict[Any, int] = {}
         for s in active_mapper.spans:
             if s.paragraph is None:
                 continue
             # Skip the inter-paragraph "\n\n" virtual separator
-            # (run is None and text == "\n\n" with paragraph != None means
+            # (run is None and text == "\n\n" means
             # the separator was attached to s.paragraph as the trailing
             # newline; we exclude it from the boundary calculation).
             if s.run is None and s.text == "\n\n":
@@ -3333,9 +4658,15 @@ class RedlineEngine:
             if hi is None or s.end > hi:
                 hi = s.end
             bounds[s.paragraph] = [lo, hi]
+            if s.run is not None:
+                prev_real = real_lows.get(s.paragraph)
+                if prev_real is None or s.start < prev_real:
+                    real_lows[s.paragraph] = s.start
 
         for p, (lo, hi) in bounds.items():
-            if lo == start_idx and hi == end_idx:
+            if hi != end_idx:
+                continue
+            if lo == start_idx or real_lows.get(p) == start_idx:
                 target_para = p
 
                 break
@@ -3343,18 +4674,26 @@ class RedlineEngine:
         if target_para is None:
             return None
 
-        # At least one side must be a heading. If neither the source
-        # paragraph nor the new_text is heading-styled, the existing
+        # At least one side must carry a block marker. If the source paragraph
+        # is unstyled and new_text names no block style, the existing
         # inline-edit path handles it correctly — don't intercept.
+        #
+        # This gate used to admit HEADINGS ONLY, which broke dual-engine
+        # parity: for a whole-paragraph replace like modify("Alpha", "- Beta")
+        # the TypeScript engine consumed the "- " and restyled the paragraph to
+        # a bullet, while Python fell through to the inline path and inserted a
+        # literal "- Beta" with no style. The marker leaked into the document as
+        # text. "* ", "- " and "1. " are block markers exactly as "# " is, so
+        # every style _parse_markdown_style recognises is admitted here.
         from adeu.utils.docx import is_heading_paragraph
 
         source_is_heading = is_heading_paragraph(target_para)
 
-        # Detect whether new_text starts with a heading marker.
+        # Detect whether new_text starts with any block marker (heading,
+        # bullet or numbered), not just a heading one.
         new_clean, new_style = self._parse_markdown_style(new_text)
-        new_is_heading = new_style is not None and (new_style.startswith("Heading") or new_style == "Title")
 
-        if not source_is_heading and not new_is_heading:
+        if not source_is_heading and new_style is None:
             return None
 
         # Synthesize a proxy edit pointing at the original paragraph.
@@ -3371,6 +4710,34 @@ class RedlineEngine:
         # Stash the resolved paragraph for the apply step.
         proxy_edit._target_paragraph = target_para  # type: ignore[attr-defined]
         return proxy_edit
+
+    @staticmethod
+    def _restore_matched_typography(actual_doc_text: str, caller_target: str, new_text: str) -> str:
+        """
+        Undoes the typographic drift a forgiving MATCH introduces into a
+        literal WRITE (BUG_comment_threading_anchoring_and_typography.md B4).
+
+        `DocumentMapper` matches a target with straight quotes against a
+        document with curly ones — deliberately, because that is how LLMs
+        normalize typography. The apply path then word-diffs the document's
+        real slice against the caller's `new_text`, so each forgiven character
+        became a genuine `w:del`/`w:ins` pair in text the caller never
+        targeted. Restore the document's characters wherever the caller changed
+        nothing.
+
+        The guard is the asymmetry itself: only when the document slice carries
+        smart typography that the caller's own target does NOT is the match
+        known to have been forgiving. A caller quoting the document's real
+        characters (`“Confidential”` → `"Confidential"`) is asking for the
+        change and still gets it.
+        """
+        if not new_text or not actual_doc_text:
+            return new_text
+        if not has_smart_quotes(actual_doc_text):
+            return new_text
+        if has_smart_quotes(caller_target or ""):
+            return new_text
+        return restore_document_typography(actual_doc_text, new_text)
 
     def _pre_resolve_heuristic_edit(
         self, edit: ModifyText, index_offset: int = 0
@@ -3474,6 +4841,18 @@ class RedlineEngine:
                 else:
                     self._flag_surviving_js_backreference(edit, current_effective_new_text)
 
+            # The matcher forgave a typographic mismatch to find this
+            # occurrence (an LLM writes "parties' Master", the document reads
+            # "parties’ Master"), so the writer must forgive the same one:
+            # otherwise the caller's straight quotes are written back verbatim
+            # and every untargeted curly character becomes a real tracked
+            # change on a provision nobody touched (B4). Keyed on the MATCH
+            # being typography-forgiving — a caller who quotes the document's
+            # own characters and asks for different ones still gets the change.
+            current_effective_new_text = self._restore_matched_typography(
+                actual_doc_text, edit.target_text, current_effective_new_text
+            )
+
             # Stash the first occurrence's full match for the report preview,
             # so it can show the complete logical change rather than only the
             # first word-diff sub-edit (e.g. "{--two--}{++five++} (2) years"
@@ -3544,6 +4923,12 @@ class RedlineEngine:
             final_target = target_str[prefix_len : len(target_str) - suffix_len]
             final_new = new_str[prefix_len : len(new_str) - suffix_len]
             start = base_offset + prefix_len
+
+            # CC-14: see _trim_shared_trailing_paragraph_mark. trim_common_context
+            # is word-boundary aware and will not trim across "\n\n", so a
+            # commented change like "A.\n\n" -> "Z.\n\nY.\n\n" arrives whole.
+            final_target, final_new = _trim_shared_trailing_paragraph_mark(final_target, final_new)
+
             if not final_target and final_new:
                 op = EditOperationType.INSERTION
             elif final_target and not final_new:
@@ -3819,8 +5204,31 @@ class RedlineEngine:
             proxy_edit._active_mapper_ref = active_mapper
             return proxy_edit
 
-        if effective_new_text.startswith(actual_doc_text.rstrip()):
-            # Smart Fallback: Handle trailing space omissions (e.g. LLM appended \n without the space)
+        if (
+            effective_new_text.startswith(actual_doc_text.rstrip())
+            and len(effective_new_text) > len(actual_doc_text.rstrip())
+            # CC-14: ...but NOT when the replacement introduces a paragraph
+            # break the target does not have. This branch preserves the
+            # target's trailing whitespace by inserting BEFORE it, which is
+            # right for a separator space inside one paragraph ("Section 1 " →
+            # "Section 1 Revised" must not glue the next word on) and wrong the
+            # moment a "\n\n" lands in the remainder: the preserved space is
+            # then stranded at the START of the new paragraph. A paragraph
+            # split at a space is exactly the shape the diff emits for
+            # "0 0." → "0.\n\n0.", which applied cleanly and produced
+            # "0.\n\n 0." — accepted, reported successful, silently wrong.
+            # The F1 rule below already resolves this shape correctly, as one
+            # atomic modification consuming the WHOLE matched span, so fall
+            # through to it rather than duplicating the reasoning here.
+            and not ("\n\n" in effective_new_text and "\n\n" not in actual_doc_text)
+        ):
+            # Smart Fallback: Handle trailing space omissions (e.g. LLM appended \n without the space).
+            # It only applies when the new text genuinely EXTENDS the rstripped target: when the
+            # remainder is empty the caller asked to DELETE the target's trailing whitespace (most
+            # importantly a "\n\n" paragraph mark, the shape make_edits_self_contained emits for a
+            # paragraph merge), and an insertion of "" would silently drop that deletion while the
+            # batch still reported the edit as applied. Fall through to the trimming path instead,
+            # which resolves it as the DELETION validate_edits already predicted.
             proxy_edit = ModifyText(
                 type="modify",
                 target_text="",
@@ -4000,6 +5408,201 @@ class RedlineEngine:
             se._split_group_id = start_idx
         return sub_edits
 
+    def _apply_url_retarget(self, edit: ModifyText, active_mapper: Any, start_idx: int) -> bool:
+        target_spans = [s for s in active_mapper.spans if s.start <= start_idx < s.end]
+        if target_spans and target_spans[0].hyperlink_id:
+            owner = target_spans[0].paragraph
+            part = owner.part if owner is not None and getattr(owner, "part", None) is not None else self.doc.part
+            try:
+                rel = part.rels[target_spans[0].hyperlink_id]
+            except KeyError:
+                logger.warning(
+                    "Hyperlink relationship not found; skipping URL retarget",
+                    r_id=target_spans[0].hyperlink_id,
+                )
+                return False
+            rel._target = edit.new_text
+            return True
+        return False
+
+    def _apply_comment_only(
+        self,
+        edit: ModifyText,
+        active_mapper: Any,
+        start_idx: int,
+        length: int,
+        rebuild_map: bool,
+    ) -> bool:
+        target_runs = active_mapper.find_target_runs_by_index(start_idx, length, rebuild_map=rebuild_map)
+        if not target_runs:
+            return False
+        if edit.comment:
+            first_el = target_runs[0]._element
+            last_el = target_runs[-1]._element
+            start_p = first_el.getparent()
+            while start_p is not None and start_p.tag != qn("w:p"):
+                start_p = start_p.getparent()
+            end_p = last_el.getparent()
+            while end_p is not None and end_p.tag != qn("w:p"):
+                end_p = end_p.getparent()
+
+            def _ascend_to_paragraph_child(el, p):
+                cur = el
+                while cur.getparent() is not None and cur.getparent() is not p:
+                    cur = cur.getparent()
+                return cur
+
+            if start_p is not None and end_p is not None:
+                first_anchor = _ascend_to_paragraph_child(first_el, start_p)
+                last_anchor = _ascend_to_paragraph_child(last_el, end_p)
+                if start_p == end_p:
+                    self._attach_comment(start_p, first_anchor, last_anchor, edit.comment)
+                else:
+                    self._attach_comment_spanning(start_p, first_anchor, end_p, last_anchor, edit.comment)
+        return True
+
+    def _apply_insertion_op(
+        self,
+        edit: ModifyText,
+        active_mapper: Any,
+        start_idx: int,
+        suppress_emphasis: bool,
+        ins_id: Optional[str],
+        rebuild_map: bool,
+    ) -> bool:
+        final_new_text = edit.new_text or ""
+
+        boundary_anchor: Optional[TextSpan] = None
+        boundary = active_mapper.part_boundary_at(start_idx) if hasattr(active_mapper, "part_boundary_at") else None
+        is_machine_pure_insertion = not edit.target_text and getattr(edit, "_parent_edit_ref", None) is None
+        if boundary is not None and is_machine_pure_insertion:
+            prev_i, next_i = boundary
+            prev_kind = active_mapper.part_kind_of(prev_i)
+            next_kind = active_mapper.part_kind_of(next_i)
+            if prev_kind == "body" and next_kind != "body":
+                real_before = [s for s in active_mapper.spans if s.run is not None and s.part_index == prev_i]
+                if real_before:
+                    boundary_anchor = real_before[-1]
+
+        if boundary_anchor is not None:
+            anchor_run, anchor_paragraph = boundary_anchor.run, boundary_anchor.paragraph
+            if not final_new_text.startswith("\n"):
+                final_new_text = "\n\n" + final_new_text
+        elif edit._insert_host_el is not None:
+            anchor_run, anchor_paragraph = None, None
+        else:
+            anchor_run, anchor_paragraph = active_mapper.get_insertion_anchor(start_idx, rebuild_map=rebuild_map)
+        if not anchor_run and not anchor_paragraph and edit._insert_host_el is None:
+            return False
+
+        insert_before = False
+        if anchor_run is None and anchor_paragraph is not None:
+            preceding = [s for s in active_mapper.spans if s.end == start_idx and s.paragraph == anchor_paragraph]
+            if preceding and preceding[-1].text != "\n\n":
+                insert_before = True
+
+        parent = None
+        index = 0
+        if edit._insert_host_el is not None:
+            parent = edit._insert_host_el
+            index = len(parent)
+        elif anchor_run:
+            parent = anchor_run._element.getparent()
+            index = parent.index(anchor_run._element)
+            if parent.tag == qn("w:del"):
+                del_wrapper = parent
+                parent = del_wrapper.getparent()
+                if parent is not None:
+                    index = parent.index(del_wrapper)
+        elif anchor_paragraph:
+            parent = anchor_paragraph._element
+            for i, child in enumerate(parent):
+                if child.tag == qn("w:pPr"):
+                    index = i + 1
+                else:
+                    break
+
+        if parent is None:
+            return False
+
+        if self._introduces_table_row_text(active_mapper, start_idx, 1, "", final_new_text):
+            return False
+
+        if start_idx == 0:
+            ins_elem, last_p = self.track_insert(
+                final_new_text,
+                anchor_run=anchor_run,
+                anchor_paragraph=anchor_paragraph,
+                comment=edit.comment,
+                suppress_inherited=suppress_emphasis,
+                insert_before=True,
+                reuse_id=ins_id,
+            )
+            if ins_elem is not None:
+                if parent.tag == qn("w:ins"):
+                    self._insert_and_split_ins(parent, index, ins_elem)
+                    actual_parent = parent.getparent()
+                else:
+                    parent.insert(index, ins_elem)
+                    actual_parent = parent
+
+                if edit.comment:
+                    if last_p is not None:
+                        last_ins_candidates = [
+                            node for node in last_p.findall(f".//{qn('w:ins')}") if not self._is_inside_pPr(node)
+                        ]
+                        if last_ins_candidates:
+                            last_ins = last_ins_candidates[-1]
+                            self._attach_comment_spanning(actual_parent, ins_elem, last_p, last_ins, edit.comment)
+                        else:
+                            self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+                    else:
+                        self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+        else:
+            if anchor_run:
+                next_run = self._get_next_run(anchor_run)
+                style_run = self._determine_style_source(anchor_run, next_run, final_new_text)
+            else:
+                style_run = None
+
+            ins_elem, last_p = self.track_insert(
+                final_new_text,
+                anchor_run=style_run,
+                anchor_paragraph=anchor_paragraph,
+                comment=edit.comment,
+                suppress_inherited=suppress_emphasis,
+                insert_before=insert_before,
+                reuse_id=ins_id,
+                positional_anchor_run=anchor_run,
+            )
+            if ins_elem is not None:
+                if parent.tag == qn("w:ins"):
+                    self._insert_and_split_ins(parent, index + 1, ins_elem)
+                    actual_parent = parent.getparent()
+                else:
+                    insert_idx = index + 1 if anchor_run else index
+                    parent.insert(insert_idx, ins_elem)
+                    actual_parent = parent
+
+                if edit.comment:
+                    if last_p is not None:
+                        last_ins_candidates = [
+                            node for node in last_p.findall(f".//{qn('w:ins')}") if not self._is_inside_pPr(node)
+                        ]
+                        if last_ins_candidates:
+                            last_ins = last_ins_candidates[-1]
+                            self._attach_comment_spanning(actual_parent, ins_elem, last_p, last_ins, edit.comment)
+                        else:
+                            self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+                    else:
+                        self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
+            elif last_p is not None and edit.comment:
+                ins_list = [node for node in last_p.findall(f".//{qn('w:ins')}") if not self._is_inside_pPr(node)]
+                if ins_list:
+                    self._attach_comment(last_p, ins_list[0], ins_list[-1], edit.comment)
+        self._record_used_revision_ids(edit, ins_id)
+        return True
+
     def _apply_single_edit_indexed(
         self,
         edit: ModifyText,
@@ -4048,209 +5651,13 @@ class RedlineEngine:
             ins_id = self._get_next_id()
 
         if op == "URL_RETARGET":
-            target_spans = [s for s in active_mapper.spans if s.start <= start_idx < s.end]
-            if target_spans and target_spans[0].hyperlink_id:
-                # Resolve the relationship on the part that owns the hyperlink
-                # (a footer link's rel lives on the footer part, not the main
-                # document part). A missing id is a clean per-edit failure,
-                # never a raw KeyError('rIdN') traceback (QA 2026-07-18 H3).
-                owner = target_spans[0].paragraph
-                part = owner.part if owner is not None and getattr(owner, "part", None) is not None else self.doc.part
-                try:
-                    rel = part.rels[target_spans[0].hyperlink_id]
-                except KeyError:
-                    logger.warning(
-                        "Hyperlink relationship not found; skipping URL retarget",
-                        r_id=target_spans[0].hyperlink_id,
-                    )
-                    return False
-                rel._target = edit.new_text
-                return True
-            return False
+            return self._apply_url_retarget(edit, active_mapper, start_idx)
 
         if op == "COMMENT_ONLY":
-            target_runs = active_mapper.find_target_runs_by_index(start_idx, length, rebuild_map=rebuild_map)
-            if not target_runs:
-                return False
-            if edit.comment:
-                first_el = target_runs[0]._element
-                last_el = target_runs[-1]._element
-                start_p = first_el.getparent()
-                while start_p is not None and start_p.tag != qn("w:p"):
-                    start_p = start_p.getparent()
-                end_p = last_el.getparent()
-                while end_p is not None and end_p.tag != qn("w:p"):
-                    end_p = end_p.getparent()
-
-                # first_el / last_el may live inside a <w:ins> or <w:del> (e.g. a
-                # comment-only edit anchored on another author's tracked
-                # insertion). _attach_comment needs an element that is a DIRECT
-                # child of the paragraph, so ascend to the child-of-paragraph
-                # ancestor; the comment markers then wrap the whole ins/del.
-                def _ascend_to_paragraph_child(el, p):
-                    cur = el
-                    while cur.getparent() is not None and cur.getparent() is not p:
-                        cur = cur.getparent()
-                    return cur
-
-                if start_p is not None and end_p is not None:
-                    first_anchor = _ascend_to_paragraph_child(first_el, start_p)
-                    last_anchor = _ascend_to_paragraph_child(last_el, end_p)
-                    if start_p == end_p:
-                        self._attach_comment(start_p, first_anchor, last_anchor, edit.comment)
-                    else:
-                        self._attach_comment_spanning(start_p, first_anchor, end_p, last_anchor, edit.comment)
-            return True
+            return self._apply_comment_only(edit, active_mapper, start_idx, length, rebuild_map)
 
         if op == EditOperationType.INSERTION:
-            final_new_text = edit.new_text or ""
-
-            # A MACHINE-PINNED pure insertion (diff/text round-trip output:
-            # authored with an empty target and no parent edit) positioned in
-            # the separator gap between the body and a following part anchors
-            # to the end of the BODY with forced new-paragraph semantics —
-            # anchoring on the next part's first paragraph writes the new
-            # final body paragraph into word/footer1.xml. Insertions DERIVED
-            # from a target-anchored edit (parent ref set — e.g. prepending
-            # "DRAFT " to "FOOTER MARKER") keep the user's chosen anchor:
-            # their context names the part they meant.
-            boundary_anchor: Optional[TextSpan] = None
-            boundary = active_mapper.part_boundary_at(start_idx) if hasattr(active_mapper, "part_boundary_at") else None
-            is_machine_pure_insertion = not edit.target_text and getattr(edit, "_parent_edit_ref", None) is None
-            if boundary is not None and is_machine_pure_insertion:
-                prev_i, next_i = boundary
-                prev_kind = active_mapper.part_kind_of(prev_i)
-                next_kind = active_mapper.part_kind_of(next_i)
-                if prev_kind == "body" and next_kind != "body":
-                    real_before = [s for s in active_mapper.spans if s.run is not None and s.part_index == prev_i]
-                    if real_before:
-                        boundary_anchor = real_before[-1]
-
-            if boundary_anchor is not None:
-                anchor_run, anchor_paragraph = boundary_anchor.run, boundary_anchor.paragraph
-                if not final_new_text.startswith("\n"):
-                    final_new_text = "\n\n" + final_new_text
-            else:
-                anchor_run, anchor_paragraph = active_mapper.get_insertion_anchor(start_idx, rebuild_map=rebuild_map)
-            if not anchor_run and not anchor_paragraph:
-                return False
-
-            insert_before = False
-            if anchor_run is None and anchor_paragraph is not None:
-                preceding = [s for s in active_mapper.spans if s.end == start_idx and s.paragraph == anchor_paragraph]
-                if preceding and preceding[-1].text != "\n\n":
-                    insert_before = True
-
-            parent = None
-            index = 0
-            if anchor_run:
-                parent = anchor_run._element.getparent()
-                index = parent.index(anchor_run._element)
-                # A tracked-deleted anchor (run inside <w:del>) cannot host
-                # the new <w:ins> as a child — an insertion nested inside a
-                # deletion is invalid revision XML. Lift the anchor to the
-                # <w:del> wrapper so the insert lands beside the whole block.
-                if parent.tag == qn("w:del"):
-                    del_wrapper = parent
-                    parent = del_wrapper.getparent()
-                    if parent is not None:
-                        index = parent.index(del_wrapper)
-            elif anchor_paragraph:
-                parent = anchor_paragraph._element
-                for i, child in enumerate(parent):
-                    if child.tag == qn("w:pPr"):
-                        index = i + 1
-                    else:
-                        break
-
-            if parent is None:
-                return False
-
-            # QA 2026-07-18 C2 (apply-level backstop, pinned edits bypass
-            # validate_edits): refuse insertions that would write row-shaped
-            # pipe text into a table cell.
-            if self._introduces_table_row_text(active_mapper, start_idx, 1, "", final_new_text):
-                return False
-
-            if start_idx == 0:
-                ins_elem, last_p = self.track_insert(
-                    final_new_text,
-                    anchor_run=anchor_run,
-                    anchor_paragraph=anchor_paragraph,
-                    comment=edit.comment,
-                    suppress_inherited=suppress_emphasis,
-                    insert_before=True,
-                    reuse_id=ins_id,
-                )
-                if ins_elem is not None:
-                    if parent.tag == qn("w:ins"):
-                        self._insert_and_split_ins(parent, index, ins_elem)
-                        actual_parent = parent.getparent()
-                    else:
-                        parent.insert(index, ins_elem)
-                        actual_parent = parent
-
-                    if edit.comment:
-                        if last_p is not None:
-                            last_ins_candidates = [
-                                node for node in last_p.findall(f".//{qn('w:ins')}") if not self._is_inside_pPr(node)
-                            ]
-                            if last_ins_candidates:
-                                last_ins = last_ins_candidates[-1]
-                                self._attach_comment_spanning(actual_parent, ins_elem, last_p, last_ins, edit.comment)
-                            else:
-                                self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
-                        else:
-                            self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
-            else:
-                if anchor_run:
-                    next_run = self._get_next_run(anchor_run)
-                    style_run = self._determine_style_source(anchor_run, next_run, final_new_text)
-                else:
-                    style_run = None
-
-                ins_elem, last_p = self.track_insert(
-                    final_new_text,
-                    anchor_run=style_run,
-                    anchor_paragraph=anchor_paragraph,
-                    comment=edit.comment,
-                    suppress_inherited=suppress_emphasis,
-                    insert_before=insert_before,
-                    reuse_id=ins_id,
-                    # style_run may be the run AFTER the insertion point (it
-                    # carries formatting only); the insertion physically
-                    # follows anchor_run — suffix relocation keys on it.
-                    positional_anchor_run=anchor_run,
-                )
-                if ins_elem is not None:
-                    if parent.tag == qn("w:ins"):
-                        self._insert_and_split_ins(parent, index + 1, ins_elem)
-                        actual_parent = parent.getparent()
-                    else:
-                        insert_idx = index + 1 if anchor_run else index
-                        parent.insert(insert_idx, ins_elem)
-                        actual_parent = parent
-
-                    if edit.comment:
-                        if last_p is not None:
-                            last_ins_candidates = [
-                                node for node in last_p.findall(f".//{qn('w:ins')}") if not self._is_inside_pPr(node)
-                            ]
-                            if last_ins_candidates:
-                                last_ins = last_ins_candidates[-1]
-                                self._attach_comment_spanning(actual_parent, ins_elem, last_p, last_ins, edit.comment)
-                            else:
-                                self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
-                        else:
-                            self._attach_comment(actual_parent, ins_elem, ins_elem, edit.comment)
-                elif last_p is not None and edit.comment:
-                    # Leading "\n\n" insertions (boundary re-anchors) create
-                    # only new paragraphs — anchor the comment on the last one.
-                    ins_list = [node for node in last_p.findall(f".//{qn('w:ins')}") if not self._is_inside_pPr(node)]
-                    if ins_list:
-                        self._attach_comment(last_p, ins_list[0], ins_list[-1], edit.comment)
-            self._record_used_revision_ids(edit, ins_id)
-            return True
+            return self._apply_insertion_op(edit, active_mapper, start_idx, suppress_emphasis, ins_id, rebuild_map)
 
         # QA 2026-07-18 C1 (apply-level backstop, pinned edits bypass
         # validate_edits): a modification/deletion may never mutate real text
@@ -4271,6 +5678,24 @@ class RedlineEngine:
                     start=start_idx,
                     parts=sorted(crossed_parts),
                 )
+                return False
+
+        # CC-4 (apply-level backstop, same reason as C1 above): pinned edits
+        # skip validate_edits AND the resolver, so a diff-generated batch
+        # reaches here with no gate having run. Only the gates whose answer
+        # cannot change between validate and apply are repeated — locks,
+        # binding and protection are properties of the document, not of the
+        # match, so re-deriving them here is cheap and cannot disagree.
+        if op in (EditOperationType.DELETION, EditOperationType.MODIFICATION) and length:
+            blocked = self._apply_gate_refusal(active_mapper, start_idx, length, edit)
+            if blocked:
+                logger.warning(
+                    "Refusing edit inside a gated content control",
+                    start=start_idx,
+                    reason=blocked,
+                )
+                if getattr(edit, "_error_msg", None) in (None, ""):
+                    edit._error_msg = blocked
                 return False
 
         target_runs = active_mapper.find_target_runs_by_index(start_idx, length, rebuild_map=rebuild_map)
@@ -4684,7 +6109,7 @@ class RedlineEngine:
         return output
 
     def _duplicate_revision_id_error(
-        self, target_id: str, action_type: str, batch_idx: Optional[int] = None
+        self, target_id: str, action_type: str, batch_idx: Optional[int] = None, part: Optional[str] = None
     ) -> Optional[str]:
         """
         Refuses accept/reject on a w:id shared by revisions from DIFFERENT
@@ -4694,12 +6119,13 @@ class RedlineEngine:
         several unrelated changes (QA 2026-07-17 F9). Same-author reuse is
         legitimate — this engine itself mints one id across every element of
         a single logical edit — so authorship is the discriminator.
+
+        `part` scopes the check to the part the action acts on (issue #114):
+        the same number in another part is an unrelated change, reported by
+        the cross-part ambiguity refusal instead.
         """
         nodes = [
-            n
-            for tag in ("w:ins", "w:del")
-            for n in self.doc.element.findall(f".//{qn(tag)}")
-            if n.get(qn("w:id")) == target_id
+            n for tag in ("w:ins", "w:del") for n in self._story_findall(tag, part) if n.get(qn("w:id")) == target_id
         ]
         authors = sorted({n.get(qn("w:author")) or "Unknown" for n in nodes})
         if len(authors) <= 1:
@@ -4716,14 +6142,138 @@ class RedlineEngine:
 
     def _existing_change_ids(self) -> List[str]:
         """Distinct tracked-change ids (w:id on w:ins/w:del and format-change
-        elements — all of them actionable) in the main story."""
+        elements — all of them actionable) across every story part."""
         ids = {
             n.get(qn("w:id"))
             for tag in ("w:ins", "w:del") + self._FORMAT_CHANGE_TAGS
-            for n in self.doc.element.findall(f".//{qn(tag)}")
+            for n in self._story_findall(tag)
             if n.get(qn("w:id"))
         }
         return sorted(ids, key=lambda x: (int(x) if x.isdigit() else 0, x))
+
+    def _warn_stranded_comment_anchors(self, watermark: int) -> None:
+        """
+        Batch-level advisory for the "stranded comment anchor" shape (demo run
+        2026-08-12, defect B).
+
+        Editing around a foreign comment — deleting the words before its anchor
+        and the words after it, while keeping the anchored phrase so the
+        comment survives — is a legitimate move, and each of those deletions is
+        legal on its own. Nothing cross-checked them against each other, so a
+        batch could leave "...necessary for this litigationAttorney's Eyes
+        Only;" behind and report two cleanly applied edits. The caller never
+        learned the sentence it wrote is gibberish once accepted.
+
+        So: warn, never reject. The condition is deliberately narrow, because a
+        false positive here trains the caller to ignore the warning:
+          - the anchored text must SURVIVE (text deleted along with its comment
+            is the normal case and is already reported elsewhere),
+          - there must be deleted text on BOTH sides of it in its own
+            paragraph,
+          - and at least one of those deletions must come from THIS batch, so a
+            condition the caller inherited is not re-reported on every batch.
+
+        `watermark` is the engine's revision-id counter as it stood before the
+        batch: every id above it was minted by this batch (ids are monotonic,
+        and a rejected batch reloads the document, resetting the counter).
+        """
+        try:
+            body = self.doc.element.body
+        except Exception:
+            return
+        starts = body.findall(".//" + qn("w:commentRangeStart"))
+        if not starts:
+            return
+
+        authors: Optional[Dict[str, str]] = None
+        stranded: List[tuple] = []
+
+        for start in starts:
+            cid = start.get(qn("w:id"))
+            if not cid:
+                continue
+
+            # The anchor's own paragraph. A range that closes in a LATER
+            # paragraph is a block-level annotation, not the single-sentence
+            # shape this advisory is about.
+            para = start.getparent()
+            while para is not None and para.tag != qn("w:p"):
+                para = para.getparent()
+            if para is None:
+                continue
+
+            # ONE document-order pass, materialised: lxml hands out throwaway
+            # proxies, so an element's identity is only stable while something
+            # holds a reference to it. Keeping this list is what makes the
+            # positional comparisons below meaningful.
+            elements = list(para.iter())
+
+            start_pos = end_pos = None
+            for i, el in enumerate(elements):
+                if el.get(qn("w:id")) != cid:
+                    continue
+                if start_pos is None and el.tag == qn("w:commentRangeStart"):
+                    start_pos = i
+                elif el.tag == qn("w:commentRangeEnd"):
+                    end_pos = i
+            # A range that closes in a LATER paragraph is a block-level
+            # annotation, not the single-sentence shape this advisory is about.
+            if start_pos is None or end_pos is None or end_pos < start_pos:
+                continue
+
+            def _inside_del(el, root) -> bool:
+                node = el.getparent()
+                while node is not None and node is not root:
+                    if node.tag == qn("w:del"):
+                        return True
+                    node = node.getparent()
+                return False
+
+            # Text inside the range that is NOT itself deleted: what a reader
+            # is left with after accepting everything.
+            surviving = ""
+            deleted_before = deleted_after = owned_by_this_batch = False
+            for i, el in enumerate(elements):
+                if el.tag == qn("w:t"):
+                    if start_pos < i < end_pos and not _inside_del(el, para):
+                        surviving += el.text or ""
+                    continue
+                if el.tag != qn("w:del"):
+                    continue
+                if i < start_pos:
+                    side = "before"
+                elif i > end_pos:
+                    side = "after"
+                else:
+                    continue
+                if not any((d.text or "").strip() for d in el.iter(qn("w:delText"))):
+                    continue
+                if side == "before":
+                    deleted_before = True
+                else:
+                    deleted_after = True
+                rid = el.get(qn("w:id")) or ""
+                if rid.isdigit() and int(rid) > watermark:
+                    owned_by_this_batch = True
+
+            if not surviving.strip():
+                continue
+
+            if deleted_before and deleted_after and owned_by_this_batch:
+                if authors is None:
+                    authors = self._comment_authors()
+                stranded.append((cid, surviving.strip()))
+
+        for cid, text in stranded:
+            who = (authors or {}).get(cid)
+            label = f"comment Com:{cid} (by {who})" if who else f"comment Com:{cid}"
+            self.skipped_details.append(
+                f"- Warning: this batch deleted text on both sides of {label} but left its "
+                f'anchored text "{truncate_middle(text, 60)}" in place, so once the changes are '
+                "accepted that text stands alone in its sentence. If you kept it to preserve the "
+                "comment's anchor, re-read the sentence; if you meant to remove the clause, extend "
+                "one edit over the anchored text too. The edits themselves were applied."
+            )
 
     def _existing_comment_ids(self) -> List[str]:
         """Comment ids present in the document, sorted for display."""
@@ -4733,8 +6283,36 @@ class RedlineEngine:
             ids = []
         return sorted(ids, key=lambda x: (int(x) if x.isdigit() else 0, x))
 
+    def _comment_authors(self) -> Dict[str, str]:
+        """
+        comment id -> author, for attributing a removal to a human. Callers that
+        also need the id SET derive it from `.keys()` rather than calling
+        `_existing_comment_ids` as well: each call re-parses the comments part.
+        """
+        try:
+            return {
+                cid: (data.get("author") or "Unknown")
+                for cid, data in self.comments_manager.extract_comments_data().items()
+            }
+        except Exception:
+            return {}
+
     @staticmethod
-    def _format_id_list(ids: List[str], prefix: str, limit: int = 20) -> str:
+    def _describe_removed_comments(removed: Iterable[str], authors: Dict[str, str]) -> str:
+        """
+        Renders removed comments WITH their authors: an anonymous "removed
+        comment Com:1" reads like the engine's own bookkeeping, which is exactly
+        how the reported run rationalised destroying the reviewer's comment as
+        success (B2). "comment Com:1 (by Sarah Chen)" cannot be misread.
+        """
+        ids = sorted(removed, key=lambda x: (int(x) if x.isdigit() else 0, x))
+        rendered = ", ".join(f"Com:{cid} (by {authors[cid]})" if cid in authors else f"Com:{cid}" for cid in ids)
+        noun = "comment" if len(ids) == 1 else "comments"
+        return f"{noun} {rendered}"
+
+    def _format_id_list(self, ids: List[str], prefix: str, limit: Optional[int] = None) -> str:
+        if limit is None:
+            limit = 8 if getattr(self, "terse_errors", False) else 20
         shown = ids[:limit]
         rendered = ", ".join(f"{prefix}{i}" for i in shown)
         if len(ids) > len(shown):
@@ -4755,8 +6333,7 @@ class RedlineEngine:
         comment_ids = self._existing_comment_ids()
         has_prefix = raw_id.startswith("Chg:") or raw_id.startswith("Com:")
         find_hint = self.id_discovery_hint or (
-            "Run `adeu markup <file> -i` or `adeu extract <file>` to list the current "
-            "change (Chg:) and comment (Com:) ids."
+            "Run `adeu extract <file> --mode changes` to list the current change (Chg:) and comment (Com:) ids."
         )
         prefix = f"- Action {batch_idx + 1} Failed: " if batch_idx is not None else "- Failed to apply action: "
 
@@ -4794,6 +6371,44 @@ class RedlineEngine:
             "(it may already have been accepted or rejected, or the id is stale). " + avail + find_hint
         )
 
+    def _not_found_in_part_error(
+        self, raw_id: str, target_id: str, act, part: str, batch_idx: Optional[int] = None
+    ) -> str:
+        """Not-found variant for an action that named an explicit `part`
+        (issue #114): says where the id DOES live instead of denying it
+        exists."""
+        prefix = f"- Action {batch_idx + 1} Failed: " if batch_idx is not None else "- Failed to apply action: "
+        echo = raw_id if raw_id.startswith("Chg:") else f"Chg:{target_id}"
+        elsewhere = self._parts_holding_id(target_id)
+        where = f"Revisions with that id exist in: {', '.join(elsewhere)}. " if elsewhere else ""
+        find_hint = self.id_discovery_hint or (
+            "Run `adeu extract <file> --mode changes` to list the current change (Chg:) and comment (Com:) ids."
+        )
+        return (
+            f"{prefix}{act.type} on {echo} — no tracked change with w:id={target_id} exists "
+            f"in part '{part}'. " + where + find_hint
+        )
+
+    def _ambiguous_part_error(
+        self, raw_id: str, action_type: str, parts: List[str], batch_idx: Optional[int] = None
+    ) -> str:
+        """
+        Refusal for a bare id matching revisions in several OPC parts (issue
+        #114). Mirrors the same-id-different-authors guard's principle: when
+        an id cannot name one change, refuse rather than guess — but unlike
+        that terminal case, this one is actionable, so the message says
+        exactly how.
+        """
+        prefix = f"- Action {batch_idx + 1} Failed: " if batch_idx is not None else "- Failed to apply action: "
+        bare = raw_id[4:] if raw_id.startswith("Chg:") else raw_id
+        return (
+            f"{prefix}{action_type} on Chg:{bare} is ambiguous: revisions with "
+            f"w:id={bare} exist in {len(parts)} document parts ({', '.join(parts)}). "
+            "Revision ids are numbered per part, so the bare id cannot name one change. "
+            "Re-issue the action with `part` set to the part whose change you mean, "
+            f'e.g. {{"type": "{action_type}", "target_id": "{bare}", "part": "{parts[0]}"}}.'
+        )
+
     @staticmethod
     def _expand_group_with_nested(all_ins: set, all_del: set) -> None:
         """
@@ -4817,15 +6432,20 @@ class RedlineEngine:
                     all_del.add(nested)
                     stack.append(nested)
 
-    def _resolution_group_ids(self, target_id: str) -> set:
+    def _resolution_group_ids(self, target_id: str, part: Optional[str] = None) -> set:
         """
         All revision ids that resolve as ONE unit with `target_id`: the ids of
         every contiguous same-author <w:ins>/<w:del> sibling of its elements
         (a replacement's del+ins pair), plus nested revisions those elements
         contain (chained-edit transients), plus the id itself.
+
+        `part` scopes the lookup to one OPC part. Ids are numbered per part
+        (issue #114), so a group is only well-defined within one part —
+        callers that pass None accept matches from anywhere and must have
+        established the id is unambiguous first.
         """
-        nodes = [n for n in self.doc.element.findall(f".//{qn('w:ins')}") if n.get(qn("w:id")) == target_id]
-        nodes += [n for n in self.doc.element.findall(f".//{qn('w:del')}") if n.get(qn("w:id")) == target_id]
+        nodes = [n for n in self._story_findall("w:ins", part) if n.get(qn("w:id")) == target_id]
+        nodes += [n for n in self._story_findall("w:del", part) if n.get(qn("w:id")) == target_id]
         group = {target_id} if nodes else set()
         group_ins: set = set()
         group_del: set = set()
@@ -4863,12 +6483,26 @@ class RedlineEngine:
             if raw_id.startswith("Com:"):
                 continue
             target_id = raw_id[4:] if raw_id.startswith("Chg:") else raw_id
-            group = self._resolution_group_ids(target_id)
+            # Groups are per-part (issue #114): accepting header1's Chg:1 and
+            # rejecting the body's Chg:1 is NOT a contradiction. Scope to the
+            # action's explicit part, else to the only part holding the id;
+            # an ambiguous or unknown bare id is skipped here — apply reports
+            # those with its own errors.
+            requested_part, part_error = self._action_part_filter(act)
+            if part_error:
+                continue
+            scope = requested_part
+            if scope is None:
+                parts_with_id = self._parts_holding_id(target_id)
+                if len(parts_with_id) != 1:
+                    continue
+                scope = parts_with_id[0]
+            group = self._resolution_group_ids(target_id, part=scope)
             if not group:
                 continue  # unknown ids fail with their own not-found error later
             conflict = None
             for gid in group:
-                prior = group_first.get(gid)
+                prior = group_first.get((scope, gid))
                 if prior is not None and prior[1] != act.type:
                     conflict = prior
                     break
@@ -4885,7 +6519,7 @@ class RedlineEngine:
                 )
                 continue
             for gid in group:
-                group_first.setdefault(gid, (pos, act.type, target_id))
+                group_first.setdefault((scope, gid), (pos, act.type, target_id))
         return errors
 
     def apply_review_actions(
@@ -4929,31 +6563,66 @@ class RedlineEngine:
                 is_change = True
                 is_comment = True
 
-            if is_change and isinstance(act, (AcceptChange, RejectChange)) and target_id in resolved_history:
-                prior_type = resolved_history[target_id]
-                if prior_type == act.type:
-                    # Consistent follow-up on the pair: legitimate agent
-                    # workflow ("accept both ids of the replacement"), but no
-                    # state transition happens — report it accurately.
-                    already_resolved += 1
+            # Issue #114: the action may carry an explicit `part` selector,
+            # and a bare id is honored only while it names revisions in
+            # exactly one part — ids are numbered per part, so one w:id in
+            # two parts names two unrelated changes, and resolving whichever
+            # a body-first walk happens to find is exactly the silent
+            # mis-resolution this refuses. Same principle as the
+            # different-authors guard below — refuse over guess — but this
+            # one is actionable: the error says which parts and how to choose.
+            requested_part: Optional[str] = None
+            acting_part: Optional[str] = None
+            if is_change and isinstance(act, (AcceptChange, RejectChange)):
+                requested_part, part_error = self._action_part_filter(act)
+                if part_error:
                     self.skipped_details.append(
-                        f"- Note: Action {batch_idx + 1} ('{act.type}' on {raw_id}) had no additional effect — "
-                        "the change was already resolved together with its replacement pair by an "
-                        "earlier action in this batch. Counted as already_resolved, not applied."
+                        f"- Action {batch_idx + 1} Failed: {act.type} on {raw_id} — {part_error}"
                     )
+                    skipped += 1
                     continue
-                # Contradiction. validate_action_pairing rejects this shape
-                # before anything mutates; this guard covers direct callers.
-                self.skipped_details.append(
-                    f"- Action {batch_idx + 1} Failed: contradictory action — '{act.type}' on {raw_id}, but "
-                    f"the change was already resolved as '{prior_type}' together with its replacement "
-                    "pair by an earlier action in this batch."
-                )
-                skipped += 1
-                continue
+
+            if is_change and isinstance(act, (AcceptChange, RejectChange)) and target_id in resolved_history:
+                prior_type, prior_part = resolved_history[target_id]
+                if requested_part is None or requested_part == prior_part:
+                    if prior_type == act.type:
+                        # Consistent follow-up on the pair: legitimate agent
+                        # workflow ("accept both ids of the replacement"), but no
+                        # state transition happens — report it accurately.
+                        already_resolved += 1
+                        self.skipped_details.append(
+                            f"- Note: Action {batch_idx + 1} ('{act.type}' on {raw_id}) had no additional effect — "
+                            "the change was already resolved together with its replacement pair by an "
+                            "earlier action in this batch. Counted as already_resolved, not applied."
+                        )
+                        continue
+                    # Contradiction. validate_action_pairing rejects this shape
+                    # before anything mutates; this guard covers direct callers.
+                    self.skipped_details.append(
+                        f"- Action {batch_idx + 1} Failed: contradictory action — '{act.type}' on {raw_id}, but "
+                        f"the change was already resolved as '{prior_type}' together with its replacement "
+                        "pair by an earlier action in this batch."
+                    )
+                    skipped += 1
+                    continue
+                # An explicit different part is a fresh lookup, not a
+                # duplicate of the history entry (issue #114).
 
             if is_change and isinstance(act, (AcceptChange, RejectChange)):
-                dup_error = self._duplicate_revision_id_error(target_id, act.type, batch_idx=batch_idx)
+                acting_part = requested_part
+                if acting_part is None:
+                    parts_with_id = self._parts_holding_id(target_id)
+                    if len(parts_with_id) > 1:
+                        self.skipped_details.append(
+                            self._ambiguous_part_error(raw_id, act.type, parts_with_id, batch_idx=batch_idx)
+                        )
+                        skipped += 1
+                        continue
+                    acting_part = parts_with_id[0] if parts_with_id else None
+
+                dup_error = self._duplicate_revision_id_error(
+                    target_id, act.type, batch_idx=batch_idx, part=acting_part
+                )
                 if dup_error:
                     self.skipped_details.append(dup_error)
                     skipped += 1
@@ -4964,38 +6633,63 @@ class RedlineEngine:
 
             # Accept/reject can delete a comment as a side effect when the
             # comment's anchor falls inside the resolved change. Snapshot the
-            # comment ids first so a removal is reported explicitly instead of
-            # happening silently under "1 applied" (QA 2026-07-22 bug #1).
+            # comment ids AND their authors first so a removal is reported
+            # explicitly — and attributed — instead of happening silently under
+            # "1 applied" (QA 2026-07-22 bug #1; authorship added for
+            # BUG_comment_threading_anchoring_and_typography.md B2: "never
+            # silently delete a comment authored by someone other than the
+            # caller").
             comments_before: set = set()
+            comment_authors: Dict[str, str] = {}
             if isinstance(act, (AcceptChange, RejectChange)) and is_change:
-                comments_before = set(self._existing_comment_ids())
+                comment_authors = self._comment_authors()
+                comments_before = set(comment_authors)
 
             if isinstance(act, AcceptChange):
                 if is_change:
-                    resolved_now = self._accept_change(target_id)
+                    resolved_now = self._accept_change(target_id, part=acting_part)
                     success = bool(resolved_now)
             elif isinstance(act, RejectChange):
                 if is_change:
-                    resolved_now = self._reject_change(target_id)
+                    resolved_now = self._reject_change(target_id, part=acting_part)
                     success = bool(resolved_now)
             elif isinstance(act, ReplyComment):
                 if is_comment:
+                    self._reply_threading_error = None
                     success = self._reply_to_comment(target_id, getattr(act, "text", ""))
 
             if success:
                 for rid in resolved_now:
                     if rid:
-                        resolved_history[rid] = act.type
+                        # acting_part is set whenever a change resolved: the
+                        # lookup that succeeded was scoped to it (issue #114).
+                        resolved_history[rid] = (act.type, acting_part)
                 applied += 1
                 if comments_before:
                     removed = comments_before - set(self._existing_comment_ids())
                     if removed:
-                        removed_list = ", ".join(f"Com:{c}" for c in sorted(removed))
                         self.skipped_details.append(
-                            f"- Note: {act.type} on {raw_id} also removed comment {removed_list} "
+                            f"- Note: {act.type} on {raw_id} also removed "
+                            f"{self._describe_removed_comments(removed, comment_authors)} "
                             "(including any reply thread) because its anchor was inside the resolved "
                             "change. This note is informational — the action itself succeeded."
                         )
+            elif isinstance(act, ReplyComment) and self._reply_threading_error:
+                # The parent comment exists but the reply could not be threaded
+                # onto it. Naming the id kind here would be a lie ("no comment
+                # with that id exists"); the caller needs the real reason (B1).
+                self.skipped_details.append(
+                    f"- Action {batch_idx + 1} Failed: reply on {raw_id} — {self._reply_threading_error}"
+                )
+                self._reply_threading_error = None
+                skipped += 1
+            elif isinstance(act, (AcceptChange, RejectChange)) and requested_part is not None:
+                # A miss under an explicit part says where the id DOES live
+                # instead of denying it exists (issue #114).
+                self.skipped_details.append(
+                    self._not_found_in_part_error(raw_id, target_id, act, requested_part, batch_idx=batch_idx)
+                )
+                skipped += 1
             else:
                 self.skipped_details.append(self._action_not_found_error(raw_id, target_id, act, batch_idx=batch_idx))
                 skipped += 1
@@ -5098,15 +6792,18 @@ class RedlineEngine:
                         if node.get(qn("w:id")) == c_id and node.getparent() is not None:
                             node.getparent().remove(node)
 
-    def _accept_change(self, target_id: str) -> set:
-        primary_ins = [n for n in self.doc.element.findall(f".//{qn('w:ins')}") if n.get(qn("w:id")) == target_id]
-        primary_del = [n for n in self.doc.element.findall(f".//{qn('w:del')}") if n.get(qn("w:id")) == target_id]
+    def _accept_change(self, target_id: str, part: Optional[str] = None) -> set:
+        # `part` scopes every lookup to one OPC part (issue #114): ids are
+        # numbered per part, so the same number elsewhere is an unrelated
+        # change that must not resolve along with this one.
+        primary_ins = [n for n in self._story_findall("w:ins", part) if n.get(qn("w:id")) == target_id]
+        primary_del = [n for n in self._story_findall("w:del", part) if n.get(qn("w:id")) == target_id]
 
         if not primary_ins and not primary_del:
             # Format-only tracked changes (w:rPrChange/w:pPrChange) carry ids
             # the projection advertises; they must be actionable by id too
             # (QA round 3, finding 2.2).
-            return self._resolve_format_change(target_id, accept=True)
+            return self._resolve_format_change(target_id, accept=True, part=part)
 
         all_ins = set(primary_ins)
         all_del = set(primary_del)
@@ -5175,14 +6872,16 @@ class RedlineEngine:
 
         return resolved_ids
 
-    def _reject_change(self, target_id: str) -> set:
-        primary_ins = [n for n in self.doc.element.findall(f".//{qn('w:ins')}") if n.get(qn("w:id")) == target_id]
-        primary_del = [n for n in self.doc.element.findall(f".//{qn('w:del')}") if n.get(qn("w:id")) == target_id]
+    def _reject_change(self, target_id: str, part: Optional[str] = None) -> set:
+        # `part` scopes every lookup to one OPC part (issue #114) — see
+        # _accept_change.
+        primary_ins = [n for n in self._story_findall("w:ins", part) if n.get(qn("w:id")) == target_id]
+        primary_del = [n for n in self._story_findall("w:del", part) if n.get(qn("w:id")) == target_id]
 
         if not primary_ins and not primary_del:
             # Format-only tracked changes: restore the stored original
             # properties (QA round 3, finding 2.2).
-            return self._resolve_format_change(target_id, accept=False)
+            return self._resolve_format_change(target_id, accept=False, part=part)
 
         all_ins = set(primary_ins)
         all_del = set(primary_del)
@@ -5260,7 +6959,7 @@ class RedlineEngine:
 
     _FORMAT_CHANGE_TAGS = ("w:rPrChange", "w:pPrChange", "w:sectPrChange")
 
-    def _resolve_format_change(self, target_id: str, accept: bool) -> set:
+    def _resolve_format_change(self, target_id: str, accept: bool, part: Optional[str] = None) -> set:
         """
         Accept/reject a FORMAT-only tracked change (<w:rPrChange>,
         <w:pPrChange>, <w:sectPrChange>) by id. The projection advertises
@@ -5271,10 +6970,12 @@ class RedlineEngine:
         the original. Reject restores the original: the change element's
         single child holds the pre-change properties — swap them into the
         live properties container.
+
+        `part` scopes the lookup to one OPC part (issue #114).
         """
         resolved: set = set()
         for tag in self._FORMAT_CHANGE_TAGS:
-            for change in self.doc.element.findall(f".//{qn(tag)}"):
+            for change in self._story_findall(tag, part):
                 if change.get(qn("w:id")) != target_id:
                     continue
                 parent = change.getparent()
@@ -5312,7 +7013,17 @@ class RedlineEngine:
         if target_id not in existing_comments:
             return False
 
-        new_comment_id = self.comments_manager.add_comment(self.author, text, parent_id=target_id)
+        try:
+            new_comment_id = self.comments_manager.add_comment(self.author, text, parent_id=target_id)
+        except CommentThreadingError as exc:
+            # A reply that cannot be threaded must NOT be written as a new
+            # top-level comment. The old path wrote it anyway and reported
+            # success, so the agent believed it had answered the reviewer, saw
+            # a stray comment instead, retried, and made the document worse
+            # (BUG_comment_threading_anchoring_and_typography.md B1).
+            logger.warning("Refusing to write an unthreadable reply", target_id=target_id, error=str(exc))
+            self._reply_threading_error = str(exc)
+            return False
 
         self._anchor_reply_comment(target_id, new_comment_id)
         return True
@@ -5369,20 +7080,7 @@ class RedlineEngine:
         # than only when a count is non-zero — comment removal and the
         # non-main parts mutate too.
         self._mutated_since_load = True
-        parts_to_process = [self.doc.element]
-
-        for part in self.doc.part.package.parts:
-            if part == self.doc.part:
-                continue
-            if "wordprocessingml" in part.content_type and part.content_type.endswith("+xml"):
-                element_to_process = None
-                if hasattr(part, "_element"):
-                    element_to_process = part._element
-                else:
-                    if not hasattr(part, "_adeu_element"):
-                        part._adeu_element = parse_xml(part.blob)  # type: ignore[attr-defined]
-                    element_to_process = part._adeu_element  # type: ignore[attr-defined]
-                parts_to_process.append(element_to_process)
+        parts_to_process = self._revision_roots()
 
         # Pre-count revisions and comments before modifying the XML structures.
         # The unit is REVISION ELEMENTS, matching sanitize's
@@ -5403,13 +7101,16 @@ class RedlineEngine:
             for tag in ("w:rPrChange", "w:pPrChange", "w:sectPrChange"):
                 accepted_formatting += len(root_element.findall(f".//{qn(tag)}"))
 
-        # Only claim comments were removed when they actually are.
-        removed_comments = 0
-        if remove_comments:
-            try:
-                removed_comments = len(self.comments_manager.extract_comments_data())
-            except Exception:
-                removed_comments = 0
+        # Only claim comments were removed when they actually are — and count
+        # EVERY body this call deletes, not just the ones a `remove_comments`
+        # request asked for. Accepting a deletion whose range carries a comment
+        # anchor removes that comment (Word behaves the same), so hard-coding 0
+        # for remove_comments=False reported "nothing happened" while a human's
+        # comment was gone — the silent data loss that let the reported run be
+        # rationalised as a success (B2).
+        comment_authors_before = self._comment_authors()
+        comments_before = set(comment_authors_before)
+        self.removed_comment_notes = []
 
         for root_element in parts_to_process:
             for ins in root_element.findall(f".//{qn('w:ins')}"):
@@ -5534,11 +7235,22 @@ class RedlineEngine:
                 elif hasattr(pkg, "parts") and isinstance(pkg.parts, list):
                     pkg.parts[:] = [p for p in pkg.parts if p.partname not in comment_partnames]
 
+        # Books that match the document: when remove_comments ejected the parts
+        # the "after" set is empty, so this still equals the total; when it did
+        # not, it counts exactly the anchors this call consumed. Each removal is
+        # attributed so no caller can mistake a human's comment for engine
+        # bookkeeping (B2).
+        removed_ids = comments_before - set(self._existing_comment_ids())
+        self.removed_comment_notes = [
+            f"Com:{cid} (by {comment_authors_before.get(cid, 'Unknown')})"
+            for cid in sorted(removed_ids, key=lambda x: (int(x) if x.isdigit() else 0, x))
+        ]
+
         return {
             "accepted_insertions": accepted_insertions,
             "accepted_deletions": accepted_deletions,
             "accepted_formatting": accepted_formatting,
-            "removed_comments": removed_comments,
+            "removed_comments": len(removed_ids),
         }
 
     def reject_all_revisions(self):
@@ -5576,20 +7288,7 @@ class RedlineEngine:
         # See accept_all_revisions: flag before mutating, or a later batch's
         # rollback restores pre-reject bytes and resurrects the revisions.
         self._mutated_since_load = True
-        parts_to_process = [self.doc.element]
-
-        for part in self.doc.part.package.parts:
-            if part == self.doc.part:
-                continue
-            if "wordprocessingml" in part.content_type and part.content_type.endswith("+xml"):
-                element_to_process = None
-                if hasattr(part, "_element"):
-                    element_to_process = part._element
-                else:
-                    if not hasattr(part, "_adeu_element"):
-                        part._adeu_element = parse_xml(part.blob)  # type: ignore[attr-defined]
-                    element_to_process = part._adeu_element  # type: ignore[attr-defined]
-                parts_to_process.append(element_to_process)
+        parts_to_process = self._revision_roots()
 
         for root_element in parts_to_process:
             # 1. Reject insertions: drop the <w:ins> and everything inside it.

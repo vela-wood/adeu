@@ -15,24 +15,40 @@ import {
   DocumentObject,
   RedlineEngine,
   BatchValidationError,
+  failure_envelope,
   create_word_patch_diff,
   collect_media_difference_warnings,
   finalize_document,
+  parse_page_arg,
+  PageArgKind,
+  extract_comments_data,
+  response_budget_limit,
+  has_fused_json_marker,
+  FUSED_JSON_HINT,
+  apply_text_revision_core,
+  TextRevisionError,
+  TextRevisionVerificationError,
 } from "@adeu/core";
 import { describe_illegal_control_chars } from "@adeu/core";
 
 import {
   build_paginated_response,
+  build_page_range_response,
   build_full_document_response,
+  build_budget_guard_message,
   build_outline_response,
   build_appendix_response,
   build_search_response,
   render_outline_response,
+  build_changes_response,
+  build_fields_response,
+  banner_for_path,
+  fields_discovery_hint,
 } from "./response-builders.js";
 import { docCache } from "./doc-cache.js";
 import type { ProgressFn } from "./doc-cache.js";
 
-import { MARKDOWN_UI_URI, handleServerCliArgs } from "./shared.js";
+import { MARKDOWN_UI_URI, MCP_ID_DISCOVERY_HINT, handleServerCliArgs } from "./shared.js";
 import { attachProtocolAdapter } from "./protocol-adapter.js";
 // Parity with Python models.py `_infer_type_in_place` + `_coerce_match_mode_in_place`.
 // The MCP boundary schema is permissive; these repairs let recoverable payloads
@@ -55,7 +71,7 @@ const MATCH_MODE_SYNONYMS: Record<string, "strict" | "first" | "all"> = {
   every: "all",
 };
 
-function coerceChangeItemInPlace(item: any): void {
+export function coerceChangeItemInPlace(item: any): void {
   if (item === null || typeof item !== "object" || Array.isArray(item)) return;
 
   // Infer a missing `type` ONLY when exactly one variant fits unambiguously.
@@ -66,6 +82,8 @@ function coerceChangeItemInPlace(item: any): void {
     if ("cells" in item) item.type = "insert_row";
     else if ("text" in item && "target_id" in item) item.type = "reply";
     else if ("target_text" in item && "new_text" in item) item.type = "modify";
+    // Parity with python models.py `_infer_type_in_place`.
+    else if ("field" in item && "value" in item) item.type = "set_field";
   }
 
   // Normalize match_mode: canonical passes through, synonyms map, anything else
@@ -78,9 +96,37 @@ function coerceChangeItemInPlace(item: any): void {
     if (typeof raw !== "string") {
       delete item.match_mode;
     } else {
-      const mapped = MATCH_MODE_SYNONYMS[raw.trim().toLowerCase()];
+      // Own keys only: `raw` is caller-supplied, so "constructor" and
+      // "__proto__" must miss the table (and be dropped) instead of resolving
+      // through Object.prototype and being assigned as a match_mode.
+      const key = raw.trim().toLowerCase();
+      const mapped = Object.hasOwn(MATCH_MODE_SYNONYMS, key)
+        ? MATCH_MODE_SYNONYMS[key]
+        : undefined;
       if (mapped === undefined) delete item.match_mode;
       else item.match_mode = mapped;
+    }
+  }
+
+  // MCP-boundary tolerance (parity with Python models.py:427): the published
+  // schema makes new_text optional, so a schema-following model that only
+  // wants to annotate sends target_text + comment. The lossless reading is
+  // the pure-comment form (new_text == target_text) — never a bounce, and
+  // never a tracked deletion. An explicit "" is left alone: empty means
+  // delete, and delete-with-explanation is a distinct intent.
+  if (
+    item.type === "modify" &&
+    (item.new_text === undefined || item.new_text === null)
+  ) {
+    const target = item.target_text;
+    const comment = item.comment;
+    if (
+      typeof target === "string" &&
+      target &&
+      typeof comment === "string" &&
+      comment.trim()
+    ) {
+      item.new_text = target;
     }
   }
 }
@@ -212,8 +258,20 @@ const READ_DOCX_COMMON_DESC =
 // `page` guidance lives HERE, not only on the parameter: real MCP clients
 // drop optional-parameter descriptions in transit, so the tool description is
 // the only channel guaranteed to reach the model (QA 2026-07-23 client-compat).
+/**
+ * The A1.9 banner for an MCP full-view read, or null.
+ *
+ * Surface-aware hint (QA F11): an MCP client cannot run a shell command, so it
+ * is pointed at the read mode rather than the CLI flag.
+ */
+async function mcpFieldsBanner(file_path: string): Promise<string | null> {
+  return banner_for_path(file_path, fields_discovery_hint(), async (p) =>
+    loadDocxOrThrow(readFileSync(p), p),
+  );
+}
+
 const READ_DOCX_TAIL =
-  "Modes:\n- 'full' (default): paginated body content. Use page=N to navigate.\n- 'outline': heading map only — start here for large docs to plan targeted reads. Defaults to L1-L2 headings; pass outline_max_level=3-6 to see deeper structure.\n- 'appendix': defined terms, anchors, and cross-reference targets. Consult before editing legal/technical docs to avoid breaking references.\n\n`page`: a positive integer (1-indexed, default 1) or 'all'. Pages are synthetic length-based chunks sized for LLM consumption, NOT printed Word pages. In mode='full', page='all' returns the whole body with no page chrome. With `search_query`, `page` instead restricts matches to that page (default: search all pages).";
+  "Modes:\n- 'full' (default): paginated body content. Use page=N to navigate.\n- 'outline': heading map only — start here for large docs to plan targeted reads. Defaults to L1-L2 headings; pass outline_max_level=3-6 to see deeper structure.\n- 'appendix': defined terms, anchors, and cross-reference targets. Consult before editing legal/technical docs to avoid breaking references.\n- 'changes' (mode='changes'): a ledger of every tracked change and comment (id, type, author, page, snippet) — start here for review work instead of reading pages. Filter with changes_author, page, and changes_offset.\n- 'fields' (mode='fields'): a ledger of every content control (ordinal, class, alias/tag, location, lock/binding state, current value) — start here to discover fillable fields. Paginate with fields_offset; `page` and `search_query` do not apply.\n\n`page`: a positive integer (1-indexed, default 1), a page RANGE like '2-6' (returns up to 8 pages in one call, then names the next range), or 'all'. Pages are synthetic length-based chunks sized for LLM consumption, NOT printed Word pages. In mode='full', page='all' returns the whole body with no page chrome; oversized documents are refused with an outline and a bounded-read recipe unless force=true. With `search_query`, `page` instead restricts matches to that page (default: search all pages).";
 
 // BUDGET: real MCP clients truncate tool descriptions at ~2048 chars — the
 // tail (wherever it falls) is invisible to the model. COMMON + OPERATIONS +
@@ -223,9 +281,9 @@ const READ_DOCX_TAIL =
 // the row-op fields (`cells` etc.) must be named in prose because clients
 // strip the typed item schema to {} in transit (QA F10).
 const PROCESS_BATCH_COMMON_DESC =
-  "Applies a batch of edits and review actions to a DOCX.\n\nBatches apply SEQUENTIALLY: each change is validated and applied against the document state produced by the changes before it, so a later change may target text an earlier one introduced. Any validation failure rejects the whole batch transactionally — nothing is applied.\n\n";
+  "Applies a batch of edits and review actions to a DOCX.\n\nBatches apply SEQUENTIALLY: each change validates against state from prior changes. Valid changes apply when others fail (salvage default): response LEADS with `PARTIAL: applied K of N` listing unapplied changes. Pass partial=false for all-or-nothing.\n\n";
 const PROCESS_BATCH_OPERATIONS_DESC =
-  "Each item in `changes` needs a `type`:\n1. 'modify': search-and-replace. `target_text` must match uniquely (`match_mode`:'strict', the default) — add surrounding context, or set `match_mode`:'first'/'all'. Set `regex`:true to treat `target_text` as a regex (capture groups in `new_text` as $1, $2…). `new_text` supports Markdown: '#'–'######' headings, '**bold**', '_italic_', '\\n\\n' paragraph split; empty `new_text` deletes. Never write CriticMarkup ({++, {--, {>>) manually — use the `comment` field.\n   • EMPTY CELLS: a blank table cell has no text to match; `read_docx` renders every cell with a trailing `{#cell:<id>}` anchor — set `target_text` to that exact anchor and put the value in `new_text`. The pipes are display separators, not editable text.\n2. 'accept'/'reject': finalize or revert a tracked change by `target_id` (e.g. 'Chg:12').\n3. 'reply': reply to a comment by `target_id` (e.g. 'Com:5') with `text`.\n4. 'insert_row': add a table row — `target_text` anchors on an existing row's text, `cells` holds the new row's cell values (strings, left to right), `position` is 'above'/'below' (default below). 'delete_row': remove the row matching `target_text`. Disk mode only.\n\nID VOLATILITY: 'Chg:N'/'Com:N' ids shift between document states — always call `read_docx` immediately before accept/reject/reply; never reuse ids from earlier turns. `{#cell:<id>}` anchors are stable across reads and edits, but finalize_document/sanitize regenerates them — re-read after finalizing.\n\n`author_name` sets Track Changes attribution; it defaults to 'Adeu AI (TS)' when omitted.";
+  "Each item in `changes` needs a `type`:\n1. 'modify': search-and-replace. `target_text` must match uniquely (`match_mode`:'strict', default) — add context or set `match_mode`:'first'/'all'. Set `regex`:true for regex matching (groups in `new_text` as $1, $2…). `new_text` supports Markdown: '#'–'######' headings, '**bold**', '_italic_', '\\n\\n' paragraph split. Omit it (with a comment) to annotate without changing text; empty string deletes. Never write CriticMarkup manually — use `comment`.\n   • EMPTY CELLS: blank cells carry `{#cell:<id>}` anchors — set `target_text` to the anchor and value in `new_text`. Pipes are display separators.\n2. 'accept'/'reject': finalize or revert a tracked change by `target_id` (e.g. 'Chg:12').\n3. 'reply': reply to a comment by `target_id` (e.g. 'Com:5') with `text`.\n4. 'set_field': fill a form field — `field` is its 'CC:<N>' id, tag or alias, `value` the text; list via `read_docx` `mode`:'fields'. Checkboxes take true/false, dates YYYY-MM-DD, dropdowns a listed option. Dual-writes bound stores. A locked/protected control refuses and names the override permitting it.\n5. 'insert_row': add table row — `target_text` anchors on an existing row's text, `cells` holds cell values (left-to-right), `position` is 'above'/'below' (default below). 'delete_row': remove row matching `target_text`. Disk mode only.\n\nID VOLATILITY: 'Chg:N'/'Com:N' ids shift between states — call `read_docx` before accept/reject/reply; never reuse ids from earlier turns.\n\n`author_name` sets Track Changes attribution; defaults to 'Adeu AI (TS)' when omitted.";
 
 const DIFF_DOCX_DESC =
   "Compares two DOCX files and returns a compact `@@ Word Patch @@` diff — Adeu's token-level, sub-word patch format — of their text content. Useful for analyzing differences between versions before editing.";
@@ -352,6 +410,7 @@ registerAppTool(
     inputSchema: z.object({
       reasoning: z
         .string()
+        .optional()
         .describe(
           "Why do I need to read this docx document? State this reason before any other parameter.",
         ),
@@ -363,10 +422,10 @@ registerAppTool(
           "If False (default), returns the 'Raw' text with inline CriticMarkup. If True, returns 'Accepted' text.",
         ),
       mode: z
-        .enum(["full", "outline", "appendix"])
+        .enum(["full", "outline", "appendix", "changes", "fields"])
         .default("full")
         .describe(
-          "'full' returns body content. 'outline' returns a structural heading map. 'appendix' returns defined terms.",
+          "'full' returns body content. 'outline' returns a structural heading map. 'appendix' returns defined terms. 'changes' returns tracked changes and comments ledger. 'fields' returns the content-control ledger.",
         ),
       // ONE published JSON type (string) — real MCP clients strip
       // property-level anyOf/oneOf to {}, losing the type and docs entirely
@@ -385,6 +444,12 @@ registerAppTool(
             ),
         )
         .optional(),
+      force: z
+        .boolean()
+        .default(false)
+        .describe(
+          "For mode='full' with page='all': read the whole document even when it exceeds the response budget.",
+        ),
       outline_max_level: z.coerce
         .number()
         .default(2)
@@ -393,6 +458,26 @@ registerAppTool(
         .boolean()
         .default(false)
         .describe("For mode='outline' only: includes metadata."),
+      changes_author: z
+        .string()
+        .optional()
+        .describe(
+          "For mode='changes' only: filter tracked changes ledger by author name.",
+        ),
+      changes_offset: z.coerce
+        .number()
+        .int()
+        .default(0)
+        .describe(
+          "For mode='changes' only: entry offset for paginating tracked changes ledger.",
+        ),
+      fields_offset: z.coerce
+        .number()
+        .int()
+        .default(0)
+        .describe(
+          "For mode='fields' only: entry offset for paginating the content-control ledger.",
+        ),
       search_query: z
         .string()
         .optional()
@@ -409,6 +494,26 @@ registerAppTool(
         .boolean()
         .default(true)
         .describe("Set to false to perform case-insensitive matching."),
+      max_matches: z.coerce
+        .number()
+        .int()
+        .default(20)
+        .describe(
+          "For search queries: maximum number of search matches to return (default 20).",
+        ),
+      match_offset: z.coerce
+        .number()
+        .int()
+        .default(0)
+        .describe(
+          "For search queries: 0-based match offset to start search results from for pagination (default 0).",
+        ),
+      full_paragraph: z
+        .boolean()
+        .default(false)
+        .describe(
+          "For search queries: return full paragraph for search matches instead of clamping snippets to ±120 chars.",
+        ),
     }),
     outputSchema: READ_DOCX_OUTPUT_SCHEMA,
     _meta: { ui: { resourceUri: MARKDOWN_UI_URI } },
@@ -420,11 +525,18 @@ registerAppTool(
       clean_view,
       mode,
       page,
+      force,
       outline_max_level,
       outline_verbose,
       search_query,
       search_regex,
       search_case_sensitive,
+      max_matches,
+      match_offset,
+      full_paragraph,
+      changes_author,
+      changes_offset,
+      fields_offset,
     },
     extra?: any,
   ) => {
@@ -513,44 +625,101 @@ registerAppTool(
           page,
           file_path,
           bundle,
+          { max_matches, match_offset, full_paragraph },
         );
         return res as any;
       }
-      // In full mode, page='all' returns the entire document without page
-      // chrome — the round-trip artifact for text-based apply/diff
-      // (QA 2026-07-17 F1 parity with the Python CLI's --page all).
-      if (
-        mode === "full" &&
-        page !== undefined &&
-        page !== null &&
-        String(page).trim().toLowerCase() === "all"
-      ) {
-        const res = build_full_document_response(text, file_path, bundle);
-        return res as any;
-      }
-      // In non-search mode, `page` defaults to 1 (show document page 1).
-      // Non-numeric values must error, not silently fall back to page 1
-      // (QA L1 parity with the Python CLI).
-      let resolvedPage = 1;
-      if (page !== undefined && page !== null) {
-        const parsed =
-          typeof page === "number" ? page : parseInt(String(page).trim(), 10);
-        if (!Number.isFinite(parsed)) {
+
+      if (mode === "changes") {
+        if (clean_view) {
           return {
             isError: true,
             content: [
               {
                 type: "text",
-                text:
-                  `Invalid page value: '${page}'. Provide a positive integer ` +
-                  `(pages are 1-indexed; 'all' is valid for mode='full' and together with search_query).`,
+                text: "Error executing tool read_docx: --clean-view cannot be used with mode='changes'.",
               },
             ],
           };
         }
-        resolvedPage = parsed;
+        const entry2 = await getEntry();
+        let comments_data: Record<string, any> | null = null;
+        let existing_change_ids: string[] | null = null;
+        try {
+          const buf = readBytes();
+          const doc = await loadDocxOrThrow(buf, file_path);
+          comments_data = extract_comments_data(doc.pkg);
+          existing_change_ids = new RedlineEngine(doc, "Adeu AI (TS)", {
+            id_discovery_hint: MCP_ID_DISCOVERY_HINT,
+          }).existing_change_ids();
+        } catch {
+          // Best-effort enrichment, exactly as Python (document.py:436-451):
+          // a ledger without comment authors still beats no ledger.
+        }
+        const res = build_changes_response(entry2.raw_text, file_path, {
+          comments_data,
+          author_filter: changes_author ?? null,
+          page: page ?? null,
+          offset: changes_offset,
+          bundle: entry2.raw_bundle,
+          existing_change_ids,
+        });
+        return res as any;
       }
+
+      if (mode === "fields") {
+        // RAW projection: the ledger previews values from the text between a
+        // control's anchors, and the clean view drops the placeholder bubbles
+        // that distinguish an empty control.
+        const entryF = await getEntry();
+        const docF = await loadDocxOrThrow(readBytes(), file_path);
+        const res = build_fields_response(docF, entryF.raw_text, file_path, {
+          offset: fields_offset,
+          bundle: entryF.raw_bundle,
+        });
+        return res as any;
+      }
+
+      let pageKind: PageArgKind = "single";
+      let pageVal: number | [number, number] | null = 1;
+      try {
+        [pageKind, pageVal] = parse_page_arg(page);
+      } catch (e: any) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: e.message,
+            },
+          ],
+        };
+      }
+
       if (mode === "appendix") {
+        if (pageKind === "range") {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "Page range pagination is only supported in 'full' mode, not 'appendix' mode.",
+              },
+            ],
+          };
+        }
+        if (pageKind === "all") {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Invalid page parameter: '${page}'. Provide a positive integer.`,
+              },
+            ],
+          };
+        }
+        const resolvedPage = pageVal as number;
         const res = build_appendix_response(
           text,
           resolvedPage,
@@ -559,11 +728,68 @@ registerAppTool(
         );
         return res as any;
       }
+
+      if (mode === "full") {
+        if (pageKind === "all") {
+          // A3: an UNBOUNDED whole-document read is the one path that can
+          // return an arbitrarily large payload. Refuse it over the budget
+          // with the page count, the L1 outline and the bounded-read recipe;
+          // `force` is the documented opt-out. Mirrors Python's
+          // tools/document.py:512-529, which asks its cache for the outline of
+          // the view it is refusing — so clean_view gets the CLEAN heading map,
+          // not the raw one (whose page numbers and CriticMarkup-bearing
+          // heading text describe a different projection).
+          //
+          // Measured on the string this path RETURNS — bundle.body, what
+          // build_full_document_response emits — not on `text`, which on the
+          // raw view carries the structural appendix nobody asked for here.
+          // Python's mode='full' text is projected with include_appendix=False
+          // (doc_cache.py:159-164), so measuring `text` refused documents whose
+          // body fits the budget while Python served them.
+          if (!force && bundle.body.length > response_budget_limit()) {
+            const nodes = clean_view
+              ? await docCache.ensureCleanOutline(entry, readBytes, loadDoc)
+              : entry.outline_nodes;
+            return {
+              isError: true,
+              content: [
+                {
+                  type: "text",
+                  text: build_budget_guard_message(
+                    bundle.body,
+                    file_path,
+                    nodes,
+                    bundle,
+                  ),
+                },
+              ],
+            } as any;
+          }
+          const res = build_full_document_response(text, file_path, bundle, {
+            fields_banner: await mcpFieldsBanner(file_path),
+          });
+          return res as any;
+        }
+        if (pageKind === "range") {
+          const [startP, endP] = pageVal as [number, number];
+          const res = build_page_range_response(
+            text,
+            startP,
+            endP,
+            file_path,
+            bundle,
+          );
+          return res as any;
+        }
+      }
+
+      const resolvedPage = pageVal as number;
       const res = build_paginated_response(
         text,
         resolvedPage,
         file_path,
         bundle,
+        { fields_banner: await mcpFieldsBanner(file_path) },
       );
       return res as any;
     } catch (e: any) {
@@ -590,13 +816,13 @@ registerAppTool(
 // string is still accepted (and normalized in-handler) so double-serialized
 // payloads from some LLM clients keep working; only `type` is required, all
 // other fields are optional, and unknown keys pass through untouched.
-const CHANGE_ITEM_SCHEMA = z
+export const CHANGE_ITEM_SCHEMA = z
   .object({
     type: z
-      .enum(["modify", "accept", "reject", "reply", "insert_row", "delete_row"])
+      .string()
       .optional()
       .describe(
-        "Change kind: 'modify' (search-and-replace), 'accept'/'reject' (resolve a tracked change by id), 'reply' (reply to a comment by id), 'insert_row'/'delete_row' (table edits; disk mode only). If omitted it is inferred when unambiguous from the other fields.",
+        "Change kind: 'modify' (search-and-replace), 'accept'/'reject' (resolve a tracked change by id), 'reply' (reply to a comment by id), 'set_field' (fill a content control), 'insert_row'/'delete_row' (table edits; disk mode only). If omitted it is inferred when unambiguous from the other fields.",
       ),
     target_text: z
       .string()
@@ -608,7 +834,22 @@ const CHANGE_ITEM_SCHEMA = z
       .string()
       .optional()
       .describe(
-        "modify: replacement text. Supports Markdown (headings, **bold**, _italic_, '\\n\\n' paragraph splits); empty string deletes. Regex capture groups are available as $1, $2…",
+        "modify: replacement text. Supports Markdown (headings, **bold**, _italic_, '\\n\\n' paragraph splits); empty string deletes. Regex capture groups are available as $1, $2… Omit it (with a comment) to annotate without changing the text; an explicit empty string deletes.",
+      ),
+    // Primitive strings, deliberately: real MCP clients strip property-level
+    // anyOf/oneOf to {} (QA 2026-07-23), so a union here would erase both the
+    // type and this guidance client-side.
+    field: z
+      .string()
+      .optional()
+      .describe(
+        "set_field only: which control to fill - the 'CC:<N>' id, its tag, or its alias. Run read_docx with mode='fields' to list them.",
+      ),
+    value: z
+      .string()
+      .optional()
+      .describe(
+        "set_field only: the value to write. Checkboxes take true/false; dates take YYYY-MM-DD; dropdowns must match a listed option. Empty string clears the field.",
       ),
     target_id: z
       .string()
@@ -616,12 +857,18 @@ const CHANGE_ITEM_SCHEMA = z
       .describe(
         "accept / reject / reply: the 'Chg:N' or 'Com:N' id taken from a fresh read_docx.",
       ),
+    part: z
+      .string()
+      .optional()
+      .describe(
+        "accept / reject: the package part holding the change, e.g. 'word/header1.xml'. Revision ids are numbered per part, so the same Chg:N can name unrelated changes in different parts; a bare ambiguous id is refused with an error listing the parts, and this field picks one. Omit whenever the id is unique (the usual case).",
+      ),
     text: z.string().optional().describe("reply: the reply body."),
     comment: z
       .string()
       .optional()
       .describe(
-        "modify / accept / reject: attach a margin comment to the change (no manual CriticMarkup).",
+        "modify: attach a margin comment to the edited text. accept / reject: record the rationale as a margin comment anchored where the change was resolved (reported as Com:N).",
       ),
     match_mode: z
       .enum(["strict", "first", "all"])
@@ -688,6 +935,7 @@ server.registerTool(
     inputSchema: {
       reasoning: z
         .string()
+        .optional()
         .describe(
           "Why do I need to apply these changes to the document? State this reason before any other parameter.",
         ),
@@ -718,6 +966,43 @@ server.registerTool(
           "Ordered list of changes to apply. Each item is an object carrying a `type` discriminator plus that type's fields (see the per-field docs and the tool description). Items apply SEQUENTIALLY: each one evaluates against the document state produced by the items before it, so later items may target text an earlier item introduced.",
         ),
       output_path: z.string().optional().describe("Optional output path."),
+      // Salvage is the default (B5, parity with tools/document.py:1511-1514):
+      // losing the changes that were right because one was wrong costs the
+      // agent a whole round trip. The response leads with what did not land.
+      partial: z
+        .boolean()
+        .default(true)
+        .describe(
+          "Whether to apply valid edits when some fail (salvage mode). Defaults to true.",
+        ),
+      // CC-4 write-gate overrides (spec-gates.md §1). All default FALSE:
+      // §1 requires it because a truthy default survives client stripping,
+      // and a gate that defaults to off is a gate that does not exist.
+      // .default() rather than required, per the author_name note above:
+      // real clients drop primitive entries from required[].
+      ignore_control_locks: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Apply edits even inside content-locked or grouped content controls. Defaults to false. " +
+            "Word refuses such edits, so overriding means the document owner has accepted the lock is wrong.",
+        ),
+      ignore_document_protection: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Apply changes even when the document carries enforced editing protection " +
+            "(read-only, fill-in-forms, comments-only, tracked-changes-only). Defaults to false.",
+        ),
+      allow_untracked_writes: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Permit writes that Word records WITHOUT tracked changes. Defaults to false. Applies only " +
+            "to fill-in-forms-protected documents, where Word does not record revisions at all; every " +
+            "such write is flagged in the report. Separate from ignore_document_protection because it " +
+            "concedes Adeu's own always-tracked guarantee rather than bypassing the author's restriction.",
+        ),
     },
   },
   async ({
@@ -726,6 +1011,10 @@ server.registerTool(
     author_name,
     changes,
     output_path,
+    partial,
+    ignore_control_locks,
+    ignore_document_protection,
+    allow_untracked_writes,
   }) => {
     try {
       void reasoning;
@@ -800,10 +1089,14 @@ server.registerTool(
         "accept",
         "reject",
         "reply",
+        "set_field",
         "insert_row",
         "delete_row",
       ]);
       const typeErrors: string[] = [];
+      // (0-based index in the caller's `changes`, reason) — the machine-readable
+      // half of the same rejection (B9). The human line stays 1-based.
+      const typeFailed: [number, string][] = [];
       sanitizedChanges.forEach((c: any, i: number) => {
         if (
           c !== null &&
@@ -811,18 +1104,27 @@ server.registerTool(
           !Array.isArray(c) &&
           (!c.type || !VALID_TYPES.has(c.type))
         ) {
-          typeErrors.push(
-            `- Change ${i + 1}: missing or unrecognized "type". Use one of: modify (needs target_text + new_text), accept/reject (needs target_id like "Chg:12"), reply (needs target_id like "Com:5" + text), insert_row (needs target_text + cells), delete_row (needs target_text). Received keys: [${Object.keys(c).join(", ")}].`,
-          );
+          const fused = has_fused_json_marker(c.type) ? ` ${FUSED_JSON_HINT}` : "";
+          const reason = `missing or unrecognized "type". Use one of: modify (needs target_text + new_text), accept/reject (needs target_id like "Chg:12"), reply (needs target_id like "Com:5" + text), set_field (needs field + value), insert_row (needs target_text + cells), delete_row (needs target_text). Received keys: [${Object.keys(c).join(", ")}].${fused}`;
+          typeErrors.push(`- Change ${i + 1}: ${reason}`);
+          typeFailed.push([i, reason]);
         }
       });
       if (typeErrors.length > 0) {
+        const env = failure_envelope(
+          "invalid_changes_file",
+          typeFailed,
+          "Batch rejected. Some changes are malformed.",
+          typeErrors,
+        );
         return {
           isError: true,
           content: [
             {
               type: "text",
-              text: `Batch rejected. Some changes are malformed:\n\n${typeErrors.join("\n")}`,
+              text:
+                `Batch rejected. Some changes are malformed:\n\n${typeErrors.join("\n")}` +
+                `\n\n\`\`\`json\n${JSON.stringify(env)}\n\`\`\``,
             },
           ],
         };
@@ -852,28 +1154,82 @@ server.registerTool(
         const buf = readFileBytesOrThrow(original_docx_path);
         doc = await loadDocxOrThrow(buf, original_docx_path);
       }
-      const engine = new RedlineEngine(doc, author_name);
+      const engine = new RedlineEngine(doc, author_name, {
+        id_discovery_hint: MCP_ID_DISCOVERY_HINT,
+        ignore_control_locks,
+        ignore_document_protection,
+        allow_untracked_writes,
+      });
 
       let stats;
       try {
-        stats = engine.process_batch(sanitizedChanges);
+        stats = engine.process_batch(sanitizedChanges, undefined, partial);
       } catch (e: any) {
         if (e instanceof BatchValidationError) {
-          // The engine's transactional snapshot restored the DOM to the
-          // exact on-disk state — safe to pin it back for the retry that
-          // typically follows a rejected batch.
-          docCache.restoreHotDoc(original_docx_path, doc);
+          // Pin the DOM back for the retry that typically follows a rejected
+          // batch — but ONLY once the engine has verified that its rollback
+          // restored the exact on-disk state. It re-pinned unconditionally
+          // before, and a batch's review actions used to survive its own
+          // rollback: every rejected attempt handed the retry a document
+          // carrying the previous attempt's reply, so one reviewer comment
+          // ended up with three identical replies (BUG 2026-08-12). An
+          // unverified DOM is simply dropped; the retry re-parses from disk.
+          if (engine.rollback_verified) {
+            docCache.restoreHotDoc(original_docx_path, doc);
+          }
+          // Prose for the human reader, envelope for the machine one: the
+          // indices name positions in the caller's own `changes` array
+          // (B9; python/src/adeu/mcp_components/tools/document.py:710-717).
+          const env = failure_envelope(
+            "batch_validation_failed",
+            e.failed,
+            "Batch rejected. Some edits failed validation.",
+            e.errors,
+          );
           return {
             isError: true,
             content: [
               {
                 type: "text",
-                text: `Batch rejected. Some edits failed validation:\n\n${e.errors.join("\n\n")}`,
+                text:
+                  `Batch rejected. Some edits failed validation:\n\n${e.errors.join("\n\n")}` +
+                  `\n\n\`\`\`json\n${JSON.stringify(env)}\n\`\`\``,
               },
             ],
           };
         }
         throw e;
+      }
+
+      // Salvage that salvaged nothing is a REJECTION, not a partial success:
+      // checked before the save so no output file is produced and no response
+      // claims one (tools/document.py:645-661). The hot doc is deliberately
+      // NOT restored here — unlike the transactional path above, salvage takes
+      // no snapshot, so this DOM may carry a failed edit's partial mutations.
+      const applied_count =
+        (stats.edits_applied || 0) + (stats.actions_applied || 0);
+      const engine_failed: Array<{ index: number; reason: string }> =
+        stats.failed || [];
+      if (applied_count === 0 && engine_failed.length > 0) {
+        const env = failure_envelope(
+          "batch_validation_failed",
+          engine_failed.map((f) => [f.index, f.reason] as [number, string]),
+          "Batch rejected. Some edits failed validation.",
+          engine_failed.map((f) => f.reason),
+        );
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                `Batch rejected. Some edits failed validation:\n\n${engine_failed
+                  .map((f) => f.reason)
+                  .join("\n\n")}` +
+                `\n\n\`\`\`json\n${JSON.stringify(env)}\n\`\`\``,
+            },
+          ],
+        };
       }
 
       let overwrite_note = "";
@@ -902,7 +1258,24 @@ server.registerTool(
       // read-after-edit then skips the full re-parse.
       docCache.primeFromDoc(outPath, doc);
 
-      let res = formatBatchResult(stats, outPath) + overwrite_note;
+      // A partial success is a SUCCESS response with the failures hoisted to
+      // the top — never a failure envelope, whose recovery protocol ("Nothing
+      // was written") would contradict the saved path in the same response
+      // (tools/document.py:739-766).
+      let partial_header = "";
+      if (partial && engine_failed.length > 0 && applied_count > 0) {
+        const fails = [...engine_failed].sort((a, b) => a.index - b.index);
+        const max_idx = fails.reduce((m, f) => Math.max(m, f.index), 0);
+        const total_n = Math.max(max_idx + 1, sanitizedChanges.length);
+        partial_header = `PARTIAL: applied ${applied_count} of ${total_n} changes. ${fails.length} failed validation:\n\n`;
+        for (const f of fails) {
+          partial_header += `- Change #${f.index + 1} Failed: ${f.reason}\n`;
+        }
+        partial_header += "\n";
+      }
+
+      let res =
+        partial_header + formatBatchResult(stats, outPath) + overwrite_note;
       if (sanitizedChanges.length === 0) {
         res =
           `⚠️ 0 changes provided — nothing to do. The output is an unmodified copy of the original.\n\n` +
@@ -922,18 +1295,33 @@ server.registerTool(
   "accept_all_changes",
   {
     description:
-      "Accepts all tracked changes and removes all comments in a single operation.",
+      "Accepts every tracked change in the document, producing a finalized clean document.\n\n" +
+      "remove_comments (boolean, DEFAULT TRUE): also delete every comment. The default is " +
+      "TRUE because this tool's purpose is a distributable clean document, and comments are " +
+      "internal review notes that must not travel to a counterparty. Pass " +
+      "remove_comments=false to accept the tracked changes while KEEPING the comments — use " +
+      "that when the review conversation is still live. Either way the response reports how " +
+      "many comments were deleted and names each one with its author, and comments whose " +
+      "anchored text an accepted deletion consumes are removed regardless, exactly as Word does.",
     inputSchema: {
       reasoning: z
         .string()
+        .optional()
         .describe(
           "Why do I need to accept all changes in this document? State this reason before any other parameter.",
         ),
       docx_path: z.string().describe("Absolute path to the DOCX file."),
       output_path: z.string().optional().describe("Optional output path."),
+      remove_comments: z
+        .boolean()
+        .default(true)
+        .describe(
+          "Also delete every comment in the document. Defaults to true (finalized clean " +
+            "document); pass false to keep comments while accepting the tracked changes.",
+        ),
     },
   },
-  async ({ reasoning, docx_path, output_path }) => {
+  async ({ reasoning, docx_path, output_path, remove_comments }) => {
     try {
       void reasoning;
       let outPath = output_path;
@@ -946,13 +1334,26 @@ server.registerTool(
 
       const buf = readFileBytesOrThrow(docx_path);
       const doc = await loadDocxOrThrow(buf, docx_path);
-      const engine = new RedlineEngine(doc);
+      const engine = new RedlineEngine(doc, "Adeu AI (TS)", {
+        id_discovery_hint: MCP_ID_DISCOVERY_HINT,
+      });
 
       // Revision-mark counts straight from the engine (AI_CONTEXT
       // "Accept-All Counts Are Revision MARKS"): a no-op must say so instead
       // of claiming "Accepted all changes" over an already-clean document
       // (QA 2026-07-23 F18).
-      const counts = engine.accept_all_revisions();
+      //
+      // This surface DELIBERATELY defaults to true while the library API
+      // defaults to false: accept_all_changes exists to produce a distributable
+      // clean document, and shipping a counterparty a file that still carries
+      // internal review notes is the more expensive failure
+      // (QA_ISSUES_DISCOVERED #10, "Confidentiality risk"). What
+      // BUG_comment_threading_anchoring_and_typography.md B2 correctly objected
+      // to was that the inversion was SILENT and unavoidable — the caller now
+      // has an explicit parameter, the published description states the
+      // default, and every deleted comment is named with its author.
+      const counts = engine.accept_all_revisions(remove_comments !== false);
+      const removedCommentNotes = [...engine.removed_comment_notes];
       const total =
         counts.accepted_insertions +
         counts.accepted_deletions +
@@ -981,7 +1382,19 @@ server.registerTool(
           `${counts.accepted_deletions} deletion(s), ` +
           `${counts.accepted_formatting} formatting change(s).`;
         if (counts.removed_comments > 0) {
+          // Deleting review content is disclosed WITH attribution: a comment the
+          // caller did not write is somebody else's work product (B2).
           text += `\nComments removed: ${counts.removed_comments}.`;
+          if (removedCommentNotes.length > 0) {
+            text += `\nComments deleted: ${removedCommentNotes.join(", ")}`;
+            if (remove_comments === false) {
+              text +=
+                `\nNote: these comments were anchored to text an accepted deletion ` +
+                `consumed, so Word removes them too. Nothing else was deleted.`;
+            }
+          }
+        } else if (remove_comments === false) {
+          text += `\nComments kept (remove_comments=false).`;
         }
       }
       text += overwriteNote(outPath, docx_path, existedBefore);
@@ -1005,6 +1418,7 @@ server.registerTool(
     inputSchema: {
       reasoning: z
         .string()
+        .optional()
         .describe(
           "Why do I need to diff these two documents? State this reason before any other parameter.",
         ),
@@ -1088,6 +1502,7 @@ server.registerTool(
     inputSchema: {
       reasoning: z
         .string()
+        .optional()
         .describe(
           "Why do I need to finalize this document? State this reason before any other parameter.",
         ),
@@ -1187,9 +1602,136 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "apply_text_revision",
+  {
+    description:
+      "Applies whole-text revised text to a DOCX document by computing a diff and generating " +
+      "tracked changes. Includes a clean-text verification gate to ensure the applied document " +
+      "matches the supplied text.\n\n" +
+      "`revised_text` must be the complete CLEAN view of the document: read it with `read_docx` " +
+      "(`clean_view=true`, `page='all'`), edit that text, and send ALL of it back. Never " +
+      "CriticMarkup ({++, {--, {>>) — this tool diffs against the clean view, so markup tokens " +
+      "would land in the document as literal prose. Never one page of a paginated extract — " +
+      "everything absent from the text is applied as a tracked deletion.\n\n" +
+      "INTERLOCK: a revision that drops >50% of the characters (>75% for documents under 2000 " +
+      "characters) is refused unless you pass allow_major_deletions=true.\n\n" +
+      "If the applied document's clean text does not then match `revised_text`, NOTHING is " +
+      "written to output_path: a diagnostic copy is kept at <name>.unverified.docx and the call " +
+      "fails. output_path defaults to <name>_redlined.docx; an existing _redlined/_processed " +
+      "artifact is revised in place.",
+    inputSchema: {
+      reasoning: z
+        .string()
+        .optional()
+        .describe(
+          "Why do I need to apply this text revision? State this reason before any other parameter.",
+        ),
+      file_path: z.string().describe("Absolute path to the source DOCX file."),
+      revised_text: z
+        .string()
+        .describe("The complete revised clean text of the document."),
+      output_path: z
+        .string()
+        .optional()
+        .describe("Optional output path for the modified DOCX."),
+      author: z.string().optional().describe("Author name for Track Changes."),
+      allow_major_deletions: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Allow deleting >50% of characters (>75% for documents under 2000 characters).",
+        ),
+    },
+  },
+  async ({
+    reasoning,
+    file_path,
+    revised_text,
+    output_path,
+    author,
+    allow_major_deletions,
+  }) => {
+    try {
+      void reasoning;
+      const buf = readFileBytesOrThrow(file_path);
+      const doc = await loadDocxOrThrow(buf, file_path);
+
+      const result = await apply_text_revision_core({
+        doc,
+        input_path: file_path,
+        revised_text,
+        output_path,
+        author,
+        allow_major_deletions,
+      });
+      const outPath = result.output_path;
+
+      const existedBefore = fs.existsSync(outPath);
+      fs.mkdirSync(dirname(outPath), { recursive: true });
+      fs.writeFileSync(outPath, result.out_bytes);
+      // Never primeFromDoc here: only the batch pipeline's byte-equality gate
+      // is covered (see the comment on the batch tool's prime call), so the
+      // correct-by-construction choice is to make the next read re-parse.
+      docCache.invalidate(outPath);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              formatBatchResult(result.stats, outPath) +
+              overwriteNote(outPath, file_path, existedBefore),
+          },
+        ],
+      };
+    } catch (e: any) {
+      if (e instanceof TextRevisionVerificationError) {
+        // The gate refused the document: keep the copy it refused, next to the
+        // path the caller asked for, so a human can see what could not be
+        // realized — and say so in the SAME message that reports the failure.
+        let note = "";
+        try {
+          fs.mkdirSync(dirname(e.unverified_path), { recursive: true });
+          fs.writeFileSync(e.unverified_path, e.unverified_bytes);
+        } catch (werr: any) {
+          note = ` (the diagnostic copy could not be written: ${werr.message})`;
+        }
+        return {
+          isError: true,
+          content: [{ type: "text", text: e.message + note }],
+        };
+      }
+      // A guard refusal is the agent's recovery instruction verbatim (parity
+      // with Python's ToolError(str(e))); anything else keeps the "Error: "
+      // shape the other tools use.
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text:
+              e instanceof TextRevisionError ? e.message : `Error: ${e.message}`,
+          },
+        ],
+      };
+    }
+  },
+);
+
 // --- Formatter for process_document_batch ---
 export function formatBatchResult(stats: any, outPath: string): string {
+  // Rendered markdown is the minimal form for MCP tool output; see payloads.ts for structured consumers.
   let res = `Batch complete. Saved to: ${outPath}\n`;
+  // spec-gates §5: an exercised override is disclosed in the report header,
+  // beside the impersonation warning, because both are "this batch did
+  // something the default would not have".
+  if (stats.overrides_note) {
+    res += `\n*${stats.overrides_note}*\n`;
+  }
+  if (stats.author_impersonation_warning) {
+    res += `\n*Warning:* ${stats.author_impersonation_warning}\n`;
+  }
   const total_occurrences = stats.edits
     ? stats.edits.reduce(
         (acc: number, e: any) =>
@@ -1227,10 +1769,18 @@ export function formatBatchResult(stats: any, outPath: string): string {
         res += `**Path:** \`${report.heading_path}\`\n`;
       }
 
-      if (report.match_mode) {
-        const occ =
-          report.occurrences_modified || (report.status === "applied" ? 1 : 0);
-        res += `**Mode:** \`${report.match_mode}\` (${occ} occurrence${occ !== 1 ? "s" : ""} modified)\n`;
+      if (report.field) {
+        // Audit-trail symmetry with Path: an edit inside a content control is
+        // subject to that control's locks and binding, which decides whether a
+        // human can keep it.
+        res += `field: ${report.field}\n`;
+      }
+
+      const occ = report.occurrences_modified ?? 0;
+      res += `**Mode:** \`${report.match_mode || "strict"}\` (${occ} occurrence${occ !== 1 ? "s" : ""} modified)\n`;
+
+      if (report.comment) {
+        res += `**Comment:** "${report.comment}"\n`;
       }
 
       if (report.error) {
@@ -1242,9 +1792,6 @@ export function formatBatchResult(stats: any, outPath: string): string {
 
       if (report.critic_markup) {
         res += `*Preview (CriticMarkup):*\n> ${report.critic_markup.split("\\n").join("\\n> ")}\n`;
-      }
-      if (report.clean_text) {
-        res += `*Preview (Clean):*\n> ${report.clean_text.split("\\n").join("\\n> ")}\n`;
       }
       res += "\n";
     }
@@ -1258,7 +1805,7 @@ export function formatBatchResult(stats: any, outPath: string): string {
       d.trimStart().startsWith("- Note:"),
     );
     const header = allNotes ? "Notes:" : "Skipped Details:";
-    res += `${header}\n${stats.skipped_details.join("\n")}`;
+    res += `\n\n${header}\n${stats.skipped_details.join("\n")}`;
   }
   return res.trim();
 }

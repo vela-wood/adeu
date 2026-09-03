@@ -32,6 +32,11 @@ uvx adeu extract contract.docx -o output.md
 # Extract only the structural heading outline
 uvx adeu extract contract.docx --mode outline
 
+# Extract the form fields ledger (content controls)
+uvx adeu extract contract.docx --mode fields
+
+# Strip navigation prose and headers for raw token efficiency
+uvx adeu extract contract.docx --no-chrome
 ```
 
 ### Diffing
@@ -53,17 +58,30 @@ uvx adeu apply original.docx edits.json --author "AI Reviewer" -o redlined.docx
 # Emit the batch result as machine-readable JSON on stdout (for agents/scripts)
 uvx adeu apply original.docx edits.json --json
 
+# Partial salvage mode: apply valid edits while reporting failing edits
+uvx adeu apply original.docx edits.json --partial
+
+# Terse error context: produce compact error messages
+uvx adeu apply original.docx edits.json --terse-errors
 ```
 
 ### Accepting All Changes
-Accept every tracked change and remove all comments in one operation, producing a finalized clean document. Mirrors the `accept_all_changes` MCP tool.
+Accept every tracked change in one operation, producing a finalized clean document. Mirrors the `accept_all_changes` MCP tool — including its default.
+
+**Comment removal is ON by default** (`--remove-comments`): the output is meant to be distributable, and comments are internal review notes that must not travel to a counterparty. Use `--no-remove-comments` when the review conversation is still live.
 ```bash
-# Writes contract_clean.docx next to the input
+# Writes contract_clean.docx next to the input; comments are DELETED
 uvx adeu accept-all contract.docx
+
+# Accept the tracked changes but keep the comments
+uvx adeu accept-all contract.docx --no-remove-comments
 
 # Explicit output path, machine-readable result on stdout
 uvx adeu accept-all contract.docx -o final.docx --json
 ```
+Every deleted comment is reported by id and author (`removed_comment_details` under `--json`). A comment whose anchored text an accepted deletion consumes is removed either way — Word does the same.
+
+> The library API is the other way round: `RedlineEngine.accept_all_revisions()` defaults to `remove_comments=False`, because an SDK caller composing their own pipeline should not lose annotations implicitly.
 
 ### Sanitization
 Strip sensitive metadata, hidden text, and author names before external distribution.
@@ -73,6 +91,12 @@ uvx adeu sanitize contract.docx --accept-all -o clean.docx
 
 # Keep your redlines/comments, but anonymize the author and strip metadata
 uvx adeu sanitize redline.docx --keep-markup --author "My Firm"
+```
+
+### JSON-Lines Daemon (`adeu serve`)
+For high-throughput local agent drivers or CI harnesses, run `adeu serve` to maintain a warm process and document cache over stdin/stdout JSON-Lines:
+```bash
+uv run adeu serve
 ```
 
 ### Agentic / Headless Usage (the CLI as an API)
@@ -89,7 +113,9 @@ The I/O contract (see `docs/cli-agent-spec.md` for the full specification):
 
 * **stdout** carries only document data (Markdown/CriticMarkup) or, with `--json`, a machine-readable JSON result. `uvx adeu extract doc.docx > out.md` always produces a clean file, even with `--debug`.
 * **stderr** carries all logs, progress messages, warnings, and errors.
-* **Exit codes**: `0` = full success; `1` = failure or a partially applied batch (check `edits_skipped` in the JSON stats).
+* **Exit codes**:
+  - `0` = success (in `--partial` mode, at least one edit applied; check `edits_skipped` in JSON stats to detect skipped edits)
+  - `1` = failure (in atomic mode, if any edit fails; in `--partial` mode, if all edits fail)
 
 `adeu apply --json` prints the engine's raw stats object — `edits_applied`, `edits_skipped`, per-edit reports with CriticMarkup previews, plus `output_path` — and suppresses the human-readable logs. A batch that fails validation prints `{"error": "batch_validation_failed", "errors": [...]}` and exits 1.
 
@@ -167,3 +193,11 @@ When developing inside the `python/` directory, please note the following invari
 
 * **Surgical Mode**: The `RedlineEngine` never performs global document normalization on load or save. This strict behavior prevents the silent destruction of unrelated metadata (like `<w:proofErr>`) and minimizes XML diff noise.
 * **Testing Asserts**: Native `python-docx` `Paragraph.text` properties silently ignore text inside `<w:ins>` tags. When writing tests to verify redlines, strictly use `extract_text_from_stream(clean_view=True)` to accurately evaluate the accepted text state.
+
+## Environment Variables
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `ADEU_NO_CACHE` | Set to `1` or `true` to disable disk-level projection caching | `0` |
+| `ADEU_CACHE_DIR` | Custom storage directory for disk projection cache | OS cache dir |
+| `ADEU_AUTHOR` | Fallback author name for tracked changes when unspecified | OS username (fallback: Adeu AI) |
