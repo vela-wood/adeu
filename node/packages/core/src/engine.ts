@@ -701,6 +701,7 @@ export class RedlineEngine {
       ignore_control_locks?: boolean;
       ignore_document_protection?: boolean;
       allow_untracked_writes?: boolean;
+      timestamp?: string | Date;
     },
   ) {
     this.doc = doc;
@@ -720,7 +721,13 @@ export class RedlineEngine {
     // gates, the projection banner and the fields ledger must all report the
     // same state.
     this.protection = readDocumentProtection(doc);
-    this.timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+    if (opts?.timestamp instanceof Date) {
+      this.timestamp = opts.timestamp.toISOString().replace(/\.\d{3}Z$/, "Z");
+    } else if (typeof opts?.timestamp === "string") {
+      this.timestamp = opts.timestamp;
+    } else {
+      this.timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+    }
 
     const w16du_ns =
       "http://schemas.microsoft.com/office/word/2023/wordml/word16du";
@@ -2273,6 +2280,42 @@ export class RedlineEngine {
           const delMark = rPr ? findChild(rPr, "w:del") : null;
           if (rPr && delMark) {
             rPr.removeChild(delMark);
+
+            // If content was merged into this paragraph from a following
+            // paragraph across the deleted paragraph break, restore the break
+            // by splitting the merged content back into a new paragraph (Issue #158).
+            const allChildren = Array.from(p.childNodes) as Element[];
+            const delNodes = allChildren.filter(
+              (c) => c.nodeType === 1 && c.tagName === "w:del",
+            );
+            if (delNodes.length > 0) {
+              const lastDel = delNodes[delNodes.length - 1];
+              const lastDelIdx = allChildren.indexOf(lastDel);
+              const trailingChildren = allChildren.slice(lastDelIdx + 1);
+              const hasContent = trailingChildren.some(
+                (c) =>
+                  c.nodeType === 1 &&
+                  (c.tagName === "w:r" ||
+                    c.tagName === "w:sdt" ||
+                    c.getElementsByTagName("w:t").length > 0),
+              );
+              if (hasContent && p.parentNode) {
+                const doc = p.ownerDocument!;
+                const newP = doc.createElement("w:p");
+                const newPPr = pPr.cloneNode(true) as Element;
+                const newRPr = findChild(newPPr, "w:rPr");
+                if (newRPr) {
+                  const dm = findChild(newRPr, "w:del");
+                  if (dm) newRPr.removeChild(dm);
+                }
+                newP.appendChild(newPPr);
+                for (const c of trailingChildren) {
+                  p.removeChild(c);
+                  newP.appendChild(c);
+                }
+                p.parentNode.insertBefore(newP, p.nextSibling);
+              }
+            }
           }
         }
       }
@@ -2464,7 +2507,12 @@ export class RedlineEngine {
     if (!parent_element || !start_element || !end_element) return null;
     if (this._skip_comment_outside_main_story(parent_element, text)) return null;
 
-    const comment_id = this.comments_manager.addComment(this.author, text);
+    const comment_id = this.comments_manager.addComment(
+      this.author,
+      text,
+      null,
+      this.timestamp,
+    );
     const xmlDoc = parent_element.ownerDocument!;
 
     const range_start = xmlDoc.createElement("w:commentRangeStart");
@@ -2522,7 +2570,12 @@ export class RedlineEngine {
     )
       return;
 
-    const comment_id = this.comments_manager.addComment(this.author, text);
+    const comment_id = this.comments_manager.addComment(
+      this.author,
+      text,
+      null,
+      this.timestamp,
+    );
     const xmlDocStart = start_p.ownerDocument!;
     const xmlDocEnd = end_p.ownerDocument!;
 
@@ -3023,35 +3076,181 @@ export class RedlineEngine {
     return false;
   }
 
+  private _is_escaped(text: string, pos: number): boolean {
+    let count = 0;
+    let p = pos - 1;
+    while (p >= 0 && text[p] === "\\") {
+      count++;
+      p--;
+    }
+    return count % 2 === 1;
+  }
+
+  private _unescape_markdown(text: string): string {
+    return text.replace(/\\([\\*_])/g, "$1");
+  }
+
+  private _is_word_char(c: string): boolean {
+    return /[\p{L}\p{N}_]/u.test(c);
+  }
+
+  private _is_space(c: string): boolean {
+    if (c === "\ufeff") return false;
+    return (
+      /^\s$/u.test(c) || c === "\u0085" || (c >= "\u001c" && c <= "\u001f")
+    );
+  }
+
+  /**
+   * Returns the character ending immediately before index `pos`, as a whole
+   * code point ("" when `pos` is at the start of the string).
+   *
+   * Python indexes `str` by code point while JavaScript indexes by UTF-16 code
+   * unit, so `text[pos - 1]` hands a lone surrogate to the character-class
+   * predicates whenever the neighbour is non-BMP: `_is_word_char` then reports
+   * false for astral letters and digits and emphasis fires where Python
+   * suppresses it. Stepping back over a surrogate pair keeps both engines
+   * inspecting the same character.
+   */
+  private _prev_char(text: string, pos: number): string {
+    if (pos <= 0) return "";
+    const low = text.charCodeAt(pos - 1);
+    if (low >= 0xdc00 && low <= 0xdfff && pos - 2 >= 0) {
+      const high = text.charCodeAt(pos - 2);
+      if (high >= 0xd800 && high <= 0xdbff) {
+        return text.slice(pos - 2, pos);
+      }
+    }
+    return text[pos - 1];
+  }
+
+  /**
+   * Returns the character starting at index `pos`, as a whole code point
+   * ("" when `pos` is past the end of the string). Code-point counterpart to
+   * `_prev_char`; see there for why raw indexing is not enough.
+   */
+  private _next_char(text: string, pos: number): string {
+    if (pos >= text.length) return "";
+    const high = text.charCodeAt(pos);
+    if (high >= 0xd800 && high <= 0xdbff && pos + 1 < text.length) {
+      const low = text.charCodeAt(pos + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        return text.slice(pos, pos + 2);
+      }
+    }
+    return text[pos];
+  }
+
+  private _find_next_emphasis(
+    text: string,
+  ): [number, number, "bold" | "italic", string] | null {
+    const n = text.length;
+    let i = 0;
+    while (i < n) {
+      // Check for bold opening: **
+      if (
+        i + 1 < n &&
+        text.substring(i, i + 2) === "**" &&
+        !this._is_escaped(text, i)
+      ) {
+        if (
+          i + 2 < n &&
+          text[i + 2] !== "*" &&
+          !this._is_space(this._next_char(text, i + 2))
+        ) {
+          let j = i + 2;
+          while (j + 1 < n) {
+            if (
+              text.substring(j, j + 2) === "**" &&
+              !this._is_escaped(text, j)
+            ) {
+              if (!this._is_space(this._prev_char(text, j))) {
+                const inner = text.substring(i + 2, j);
+                if (inner && !/^[*]+$/.test(inner)) {
+                  return [i, j + 2, "bold", inner];
+                }
+              }
+              j += 2;
+            } else {
+              j++;
+            }
+          }
+        }
+      }
+
+      // Check for italic opening: _
+      if (text[i] === "_" && !this._is_escaped(text, i)) {
+        const isPrevUnderscore = i > 0 && text[i - 1] === "_";
+        const isNextUnderscore = i + 1 < n && text[i + 1] === "_";
+        const isPrevWord =
+          i > 0 && this._is_word_char(this._prev_char(text, i));
+        const isNextSpace =
+          i + 1 === n || this._is_space(this._next_char(text, i + 1));
+
+        if (
+          !isPrevUnderscore &&
+          !isNextUnderscore &&
+          !isPrevWord &&
+          !isNextSpace
+        ) {
+          let j = i + 1;
+          while (j < n) {
+            if (text[j] === "_" && !this._is_escaped(text, j)) {
+              const isClosePrevSpace = this._is_space(this._prev_char(text, j));
+              const isClosePrevUnderscore = text[j - 1] === "_";
+              const isCloseNextUnderscore = j + 1 < n && text[j + 1] === "_";
+              const isCloseNextWord =
+                j + 1 < n && this._is_word_char(this._next_char(text, j + 1));
+
+              if (
+                !isClosePrevSpace &&
+                !isClosePrevUnderscore &&
+                !isCloseNextUnderscore &&
+                !isCloseNextWord
+              ) {
+                const inner = text.substring(i + 1, j);
+                if (inner && !/^[_]+$/.test(inner)) {
+                  return [i, j + 1, "italic", inner];
+                }
+              }
+            }
+            j++;
+          }
+        }
+      }
+
+      i++;
+    }
+
+    return null;
+  }
+
   private _parse_inline_markdown(
     text: string,
     baseStyle: any = {},
   ): [string, any][] {
     if (!text) return [];
 
-    const tokenPattern = /(\*\*.*?\*\*)|(_.*?_)/;
-    const match = text.match(tokenPattern);
+    const match = this._find_next_emphasis(text);
+    if (!match) {
+      return [[this._unescape_markdown(text), baseStyle]];
+    }
 
-    if (!match) return [[text, baseStyle]];
-
-    const start = match.index!;
-    const raw = match[0];
-    const end = start + raw.length;
-
-    const isBold = raw.startsWith("**");
-    const innerContent = isBold
-      ? raw.substring(2, raw.length - 2)
-      : raw.substring(1, raw.length - 1);
-
+    const [start, end, tagType, innerContent] = match;
     const preText = text.substring(0, start);
     const postText = text.substring(end);
 
     const results: [string, any][] = [];
-    if (preText) results.push([preText, baseStyle]);
+    if (preText) {
+      results.push([this._unescape_markdown(preText), baseStyle]);
+    }
 
     const newStyle = { ...baseStyle };
-    if (isBold) newStyle.bold = true;
-    else newStyle.italic = true;
+    if (tagType === "bold") {
+      newStyle.bold = true;
+    } else {
+      newStyle.italic = true;
+    }
 
     results.push(...this._parse_inline_markdown(innerContent, newStyle));
     results.push(...this._parse_inline_markdown(postText, baseStyle));
@@ -6486,7 +6685,12 @@ export class RedlineEngine {
         }
         let new_id: string;
         try {
-          new_id = this.comments_manager.addComment(this.author, action.text, cid);
+          new_id = this.comments_manager.addComment(
+            this.author,
+            action.text,
+            cid,
+            this.timestamp,
+          );
         } catch (e) {
           if (e instanceof CommentThreadingError) {
             // A reply that cannot be threaded must NOT be written as a new
@@ -6748,14 +6952,29 @@ export class RedlineEngine {
       // (bottom-up, after the node loop).
       const rejected_mark_hosts: Element[] = [];
 
-      for (const node of group_nodes) {
+      // Process pilcrow deletions before content deletions so that paragraph splits
+      // can locate the boundary while child <w:del> elements are still intact.
+      const sorted_nodes = [...group_nodes].sort((a, b) => {
+        const a_is_del_pm =
+          a.tagName === "w:del" &&
+          (a.parentNode as Element)?.tagName === "w:rPr" &&
+          ((a.parentNode as Element)?.parentNode as Element)?.tagName === "w:pPr";
+        const b_is_del_pm =
+          b.tagName === "w:del" &&
+          (b.parentNode as Element)?.tagName === "w:rPr" &&
+          ((b.parentNode as Element)?.parentNode as Element)?.tagName === "w:pPr";
+        if (a_is_del_pm && !b_is_del_pm) return -1;
+        if (!a_is_del_pm && b_is_del_pm) return 1;
+        return 0;
+      });
+
+      for (const node of sorted_nodes) {
         const is_ins = node.tagName === "w:ins";
         const parent_tag = node.parentNode
           ? (node.parentNode as Element).tagName
           : "";
         const is_trPr = parent_tag === "w:trPr";
         const is_paragraph_mark =
-          is_ins &&
           parent_tag === "w:rPr" &&
           !!node.parentNode?.parentNode &&
           (node.parentNode.parentNode as Element).tagName === "w:pPr";
@@ -6807,7 +7026,46 @@ export class RedlineEngine {
             // deleted text is being RESTORED, so a comment anchored on it
             // stays valid (Python-engine parity, QA round 3 finding 1.1).
             if (is_trPr) node.parentNode?.removeChild(node);
-            else {
+            else if (is_paragraph_mark) {
+              const rPr = node.parentNode as Element;
+              const pPr = rPr ? (rPr.parentNode as Element) : null;
+              const hostP = pPr ? (pPr.parentNode as Element) : null;
+              if (hostP && hostP.tagName === "w:p") {
+                const allChildren = Array.from(hostP.childNodes) as Element[];
+                const delNodes = allChildren.filter(
+                  (c) => c.nodeType === 1 && c.tagName === "w:del",
+                );
+                if (delNodes.length > 0) {
+                  const lastDel = delNodes[delNodes.length - 1];
+                  const lastDelIdx = allChildren.indexOf(lastDel);
+                  const trailingChildren = allChildren.slice(lastDelIdx + 1);
+                  const hasContent = trailingChildren.some(
+                    (c) =>
+                      c.nodeType === 1 &&
+                      (c.tagName === "w:r" ||
+                        c.tagName === "w:sdt" ||
+                        c.getElementsByTagName("w:t").length > 0),
+                  );
+                  if (hasContent && hostP.parentNode) {
+                    const doc = hostP.ownerDocument!;
+                    const newP = doc.createElement("w:p");
+                    const newPPr = pPr!.cloneNode(true) as Element;
+                    const newRPr = findChild(newPPr, "w:rPr");
+                    if (newRPr) {
+                      const dm = findChild(newRPr, "w:del");
+                      if (dm) newRPr.removeChild(dm);
+                    }
+                    newP.appendChild(newPPr);
+                    for (const c of trailingChildren) {
+                      hostP.removeChild(c);
+                      newP.appendChild(c);
+                    }
+                    hostP.parentNode.insertBefore(newP, hostP.nextSibling);
+                  }
+                }
+              }
+              node.parentNode?.removeChild(node);
+            } else {
               const delTexts = Array.from(
                 node.getElementsByTagName("w:delText"),
               );
@@ -8125,7 +8383,12 @@ export class RedlineEngine {
     let first_del: Element | null = null;
     let last_del: Element | null = null;
     for (const run of target_runs) {
-      const del_tag = this._create_track_change_tag("w:del", "", del_id);
+      // One deletion may contain several styled runs. Do not repeat its ID
+      // on sibling wrappers or move intervening anchors into the deletion.
+      const can_append: boolean = last_del !== null && run._element.previousSibling === last_del;
+      const del_tag: Element = can_append
+        ? last_del!
+        : this._create_track_change_tag("w:del", "", first_del === null ? del_id : null);
       const new_run = run._element.cloneNode(true) as Element;
 
       const tNodes = Array.from(new_run.getElementsByTagName("w:t"));
@@ -8138,7 +8401,11 @@ export class RedlineEngine {
       });
 
       del_tag.appendChild(new_run);
-      run._element.parentNode?.replaceChild(del_tag, run._element);
+      if (can_append) {
+        run._element.parentNode?.removeChild(run._element);
+      } else {
+        run._element.parentNode?.replaceChild(del_tag, run._element);
+      }
       if (first_del === null) first_del = del_tag;
       last_del = del_tag;
     }
@@ -8242,14 +8509,6 @@ export class RedlineEngine {
           }
 
           if (p2_element && p2_element.tagName === "w:p") {
-            // Decide the merged container's properties BEFORE p2's children
-            // move in: when p1 keeps no visible content (a FULL paragraph
-            // deletion), the only surviving text is p2's — the merged
-            // paragraph must carry p2's properties (style, numbering).
-            // Keeping p1's restyled the following paragraph: deleting a
-            // heading turned the next body paragraph into a heading,
-            // deleting a plain paragraph before a list item stripped the
-            // item's numbering (QA 2026-07-19 ADEU-QA-002 B).
             const p1_fully_deleted =
               !this._paragraph_has_visible_content(p1_element);
 
@@ -8290,7 +8549,7 @@ export class RedlineEngine {
               pPr!.appendChild(rPr);
             }
             if (!findChild(rPr!, "w:del")) {
-              const del_mark = this._create_track_change_tag("w:del");
+              const del_mark = this._create_track_change_tag("w:del", "", del_id);
               rPr!.appendChild(del_mark);
             }
 
@@ -8376,7 +8635,7 @@ export class RedlineEngine {
           pPr!.appendChild(rPr);
         }
         if (!findChild(rPr!, "w:del")) {
-          const del_mark = this._create_track_change_tag("w:del");
+          const del_mark = this._create_track_change_tag("w:del", "", del_id);
           rPr!.appendChild(del_mark);
         }
       }

@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { DocumentObject } from "./docx/bridge.js";
 import {
   createTestDocument,
   addParagraph,
@@ -10,6 +11,7 @@ import { parseXml, serializeXml } from "./docx/dom.js";
 import { create_unified_diff } from "./diff.js";
 import { extract_outline } from "./outline.js";
 import { paginate } from "./pagination.js";
+import { CommentsManager, extract_comments_data } from "./comments.js";
 
 describe("Resolved Bugs Core Engine Verification", () => {
   it("BUG-3 & BUG-4: Links parts to package and yields headers for extraction", async () => {
@@ -623,5 +625,223 @@ describe("Resolved Bugs Core Engine Verification", () => {
     const stats = other.accept_all_revisions() as any;
 
     expect(stats.removed_comments).toBe(1);
+  });
+
+  it("Issue #157: A tab in a run that an edit splits is preserved, not replaced by space", async () => {
+    const doc = await createTestDocument();
+    const xmlDoc = doc.element.ownerDocument!;
+    const p = xmlDoc.createElement("w:p");
+    const r = xmlDoc.createElement("w:r");
+
+    const t1 = xmlDoc.createElement("w:t");
+    t1.textContent = "1.1";
+    r.appendChild(t1);
+
+    const tab = xmlDoc.createElement("w:tab");
+    r.appendChild(tab);
+
+    const t2 = xmlDoc.createElement("w:t");
+    t2.textContent = "The Supplier shall deliver the Goods.";
+    t2.setAttribute("xml:space", "preserve");
+    r.appendChild(t2);
+
+    p.appendChild(r);
+    doc.element.appendChild(p);
+
+    const tabsBefore = doc.element.getElementsByTagName("w:tab").length;
+    expect(tabsBefore).toBe(1);
+
+    const engine = new RedlineEngine(doc, "Tester");
+    engine.process_batch([{ type: "modify", target_text: "deliver", new_text: "supply" }]);
+
+    const tabsAfter = doc.element.getElementsByTagName("w:tab").length;
+    expect(tabsAfter).toBe(1);
+
+    const buf = await doc.save();
+    const docForReject = await DocumentObject.load(buf);
+    const rejected = new RedlineEngine(docForReject, "Tester");
+    rejected.reject_all_revisions();
+    expect(docForReject.element.getElementsByTagName("w:tab").length).toBe(1);
+
+    const docForAccept = await DocumentObject.load(buf);
+    const accepted = new RedlineEngine(docForAccept, "Tester");
+    accepted.accept_all_revisions();
+    expect(docForAccept.element.getElementsByTagName("w:tab").length).toBe(1);
+  });
+
+  it("Issue #158: Deleting a paragraph with its separator restores the paragraph break on reject", async () => {
+    const doc = await createTestDocument();
+    addParagraph(doc, "First paragraph.");
+    addParagraph(doc, "Second paragraph.");
+    addParagraph(doc, "Third paragraph.");
+
+    const engine = new RedlineEngine(doc, "Tester");
+    const stats = engine.process_batch([
+      { type: "modify", target_text: "Second paragraph.\n\n", new_text: "" },
+    ]);
+    expect(stats.status).toBe("ok");
+    expect(stats.edits[0].status).toBe("applied");
+
+    const buf = await doc.save();
+
+    // Accept all revisions: leaves only First and Third
+    const docAccept = await DocumentObject.load(buf);
+    const engAccept = new RedlineEngine(docAccept, "Tester");
+    engAccept.accept_all_revisions();
+    const pElementsAccept = docAccept.element.getElementsByTagName("w:p");
+    const textsAccept = Array.from(pElementsAccept).map((p) => p.textContent);
+    expect(textsAccept).toEqual(["First paragraph.", "Third paragraph."]);
+
+    // Reject all revisions: restores all three separate paragraphs
+    const docReject = await DocumentObject.load(buf);
+    const engReject = new RedlineEngine(docReject, "Tester");
+    engReject.reject_all_revisions();
+    const pElementsReject = docReject.element.getElementsByTagName("w:p");
+    const textsReject = Array.from(pElementsReject).map((p) => p.textContent);
+    expect(textsReject).toEqual([
+      "First paragraph.",
+      "Second paragraph.",
+      "Third paragraph.",
+    ]);
+
+    // Individual reject via apply_review_actions restores all three separate paragraphs
+    const docReview = await DocumentObject.load(buf);
+    const engReview = new RedlineEngine(docReview, "Tester");
+    const delNodes = docReview.element.getElementsByTagName("w:del");
+    const ids = Array.from(delNodes)
+      .map((d) => d.getAttribute("w:id"))
+      .filter(Boolean) as string[];
+    for (const id of ids) {
+      engReview.apply_review_actions([
+        { type: "reject", target_id: `Chg:${id}` },
+      ]);
+    }
+    const pElementsReview = docReview.element.getElementsByTagName("w:p");
+    const textsReview = Array.from(pElementsReview).map((p) => p.textContent);
+    expect(textsReview).toEqual([
+      "First paragraph.",
+      "Second paragraph.",
+      "Third paragraph.",
+    ]);
+  });
+
+  it("Issue #159: Revisions and comments share engine timestamp from opts.timestamp", async () => {
+    const doc = await createTestDocument();
+    addParagraph(doc, "The quick brown fox.");
+
+    const fixedTime = "2026-04-15T09:30:00Z";
+    const engine = new RedlineEngine(doc, "Tester", { timestamp: fixedTime });
+    expect(engine.timestamp).toBe(fixedTime);
+
+    const stats = engine.process_batch([
+      {
+        type: "modify",
+        target_text: "quick",
+        new_text: "slow",
+        comment: "Foxes are not always quick.",
+      },
+    ]);
+    expect(stats.status).toBe("ok");
+
+    // Body revisions carry fixedTime
+    const docXml = doc.element.toString();
+    const delDates = Array.from(docXml.matchAll(/<w:del\b[^>]*\bw:date="([^"]+)"/g)).map((m) => m[1]);
+    const insDates = Array.from(docXml.matchAll(/<w:ins\b[^>]*\bw:date="([^"]+)"/g)).map((m) => m[1]);
+    expect(delDates.length + insDates.length).toBeGreaterThan(0);
+    for (const d of [...delDates, ...insDates]) {
+      expect(d).toBe(fixedTime);
+    }
+
+    // Comment w:date carries fixedTime
+    const data = extract_comments_data(doc.pkg);
+    const commentDates = Object.values(data).map((c: any) => c.date);
+    expect(commentDates.length).toBeGreaterThan(0);
+    for (const d of commentDates) {
+      expect(d).toBe(fixedTime);
+    }
+  });
+
+  it("Issue #159: RedlineEngine constructor handles Date, string, and default timestamp", async () => {
+    const doc = await createTestDocument();
+
+    // 1. Date instance
+    const d = new Date("2026-06-01T12:00:00.123Z");
+    const engDate = new RedlineEngine(doc, "Tester", { timestamp: d });
+    expect(engDate.timestamp).toBe("2026-06-01T12:00:00Z");
+
+    // 2. String
+    const engStr = new RedlineEngine(doc, "Tester", { timestamp: "2026-01-01T00:00:00Z" });
+    expect(engStr.timestamp).toBe("2026-01-01T00:00:00Z");
+
+    // 3. Default
+    const engDefault = new RedlineEngine(doc, "Tester");
+    expect(engDefault.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  });
+
+  it("Issue #159: Reassigning engine.timestamp before process_batch updates comment timestamp", async () => {
+    const doc = await createTestDocument();
+    addParagraph(doc, "The quick brown fox.");
+
+    const engine = new RedlineEngine(doc, "Tester");
+    const reassignedTime = "2026-12-25T18:00:00Z";
+    engine.timestamp = reassignedTime;
+
+    const stats = engine.process_batch([
+      {
+        type: "modify",
+        target_text: "quick",
+        new_text: "slow",
+        comment: "Foxes are slow.",
+      },
+    ]);
+    expect(stats.status).toBe("ok");
+
+    const data = extract_comments_data(doc.pkg);
+    const commentDates = Object.values(data).map((c: any) => c.date);
+    expect(commentDates).toEqual([reassignedTime]);
+
+    const docXml = doc.element.toString();
+    const delDates = Array.from(docXml.matchAll(/<w:del\b[^>]*\bw:date="([^"]+)"/g)).map((m) => m[1]);
+    const insDates = Array.from(docXml.matchAll(/<w:ins\b[^>]*\bw:date="([^"]+)"/g)).map((m) => m[1]);
+    for (const d of [...delDates, ...insDates]) {
+      expect(d).toBe(reassignedTime);
+    }
+  });
+
+  it("Issue #159: ReplyComment review action uses engine.timestamp", async () => {
+    const doc = await createTestDocument();
+    addParagraph(doc, "The quick brown fox.");
+
+    const engine = new RedlineEngine(doc, "Tester", { timestamp: "2026-01-01T10:00:00Z" });
+    engine.process_batch([
+      {
+        type: "modify",
+        target_text: "quick",
+        new_text: "fast",
+        comment: "Original note",
+      },
+    ]);
+
+    const replyTime = "2026-01-02T15:00:00Z";
+    engine.timestamp = replyTime;
+    const [applied] = engine.apply_review_actions([
+      { type: "reply", target_id: "Com:1", text: "Reply note" },
+    ]);
+    expect(applied).toBe(1);
+
+    const data = extract_comments_data(doc.pkg);
+    expect(data["1"].date).toBe("2026-01-01T10:00:00Z");
+    expect(data["2"].date).toBe(replyTime);
+  });
+
+  it("Issue #159: CommentsManager.addComment respects optional timestamp", async () => {
+    const doc = await createTestDocument();
+    const cm = new CommentsManager(doc);
+    const cid1 = cm.addComment("Tester", "Explicit timestamp", null, "2026-07-07T07:07:07Z");
+    const cid2 = cm.addComment("Tester", "Default timestamp");
+
+    const data = extract_comments_data(doc.pkg);
+    expect(data[cid1].date).toBe("2026-07-07T07:07:07Z");
+    expect(data[cid2].date).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
   });
 });

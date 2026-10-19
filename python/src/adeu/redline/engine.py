@@ -497,6 +497,7 @@ class RedlineEngine:
         ignore_control_locks: bool = False,
         ignore_document_protection: bool = False,
         allow_untracked_writes: bool = False,
+        timestamp: Optional[Union[str, datetime.datetime]] = None,
     ):
         self.terse_errors = terse_errors
         # CC-4 write-gate overrides. Engine kwargs rather than process_batch
@@ -555,9 +556,20 @@ class RedlineEngine:
             part._adeu_element = parse_xml(part.blob)  # type: ignore[attr-defined]
 
         self.author = author
-        self.timestamp = (
-            datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
+        if isinstance(timestamp, datetime.datetime):
+            if timestamp.tzinfo is None:
+                dt = timestamp.replace(tzinfo=datetime.timezone.utc)
+            else:
+                dt = timestamp.astimezone(datetime.timezone.utc)
+            self.timestamp = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif isinstance(timestamp, str):
+            self.timestamp = timestamp
+        elif timestamp is None:
+            self.timestamp = (
+                datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+        else:
+            raise TypeError(f"timestamp must be a str, datetime.datetime, or None, got {type(timestamp).__name__}")
         self.current_id = self._scan_existing_ids()
         self.mapper = DocumentMapper(self.doc)
         # Offsets into mapper.full_text; rebuilt whenever the mapper is.
@@ -1211,11 +1223,85 @@ class RedlineEngine:
                 return True
         return False
 
+    @staticmethod
+    def _is_escaped(text: str, pos: int) -> bool:
+        """True if the character at pos is preceded by an odd number of backslashes."""
+        count = 0
+        p = pos - 1
+        while p >= 0 and text[p] == "\\":
+            count += 1
+            p -= 1
+        return count % 2 == 1
+
+    @staticmethod
+    def _unescape_markdown(text: str) -> str:
+        """Replaces escaped markdown characters with literal form (e.g. \\_ -> _, \\* -> *, \\\\ -> \\)."""
+        return re.sub(r"\\([\\*_])", r"\1", text)
+
+    @staticmethod
+    def _is_word_char(c: str) -> bool:
+        return c.isalnum() or c == "_"
+
+    def _find_next_emphasis(self, text: str) -> Optional[Tuple[int, int, str, str]]:
+        """
+        Finds the earliest valid emphasis delimiter pair in text.
+        Returns (start_idx, end_idx, tag_type, inner_content) or None.
+        tag_type is 'bold' or 'italic'.
+        """
+        n = len(text)
+        i = 0
+        while i < n:
+            # Check for bold opening: **
+            if i + 1 < n and text[i : i + 2] == "**" and not self._is_escaped(text, i):
+                if i + 2 < n and text[i + 2] != "*" and not text[i + 2].isspace():
+                    j = i + 2
+                    while j + 1 < n:
+                        if text[j : j + 2] == "**" and not self._is_escaped(text, j):
+                            if not text[j - 1].isspace():
+                                inner = text[i + 2 : j]
+                                if inner and not all(c == "*" for c in inner):
+                                    return (i, j + 2, "bold", inner)
+                            j += 2
+                        else:
+                            j += 1
+
+            # Check for italic opening: _
+            if text[i] == "_" and not self._is_escaped(text, i):
+                is_prev_underscore = i > 0 and text[i - 1] == "_"
+                is_next_underscore = i + 1 < n and text[i + 1] == "_"
+                is_prev_word = i > 0 and self._is_word_char(text[i - 1])
+                is_next_space = i + 1 == n or text[i + 1].isspace()
+
+                if (not is_prev_underscore) and (not is_next_underscore) and (not is_prev_word) and (not is_next_space):
+                    j = i + 1
+                    while j < n:
+                        if text[j] == "_" and not self._is_escaped(text, j):
+                            is_close_prev_space = text[j - 1].isspace()
+                            is_close_prev_underscore = text[j - 1] == "_"
+                            is_close_next_underscore = j + 1 < n and text[j + 1] == "_"
+                            is_close_next_word = j + 1 < n and self._is_word_char(text[j + 1])
+
+                            if (
+                                (not is_close_prev_space)
+                                and (not is_close_prev_underscore)
+                                and (not is_close_next_underscore)
+                                and (not is_close_next_word)
+                            ):
+                                inner = text[i + 1 : j]
+                                if inner and not all(c == "_" for c in inner):
+                                    return (i, j + 1, "italic", inner)
+                        j += 1
+
+            i += 1
+
+        return None
+
     def _parse_inline_markdown(
         self, text: str, base_style: Optional[Dict[str, Any]] = None
     ) -> List[Tuple[str, Dict[str, Any]]]:
         """
-        Recursively parses bold (**) and italic (_) markdown.
+        Recursively parses bold (**) and italic (_) markdown, preserving underscore runs
+        and literal escaped characters.
         """
         if base_style is None:
             base_style = {}
@@ -1223,27 +1309,12 @@ class RedlineEngine:
         if not text:
             return []
 
-        # Italic span requires REAL content: at least one non-underscore,
-        # non-whitespace character, and the delimiters must not sit inside a
-        # longer underscore run. Without this, a fill-in blank like
-        # "$[_______]" is consumed as empty/nested italic pairs and the
-        # underscores vanish from the applied document (reported 2026-07-30:
-        # form regeneration blanked 6 of 7 fill-in fields).
-        token_pattern = re.compile(r"(\*\*.*?\*\*)|((?<!_)_(?!_)(?=[^_])(.*?[^_\s])_(?!_))")
-
-        match = token_pattern.search(text)
+        match = self._find_next_emphasis(text)
 
         if not match:
-            return [(text, base_style)]
+            return [(self._unescape_markdown(text), base_style)]
 
-        start, end = match.span()
-
-        if match.group(1):
-            tag_type = "bold"
-            inner_raw = match.group(1)
-        else:
-            tag_type = "italic"
-            inner_raw = match.group(2)
+        start, end, tag_type, inner_content = match
 
         pre_text = text[:start]
         post_text = text[end:]
@@ -1251,14 +1322,12 @@ class RedlineEngine:
         results = []
 
         if pre_text:
-            results.append((pre_text, base_style))
+            results.append((self._unescape_markdown(pre_text), base_style))
 
         new_style = base_style.copy()
         if tag_type == "bold":
-            inner_content = inner_raw[2:-2]
             new_style["bold"] = True
         else:
-            inner_content = inner_raw[1:-1]
             new_style["italic"] = True
 
         results.extend(self._parse_inline_markdown(inner_content, new_style))
@@ -2067,8 +2136,15 @@ class RedlineEngine:
 
         grandparent.remove(parent_ins)
 
-    def track_delete_run(self, run: Run, reuse_id: Optional[str] = None):
-        del_tag = self._create_track_change_tag("w:del", reuse_id=reuse_id)
+    def track_delete_run(
+        self, run: Run, reuse_id: Optional[str] = None, previous_deletion: Optional[etree._Element] = None
+    ):
+        # Keep adjacent styled runs in one deletion without swallowing anchors.
+        # A separate wrapper needs a fresh ID even within the same logical edit.
+        if previous_deletion is not None and run._r.getprevious() is previous_deletion:
+            del_tag = previous_deletion
+        else:
+            del_tag = self._create_track_change_tag("w:del", reuse_id=reuse_id if previous_deletion is None else None)
 
         # Clone the run to preserve special content (w:drawing, w:commentReference)
         new_run = deepcopy(run._r)
@@ -2093,7 +2169,10 @@ class RedlineEngine:
         # The replacement-insertion side (in _apply_single_edit_indexed) splits
         # the enclosing <w:ins> so the new <w:ins> is a sibling, never <w:ins>
         # nested in <w:ins>.
-        parent.replace(run._r, del_tag)
+        if del_tag is previous_deletion:
+            parent.remove(run._r)
+        else:
+            parent.replace(run._r, del_tag)
         return del_tag
 
     @staticmethod
@@ -2184,7 +2263,7 @@ class RedlineEngine:
             logger.warning("Comment anchor elements are not children of the parent; skipping", text=text[:60])
             return
 
-        comment_id = self.comments_manager.add_comment(self.author, text)
+        comment_id = self.comments_manager.add_comment(self.author, text, timestamp=self.timestamp)
         range_start = create_element("w:commentRangeStart")
         create_attribute(range_start, "w:id", comment_id)
         range_end = create_element("w:commentRangeEnd")
@@ -2219,7 +2298,7 @@ class RedlineEngine:
         start_el = self._paragraph_child_ancestor(start_el, start_p)
         end_el = self._paragraph_child_ancestor(end_el, end_p)
 
-        comment_id = self.comments_manager.add_comment(self.author, text)
+        comment_id = self.comments_manager.add_comment(self.author, text, timestamp=self.timestamp)
 
         range_start = create_element("w:commentRangeStart")
         create_attribute(range_start, "w:id", comment_id)
@@ -5668,15 +5747,9 @@ class RedlineEngine:
         if op == EditOperationType.PARAGRAPH_REPLACE:
             return self._apply_paragraph_replace(edit)
 
-        # Allocate logical-edit IDs up front: one id for the delete side and
-        # one for the insert side per logical operation, reused across every
-        # <w:ins>/<w:del> element this edit produces. A single ModifyText can
-        # span multiple XML runs (e.g. a target containing a bold word, which
-        # OOXML stores as a separate <w:r> element) or multiple paragraphs;
-        # minting a fresh w:id per element would surface N [Chg:N] entries in
-        # the projected bubble for what Word renders as a single review entry.
-        # The mapper's _build_merged_meta_block deduplicates repeated IDs via
-        # seen_sigs, collapsing the bubble without any projection-side change.
+        # Reserve the first deletion and insertion IDs up front. Adjacent
+        # deleted runs share one wrapper, not repeated w:del IDs. Separate
+        # wrappers across structural boundaries receive fresh deletion IDs.
         del_id: Optional[str] = edit._reserved_del_id
         ins_id: Optional[str] = edit._reserved_ins_id
         if op in (EditOperationType.DELETION, EditOperationType.MODIFICATION) and del_id is None:
@@ -5759,7 +5832,7 @@ class RedlineEngine:
             last_del_element = None
             del_elems = []
             for run in target_runs:
-                del_elem = self.track_delete_run(run, reuse_id=del_id)
+                del_elem = self.track_delete_run(run, reuse_id=del_id, previous_deletion=last_del_element)
                 if del_elem is not None:
                     del_elems.append(del_elem)
                 if first_del_element is None:
@@ -5797,7 +5870,7 @@ class RedlineEngine:
             last_del_element = None
             del_elems = []
             for run in target_runs:
-                del_elem = self.track_delete_run(run, reuse_id=del_id)
+                del_elem = self.track_delete_run(run, reuse_id=del_id, previous_deletion=last_del_element)
                 if del_elem is not None:
                     del_elems.append(del_elem)
                 if first_del_element is None:
@@ -5818,9 +5891,8 @@ class RedlineEngine:
                         if current_style and getattr(current_style, "name", "") == style_name:
                             text_to_insert = clean_text
 
-                    del_r = last_del_element.find(qn("w:r"))
-                    if del_r is None:
-                        del_r = target_runs[-1]._element
+                    deleted_runs = last_del_element.findall(qn("w:r"))
+                    del_r = deleted_runs[-1] if deleted_runs else target_runs[-1]._element
 
                     ins_elem, last_p = self.track_insert(
                         text_to_insert,
@@ -5949,15 +6021,6 @@ class RedlineEngine:
                         p2_element = p2_element.getnext()
 
                     if p2_element is not None and p2_element.tag == qn("w:p"):
-                        # Decide the merged container's properties BEFORE p2's
-                        # children move in: when p1 keeps no visible content
-                        # (a FULL paragraph deletion), the only surviving text
-                        # is p2's — the merged paragraph must carry p2's
-                        # properties (style, numbering). Keeping p1's restyled
-                        # the following paragraph: deleting a heading turned
-                        # the next body paragraph into a heading, deleting a
-                        # plain paragraph before a list item stripped the
-                        # item's numbering (QA 2026-07-19 ADEU-QA-002 B).
                         p1_fully_deleted = not self._paragraph_has_visible_content(p1_element)
 
                         # 1. Track pilcrow deletion in p1
@@ -5984,7 +6047,7 @@ class RedlineEngine:
                             pPr.append(rPr)
 
                         if rPr.find(qn("w:del")) is None:
-                            del_mark = self._create_track_change_tag("w:del")
+                            del_mark = self._create_track_change_tag("w:del", reuse_id=del_id)
                             rPr.append(del_mark)
 
                         # 2. Coalesce children from p2 to p1
@@ -6017,7 +6080,7 @@ class RedlineEngine:
                     del_mark = self._create_track_change_tag("w:del", reuse_id=del_id)
                     rPr.append(del_mark)
 
-        self._record_used_revision_ids(edit, del_id, ins_id)
+        self._record_used_revision_ids(edit, del_id, ins_id, *(node.get(qn("w:id")) for node in del_elems))
         return True
 
     def _paragraph_has_visible_content(self, p_elem) -> bool:
@@ -6730,6 +6793,8 @@ class RedlineEngine:
 
         if applied:
             self._mutated_since_load = True
+            for el in self.doc.element.findall(".//*[@_adeu_unwrapped_end]"):
+                el.attrib.pop("_adeu_unwrapped_end", None)
         return applied, skipped, already_resolved
 
     def _clean_wrapping_comments(self, element, preserve_comments: bool = False):
@@ -6969,7 +7034,11 @@ class RedlineEngine:
 
             parent.remove(ins)
 
-        for d in all_del:
+        sorted_del = sorted(
+            all_del,
+            key=lambda d: 0 if d.getparent() is not None and d.getparent().tag == qn("w:rPr") else 1,
+        )
+        for d in sorted_del:
             self._clean_wrapping_comments(d, preserve_comments=True)
             parent = d.getparent()
             if parent is None:
@@ -6979,8 +7048,44 @@ class RedlineEngine:
                 parent.remove(d)
                 continue
 
+            grandparent = parent.getparent()
+            if parent.tag == qn("w:rPr") and grandparent is not None and grandparent.tag == qn("w:pPr"):
+                p_el = grandparent.getparent()
+                if p_el is not None and p_el.tag == qn("w:p"):
+                    all_children = list(p_el)
+                    del_nodes = [c for c in all_children if c.tag == qn("w:del")]
+                    if del_nodes:
+                        last_del_idx = all_children.index(del_nodes[-1])
+                    else:
+                        unwrapped = [c for c in all_children if c.get("_adeu_unwrapped_end") == "true"]
+                        if unwrapped:
+                            last_del_idx = all_children.index(unwrapped[-1])
+                            unwrapped[-1].attrib.pop("_adeu_unwrapped_end", None)
+                        else:
+                            last_del_idx = -1
+                    if last_del_idx >= 0:
+                        trailing_children = all_children[last_del_idx + 1 :]
+                        if any(c.tag in (qn("w:r"), qn("w:sdt")) or any(c.iter(qn("w:t"))) for c in trailing_children):
+                            new_p = create_element("w:p")
+                            new_pPr = deepcopy(grandparent)
+                            new_rPr = new_pPr.find(qn("w:rPr"))
+                            if new_rPr is not None:
+                                dm = new_rPr.find(qn("w:del"))
+                                if dm is not None:
+                                    new_rPr.remove(dm)
+                            new_p.append(new_pPr)
+                            for c in trailing_children:
+                                p_el.remove(c)
+                                new_p.append(c)
+                            p_el.addnext(new_p)
+                parent.remove(d)
+                continue
+
             index = parent.index(d)
-            for child in list(d):
+            children = list(d)
+            if children:
+                children[-1].set("_adeu_unwrapped_end", "true")
+            for child in children:
                 for dt in child.findall(f".//{qn('w:delText')}"):
                     dt.tag = qn("w:t")
                     if dt.text is not None and dt.text.strip() != dt.text:
@@ -7048,7 +7153,9 @@ class RedlineEngine:
             return False
 
         try:
-            new_comment_id = self.comments_manager.add_comment(self.author, text, parent_id=target_id)
+            new_comment_id = self.comments_manager.add_comment(
+                self.author, text, parent_id=target_id, timestamp=self.timestamp
+            )
         except CommentThreadingError as exc:
             # A reply that cannot be threaded must NOT be written as a new
             # top-level comment. The old path wrote it anyway and reported
@@ -7363,6 +7470,31 @@ class RedlineEngine:
                         del_mark = rPr.find(qn("w:del"))
                         if del_mark is not None:
                             rPr.remove(del_mark)
+
+                            # If content was merged into this paragraph from a following
+                            # paragraph across the deleted paragraph break, restore the break
+                            # by splitting the merged content back into a new paragraph (Issue #158).
+                            all_children = list(p)
+                            del_nodes = [c for c in all_children if c.tag == qn("w:del")]
+                            if del_nodes:
+                                last_del_idx = all_children.index(del_nodes[-1])
+                                trailing_children = all_children[last_del_idx + 1 :]
+                                if any(
+                                    c.tag in (qn("w:r"), qn("w:sdt")) or any(c.iter(qn("w:t")))
+                                    for c in trailing_children
+                                ):
+                                    new_p = create_element("w:p")
+                                    new_pPr = deepcopy(pPr)
+                                    new_rPr = new_pPr.find(qn("w:rPr"))
+                                    if new_rPr is not None:
+                                        dm = new_rPr.find(qn("w:del"))
+                                        if dm is not None:
+                                            new_rPr.remove(dm)
+                                    new_p.append(new_pPr)
+                                    for c in trailing_children:
+                                        p.remove(c)
+                                        new_p.append(c)
+                                    p.addnext(new_p)
 
             # 3. Reject deletions: restore the original text.
             for d in root_element.findall(f".//{qn('w:del')}"):
