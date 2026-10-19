@@ -107,11 +107,9 @@ const exampleFiles = readdirSync(EXAMPLES_DIR).filter((f) =>
 );
 
 describe("example workflows", () => {
-  it("both documented examples are present", () => {
-    expect(exampleFiles.sort()).toEqual([
-      "AI_Agent_workflow.json",
-      "Sequential_workflow.json",
-    ]);
+  it("the documented example is present", () => {
+    // slim ships no AI Agent example: it is agent-framework free.
+    expect(exampleFiles.sort()).toEqual(["Sequential_workflow.json"]);
   });
 
   for (const file of exampleFiles) {
