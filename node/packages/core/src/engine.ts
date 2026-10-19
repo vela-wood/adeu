@@ -2837,8 +2837,15 @@ export class RedlineEngine {
     // status "applied". Note the em-dash spelling was never affected, so the
     // corruption tracked the punctuation an author chose.
     const have_line_break = /[\r\n]/.test(text);
+    // A marker is only a block marker at paragraph start. Spliced after
+    // surviving host text ("0 " + "1. 0\n\n0") it is literal content.
+    const mid_paragraph =
+      !insert_before && this._text_before(current_p, pos_source);
     const block_mode =
-      first_style !== null && have_paragraph_context && have_line_break;
+      first_style !== null &&
+      have_paragraph_context &&
+      have_line_break &&
+      !mid_paragraph;
 
     let first_node: Element | null = null;
     let inline_ins: Element | null = null;
@@ -2957,8 +2964,10 @@ export class RedlineEngine {
 
     // Relocate the suffix into the last new paragraph: the paragraph break
     // the insertion introduced splits current_p at the anchor, so everything
-    // after the anchor continues in the final inserted paragraph.
-    if (!block_mode && last_p && suffix_nodes.length > 0) {
+    // after the anchor continues in the final inserted paragraph. Block mode
+    // too: "0 1." modify "0 1" -> "1. 0\n\n0" must read "1. 0\n\n0.", not
+    // ".\n\n1. 0\n\n0".
+    if ((!block_mode || !insert_before) && last_p && suffix_nodes.length > 0) {
       for (const node of suffix_nodes) {
         node.parentNode?.removeChild(node);
         last_p.appendChild(node);
@@ -2966,6 +2975,32 @@ export class RedlineEngine {
     }
 
     return { first_node, last_p, last_ins, used_block_mode: block_mode };
+  }
+
+  /**
+   * True when `current_p` holds non-deleted text up to and including
+   * `pos_el`, the element the insertion follows.
+   */
+  private _text_before(current_p: Element | null, pos_el: Element | null): boolean {
+    if (current_p === null || pos_el === null) return false;
+
+    // Ascend to the direct child of current_p holding the anchor.
+    let anchor: Element | null = pos_el;
+    while (anchor && anchor.parentNode !== current_p) {
+      anchor = anchor.parentNode as Element | null;
+    }
+    if (!anchor) return false;
+
+    for (let child = current_p.firstChild; child; child = child.nextSibling) {
+      if (child.nodeType !== 1) continue;
+      const el = child as Element;
+      if (el.tagName !== "w:del" && el.tagName !== "w:pPr") {
+        if (findAllDescendants(el, "w:t").some((t) => t.textContent)) return true;
+      }
+      if (el === anchor) break;
+    }
+
+    return false;
   }
 
   /**

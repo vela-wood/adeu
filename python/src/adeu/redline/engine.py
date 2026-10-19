@@ -1379,6 +1379,84 @@ class RedlineEngine:
             pPr_clone.remove(outlineLvl_el)
         return pPr_clone
 
+    @staticmethod
+    def _text_before(current_p, pos_run: Optional[Run]) -> bool:
+        """
+        True when `current_p` holds non-deleted text up to and including
+        `pos_run`, the run the insertion follows.
+        """
+        if current_p is None or pos_run is None:
+            return False
+
+        # Ascend to the direct child of current_p holding the anchor run.
+        anchor = pos_run._element
+        while anchor is not None and anchor.getparent() is not current_p:
+            anchor = anchor.getparent()
+        if anchor is None:
+            return False
+
+        for child in current_p:
+            if child.tag != qn("w:del") and child.tag != qn("w:pPr"):
+                if any(t.text for t in child.iter(qn("w:t"))):
+                    return True
+            if child is anchor:
+                break
+
+        return False
+
+    @staticmethod
+    def _collect_suffix(current_p, ins_elem, pos_run: Optional[Run], insert_before: bool) -> list:
+        """
+        Returns the children of `current_p` that follow the insertion point.
+        A paragraph-splitting insertion relocates them into its last new
+        paragraph.
+        """
+        if current_p is None:
+            return []
+
+        # ins_elem is attached by the CALLER after this method returns, so
+        # it usually has no parent yet and cannot locate the insertion
+        # point. The positional anchor run IS attached, and the insertion
+        # lands immediately after it — its following siblings are the
+        # suffix that relocates into the last new paragraph when the text
+        # carries paragraph breaks.
+        positional_anchor = None
+        suffix_includes_anchor = False
+        if ins_elem is not None and ins_elem.getparent() is not None:
+            positional_anchor = ins_elem
+        elif pos_run is not None and pos_run._element.getparent() is not None:
+            positional_anchor = pos_run._element
+            # insert_before: the insertion will be attached BEFORE this
+            # run, so the run itself belongs to the relocating suffix.
+            # Without this, a paragraph-splitting insertion at paragraph
+            # START leaves the host text glued to the FIRST inserted line
+            # ("00." + insert "0.\n\n0 " read "0.00.\n\n0 " instead of
+            # "0.\n\n0 00.") — hunt-profile counterexample, 2026-07-19.
+            suffix_includes_anchor = insert_before
+        while positional_anchor is not None and positional_anchor.getparent() is not current_p:
+            positional_anchor = positional_anchor.getparent()
+            if positional_anchor is current_p:
+                positional_anchor = None
+                break
+
+        relocatable_tags = {qn("w:r"), qn("w:ins"), qn("w:del")}
+        if positional_anchor is not None:
+            suffix_nodes = []
+            nxt = positional_anchor if suffix_includes_anchor else positional_anchor.getnext()
+            while nxt is not None:
+                if nxt.tag in relocatable_tags:
+                    suffix_nodes.append(nxt)
+                nxt = nxt.getnext()
+            return suffix_nodes
+
+        if insert_before:
+            # No attached anchor run at all (paragraph-anchored insertion
+            # at paragraph START): everything in the host paragraph
+            # follows the insertion point, so it all relocates.
+            return [child for child in current_p if child.tag in relocatable_tags]
+
+        return []
+
     def track_insert(
         self,
         text: str,
@@ -1438,7 +1516,11 @@ class RedlineEngine:
         # affected, so the corruption tracked the punctuation an author chose.
         has_line_break = re.search(r"[\r\n]", text) is not None
 
-        if first_style and has_line_break:
+        # A marker is only a block marker at paragraph start. Spliced after
+        # surviving host text ("0 " + "1. 0\n\n0") it is literal content.
+        mid_paragraph = not insert_before and self._text_before(current_p, positional_anchor_run or anchor_run)
+
+        if first_style and has_line_break and not mid_paragraph:
             if current_p is None:
                 return None, None
 
@@ -1453,9 +1535,24 @@ class RedlineEngine:
 
             created_nodes = []
 
+            # Host text after the insertion point follows the new paragraphs:
+            # "0 1." modify "0 1" -> "1. 0\n\n0" must read "1. 0\n\n0.", not
+            # ".\n\n1. 0\n\n0". insert_before needs none: the whole host
+            # paragraph already follows.
+            suffix_nodes = (
+                []
+                if insert_before
+                else self._collect_suffix(current_p, None, positional_anchor_run or anchor_run, insert_before)
+            )
+
+            # A trailing break with a suffix opens a fresh paragraph for it.
+            keep_trailing = bool(suffix_nodes) and lines[-1] == ""
+            suffix_p = None
+
             for i, line_text in enumerate(lines):
                 c_text, s_name = self._parse_markdown_style(line_text)
-                if not c_text and not s_name:
+                is_suffix_line = keep_trailing and i == len(lines) - 1
+                if not c_text and not s_name and not is_suffix_line:
                     continue
 
                 new_p = create_element("w:p")
@@ -1501,7 +1598,19 @@ class RedlineEngine:
                     body.insert(p_index + i, new_p)
                 else:
                     body.insert(p_index + 1 + i, new_p)
+
+                if is_suffix_line:
+                    suffix_p = new_p
+                    continue
                 created_nodes.append((new_p, new_ins))
+
+            # Relocate the suffix into its paragraph: the fresh one, else
+            # the last inserted line.
+            dest_p = suffix_p if suffix_p is not None else (created_nodes[-1][0] if created_nodes else None)
+            if dest_p is not None:
+                for node in suffix_nodes:
+                    current_p.remove(node)
+                    dest_p.append(node)
 
             if comment and created_nodes:
                 start_p, start_ins = created_nodes[0]
@@ -1587,46 +1696,7 @@ class RedlineEngine:
         # policy. If there are, and new_text ends with a paragraph break,
         # we keep the trailing empty line so the loop creates a fresh
         # destination paragraph for the suffix to land in.
-        positional_anchor = None
-        suffix_nodes: list = []
-        suffix_includes_anchor = False
-        if current_p is not None:
-            # ins_elem is attached by the CALLER after this method returns, so
-            # it usually has no parent yet and cannot locate the insertion
-            # point. The positional anchor run IS attached, and the insertion
-            # lands immediately after it — its following siblings are the
-            # suffix that relocates into the last new paragraph when the text
-            # carries paragraph breaks.
-            pos_run = positional_anchor_run or anchor_run
-            if ins_elem is not None and ins_elem.getparent() is not None:
-                positional_anchor = ins_elem
-            elif pos_run is not None and pos_run._element.getparent() is not None:
-                positional_anchor = pos_run._element
-                # insert_before: the insertion will be attached BEFORE this
-                # run, so the run itself belongs to the relocating suffix.
-                # Without this, a paragraph-splitting insertion at paragraph
-                # START leaves the host text glued to the FIRST inserted line
-                # ("00." + insert "0.\n\n0 " read "0.00.\n\n0 " instead of
-                # "0.\n\n0 00.") — hunt-profile counterexample, 2026-07-19.
-                suffix_includes_anchor = insert_before
-            while positional_anchor is not None and positional_anchor.getparent() is not current_p:
-                positional_anchor = positional_anchor.getparent()
-                if positional_anchor is current_p:
-                    positional_anchor = None
-                    break
-
-            relocatable_tags = {qn("w:r"), qn("w:ins"), qn("w:del")}
-            if positional_anchor is not None:
-                nxt = positional_anchor if suffix_includes_anchor else positional_anchor.getnext()
-                while nxt is not None:
-                    if nxt.tag in relocatable_tags:
-                        suffix_nodes.append(nxt)
-                    nxt = nxt.getnext()
-            elif insert_before:
-                # No attached anchor run at all (paragraph-anchored insertion
-                # at paragraph START): everything in the host paragraph
-                # follows the insertion point, so it all relocates.
-                suffix_nodes.extend(child for child in current_p if child.tag in relocatable_tags)
+        suffix_nodes = self._collect_suffix(current_p, ins_elem, positional_anchor_run or anchor_run, insert_before)
 
         # Decide whether to keep the trailing empty in remaining_lines.
         # Keep it when both conditions hold: the new_text ends with a
