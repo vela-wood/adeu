@@ -370,6 +370,26 @@ CRITICMARKUP_BLOCK_RE = re.compile(
 )
 
 
+# One complete emphasis span. Kept atomic in word tokenization so a diff hunk
+# can never split a marker pair: half-pairs reach the apply engine unbalanced,
+# which silently drops the formatting (2026-07-30: a form regeneration whose
+# only change to six defined terms was adding **_..._** markers came back
+# plain or half-formatted because the hunk boundary fell inside the pair).
+# The italic branch mirrors the engine parser's guards: real non-underscore
+# content, delimiters not inside a longer underscore run - so fill-in blanks
+# ($[_______]) are never glued into an atom.
+_EMPHASIS_ATOM_RE = re.compile(
+    # Bold span; content never crosses a line or a {...} projection token
+    # (bookmark anchors like {#_Ref...} carry underscores that must not be
+    # mistaken for emphasis delimiters).
+    r"\*\*(?:(?!\*\*)[^\n{}]){1,200}?\*\*"
+    # Italic span: opener at a real emphasis boundary (not mid-word, not after
+    # '#' inside an anchor token), real non-underscore content, closer not
+    # running into a word.
+    r"|(?<![\w#])_(?!_|\s)[^_\n{}]{0,158}?[^_\s\n{}]_(?!\w)"
+)
+
+
 def _words_to_chars(text1: str, text2: str, atomic_criticmarkup: bool = False) -> Tuple[str, str, List[str]]:
     """
     Splits text into words/tokens and encodes them as unique Unicode characters.
@@ -382,16 +402,31 @@ def _words_to_chars(text1: str, text2: str, atomic_criticmarkup: bool = False) -
     token_hash: Dict[str, int] = {}
     split_pattern = r"(\s+|\w+|[^\w\s])"
 
+    def _split_words(segment: str) -> List[str]:
+        return [t for t in re.split(split_pattern, segment) if t]
+
+    def _split_emphasis(segment: str) -> List[str]:
+        # Complete **...** / _..._ spans are single tokens (see
+        # _EMPHASIS_ATOM_RE); everything between them splits word-level.
+        tokens: List[str] = []
+        last = 0
+        for m in _EMPHASIS_ATOM_RE.finditer(segment):
+            tokens.extend(_split_words(segment[last : m.start()]))
+            tokens.append(m.group(0))
+            last = m.end()
+        tokens.extend(_split_words(segment[last:]))
+        return tokens
+
     def tokenize(text: str) -> List[str]:
         if not atomic_criticmarkup:
-            return [t for t in re.split(split_pattern, text) if t]
+            return _split_emphasis(text)
         tokens: List[str] = []
         last = 0
         for m in CRITICMARKUP_BLOCK_RE.finditer(text):
-            tokens.extend(t for t in re.split(split_pattern, text[last : m.start()]) if t)
+            tokens.extend(_split_emphasis(text[last : m.start()]))
             tokens.append(m.group(0))
             last = m.end()
-        tokens.extend(t for t in re.split(split_pattern, text[last:]) if t)
+        tokens.extend(_split_emphasis(text[last:]))
         return tokens
 
     def encode_text(text: str) -> str:

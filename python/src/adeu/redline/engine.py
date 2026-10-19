@@ -1167,11 +1167,15 @@ class RedlineEngine:
                 stripped_text = stripped_text[1:]
 
             if stripped_text.startswith(" "):
-                return stripped_text.strip(), f"Heading {level}"
+                # lstrip only: trailing whitespace is document content (a
+                # paragraph ending "entity.  " must round-trip its spaces;
+                # stripping them here made post-apply verification fail the
+                # whole batch, 2026-08-14).
+                return stripped_text.lstrip(), f"Heading {level}"
 
         # Bullet Lists
         if stripped_text.startswith("* ") or stripped_text.startswith("- "):
-            return stripped_text[2:].strip(), "List Paragraph"
+            return stripped_text[2:].lstrip(), "List Paragraph"
 
         # Numbered lists: the projection emits ordered items with a CONSTANT
         # "1. " marker (Markdown renumbers), so only that exact shape converts
@@ -1181,7 +1185,7 @@ class RedlineEngine:
         # the list-anchored insertion path.
         match = re.match(r"^1\.\s+", stripped_text)
         if match:
-            return stripped_text[match.end() :].strip(), "List Number"
+            return stripped_text[match.end() :], "List Number"
 
         return text, None
 
@@ -1219,7 +1223,13 @@ class RedlineEngine:
         if not text:
             return []
 
-        token_pattern = re.compile(r"(\*\*.*?\*\*)|(_.*?_)")
+        # Italic span requires REAL content: at least one non-underscore,
+        # non-whitespace character, and the delimiters must not sit inside a
+        # longer underscore run. Without this, a fill-in blank like
+        # "$[_______]" is consumed as empty/nested italic pairs and the
+        # underscores vanish from the applied document (reported 2026-07-30:
+        # form regeneration blanked 6 of 7 fill-in fields).
+        token_pattern = re.compile(r"(\*\*.*?\*\*)|((?<!_)_(?!_)(?=[^_])(.*?[^_\s])_(?!_))")
 
         match = token_pattern.search(text)
 
@@ -4190,6 +4200,30 @@ class RedlineEngine:
                     host = self._empty_control_fill_host(edit._active_mapper_ref, edit._resolved_start_idx or 0)
                     if host is not None:
                         edit._insert_host_el = host
+                # Positional edits deserve the same PARAGRAPH_REPLACE fast
+                # path the string-matched flow gets via
+                # _pre_resolve_heuristic_edit. Without it, a whole-paragraph
+                # heading replacement from the internal text diff deletes the
+                # paragraph's CONTENT and inserts a new styled paragraph but
+                # never stamps the old paragraph MARK as deleted, so
+                # accept-all leaves an empty styled paragraph behind
+                # (2026-08-14: ICA regen kept an empty Heading 2 where the
+                # "Costs." paragraph was replaced).
+                if (
+                    isinstance(edit, ModifyText)
+                    and getattr(edit, "_internal_op", None) is None
+                    and edit.target_text
+                    and edit.new_text
+                ):
+                    pr_proxy = self._maybe_paragraph_replace(
+                        edit,
+                        edit._resolved_start_idx or 0,
+                        len(edit.target_text),
+                        edit._active_mapper_ref,
+                    )
+                    if pr_proxy is not None:
+                        edit._internal_op = EditOperationType.PARAGRAPH_REPLACE
+                        edit._target_paragraph = pr_proxy._target_paragraph  # type: ignore[attr-defined]
                 resolved_edits.append((edit, getattr(edit, "new_text", None)))
             elif isinstance(edit, (InsertTableRow, DeleteTableRow)):
                 sub_edits, err_msg = self._resolve_structural_table_edit(edit)
@@ -7139,6 +7173,18 @@ class RedlineEngine:
                         for tag in ["w:t", "w:tab", "w:br"]:
                             for child in p.findall(f".//{qn(tag)}"):
                                 if tag == "w:t" and not child.text:
+                                    continue
+                                # w:tab is ALSO the element name for tab-stop
+                                # DEFINITIONS under pPr/w:tabs (ruler settings,
+                                # not content). Counting those as content kept
+                                # fully-deleted paragraphs alive as empty styled
+                                # paragraphs after accept-all whenever their
+                                # style carried custom tab stops (2026-08-14:
+                                # ICA regen left two empty Heading 2s). Only a
+                                # tab/br INSIDE A RUN is document content.
+                                if tag in ("w:tab", "w:br") and (
+                                    child.getparent() is None or child.getparent().tag != qn("w:r")
+                                ):
                                     continue
                                 is_deleted = False
                                 curr = child.getparent()
